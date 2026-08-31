@@ -27,7 +27,7 @@ git clone <this-repo> ~/src/bar
 cd ~/src/bar && ./install.sh
 
 cd <你的项目>
-bar-init <短名>
+herdsman-init <短名>
 ```
 
 完整步骤见 [docs/QUICKSTART.md](docs/QUICKSTART.md)，原理与全部细节见 [docs/HANDBOOK.md](docs/HANDBOOK.md)。
@@ -46,7 +46,7 @@ bar-init <短名>
 bin/
   request-review      写手调用的主脚本；注入、等待、哨兵判定、归档、度量
   review-archive      手动归档工具（自动归档已内建在 request-review）
-  bar-init            项目初始化
+  herdsman-init       项目初始化
 config/
   rubric.md           评审契约，全局共用，安装到 ~/.config/review/
 templates/

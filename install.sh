@@ -40,5 +40,5 @@ esac
 [ "${missing}" -eq 0 ] && echo "  ✓ 依赖检查通过"
 
 echo
-echo "下一步：在项目目录里运行  bar-init <短名>"
-install -m 0755 "${SRC}/bin/bar-init" "${BIN}/bar-init" 2>/dev/null && echo "  ✓ ${BIN}/bar-init"
+echo "下一步：在项目目录里运行  herdsman-init <短名>"
+install -m 0755 "${SRC}/bin/herdsman-init" "${BIN}/herdsman-init" 2>/dev/null && echo "  ✓ ${BIN}/herdsman-init"

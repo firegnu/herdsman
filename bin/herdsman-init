@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 在当前 git 仓库里初始化有界对抗评审。
-# 用法： bar-init <短名>
+# 用法： herdsman-init <短名>
 #
 # 幂等：已存在的东西不覆盖，只报告。
 set -uo pipefail
 
 SHORT="${1:-}"
-[ -n "${SHORT}" ] || { echo "用法: bar-init <短名>   例如: bar-init inksample"; exit 2; }
+[ -n "${SHORT}" ] || { echo "用法: herdsman-init <短名>   例如: herdsman-init inksample"; exit 2; }
 case "${SHORT}" in
   *[!a-z0-9-]*) echo "ERROR: 短名只允许小写字母、数字和连字符"; exit 2;;
 esac

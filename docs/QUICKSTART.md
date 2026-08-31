@@ -7,7 +7,7 @@ git clone <本仓库> ~/src/bar
 cd ~/src/bar && ./install.sh
 ```
 
-安装 `request-review`、`review-archive`、`bar-init` 到 `~/.local/bin`，
+安装 `request-review`、`review-archive`、`herdsman-init` 到 `~/.local/bin`，
 `rubric.md` 到 `~/.config/review/`，并检查依赖（jq / herdr / git / PATH）。
 
 验证：
@@ -26,7 +26,7 @@ request-review
 
 ```bash
 cd <repo>
-bar-init <短名>
+herdsman-init <短名>
 ```
 
 它会建评审 worktree、写 `.review.conf`、加 `.gitignore`、建两个度量文件和交接目录，
