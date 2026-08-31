@@ -46,6 +46,10 @@ should   = real but deferrable. nit = style/taste.
 Only blocking findings can cause another round.
 "I would have done it differently" is not a finding.
 
+A claim that something is impossible, infeasible, or must be downgraded needs
+the same evidence as a defect claim: show the candidate space you searched.
+Unsearched, it goes under Suspicions, never blocking.
+
 NOTE ON SCOPE: this contract targets correctness, not design quality.
 An abstraction that is correct today but will not survive the next requirement
 is a `should`, not a `blocking`. Design quality belongs to plan review.

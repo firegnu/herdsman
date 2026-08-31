@@ -20,7 +20,8 @@
 3. 运行 request-review，按退出码处理：
    0 → 读它输出的路径。对每条 finding 写一行 accept 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
-       只有 blocking 需要下一轮；should / nit 进 docs/review-backlog.md。
+       只有 blocking 需要下一轮；should / nit 留在本轮 findings，随
+       docs/reviews/<sha>.md 归档，不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。

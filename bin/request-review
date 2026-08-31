@@ -145,10 +145,11 @@ git diff --quiet && git diff --cached --quiet \
   || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
 [ -f "${REQ}" ] || { echo "ERROR: 先写 ${REQ}"; exit 2; }
 
-read -r cur cap < <(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
-: "${cur:=1}"; : "${cap:=2}"
+parsed=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
+[ -n "${parsed}" ] || { echo "ERROR: ${REQ} 缺少或写错 round: n/cap 行"; exit 2; }
+read -r cur cap <<< "${parsed}"
 [ "${cur}" -le "${cap}" ] || {
-  echo "STOP: 轮次上限 ${cap} 已到。出口只有三种：带着已知问题接受并记入 backlog /"
+  echo "STOP: 轮次上限 ${cap} 已到。出口只有三种：带着已知问题接受并记入本轮 findings 的 ## Backlog /"
   echo "      把该条 finding 升级给强模型直接写补丁 / 判定框定有误退回重写计划。交给人决定。"
   exit 5
 }

@@ -10,7 +10,7 @@
 
 - 第 1 部分：这是什么，以及三条你必须知道的前提
 - 第 2 部分：完整流程
-- 第 3 部分：搭建（八步）
+- 第 3 部分：搭建（四步）
 - 第 4 部分：四份文件的分工
 - 第 5 部分：所有模板原文
 - 第 6 部分：生成项目简报的提示词
@@ -108,80 +108,44 @@
 
 下面用 `<repo>` 指项目根目录，`<短名>` 指项目短标识（自己取，全程一致，例如 `inksample`）。
 
-### 步骤 1 — 装两个脚本（全局一次，所有项目共用）
-
-把第 5.1、5.2 节的两个脚本存为 `~/.local/bin/request-review` 和 `~/.local/bin/review-archive`。
+### 步骤 1 — 全局安装（只做一次，所有项目共用）
 
 ```bash
-chmod +x ~/.local/bin/request-review ~/.local/bin/review-archive
+cd <herdsman 仓库>
+./install.sh
 ```
+
+它把 `request-review`、`review-archive`、`herdsman-init` 安装到 `~/.local/bin`，把 `rubric.md` 安装到 `~/.config/review/`。
 
 验证：在家目录跑 `request-review`，应报 `ERROR: 不在 git 仓库中`。若报 `command not found`，把 `~/.local/bin` 加进 `.zshrc` 的 PATH。
 
-### 步骤 2 — 装评审契约（全局一次）
-
-把第 5.3 节的内容存为 `~/.config/review/rubric.md`。所有项目共用这一份。
-
 验证：`tail -5 ~/.config/review/rubric.md` 应看到 `## Checkability` 那几行。
 
-### 步骤 3 — 建评审 worktree（每个项目一次）
-
-一条命令，纯 git，不涉及 herdr。
+### 步骤 2 — 项目初始化
 
 ```bash
 cd <repo>
-git worktree add ~/wt/<短名>-review -b review-wt
+herdsman-init <短名>
 ```
 
-这是写隔离的物理基础。**这个目录建一次就一直在** —— 跟评审 agent 的死活无关。每次评审时脚本会把它 `reset --hard` 到本次要审的 sha，目录内容变，目录本身不动。
+它自动创建评审 worktree，写 `.review.conf` 和 `.gitignore` 条目，建立 `docs/reviews/`、两个度量文件与交接目录。命令幂等，已存在的内容不会被覆盖。
 
-验证：`git worktree list` 和 `ls ~/wt/<短名>-review`。
+`.review.conf` 有四个变量：`REVIEW_KIND` 是评审 agent 类型，`REVIEW_WT` 是评审 worktree，`REVIEW_DIR` 是交接目录，`REVIEW_WAIT` 是等待秒数；其中路径值必须是绝对路径。
 
-### 步骤 4 — 写项目配置
+没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
-```bash
-cd <repo>
-cat > .review.conf <<EOF
-REVIEW_KIND=claude
-REVIEW_WT=$HOME/wt/<短名>-review
-REVIEW_DIR=$HOME/.review/<短名>
-REVIEW_WAIT=600
-EOF
+评审 worktree 建一次就一直在，跟评审 agent 的死活无关；每轮脚本把它 `reset --hard` 到本次要审的 sha，目录内容变、目录本身不动。
 
-echo '.review.conf' >> .gitignore
-```
+可选：`chmod 444 .review.conf`。挡不住恶意，但挡得住写手顺手改。
 
-四个变量，全用绝对路径。`REVIEW_DIR` 目录不用建，脚本会 `mkdir -p`。
+### 步骤 3 — 两件必须手工做的事
 
-**没有 `REVIEWER` 这一项** —— 脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字。名字需要人维护（进程一退就没），cwd 是进程自带属性。
-
-可选：`chmod 444 .review.conf`。写手跑在跳过确认模式下能改这个文件，挡不住恶意但挡得住顺手。
-
-验证：`cd <repo> && request-review`。工作区干净应报 `ERROR: 先写 .../request.md`，有未提交改动则报未提交。报这两个之一就是对的。
-
-### 步骤 5 — 项目简报
-
-用第 6 部分的提示词让写手生成 `<repo>/docs/reviewer-brief.md`，然后你亲自过一遍「不变量」那节。
+1. 把第 5.4 节的 `agents-section.md` 追加到 `<repo>/AGENTS.md`（Codex 系）或 `CLAUDE.md`（Claude Code），然后把 `<核心路径清单>` 换成本项目真实路径。
+2. 用第 6 部分的提示词让写手生成 `docs/reviewer-brief.md`，生成后你亲自过一遍「不变量」那节。
 
 **这一步不要跳过。** 简报是空的话，评审方每轮从零爬全仓库，成本可能超过实施本身。
 
-### 步骤 6 — 常驻指令
-
-把第 5.4 节的内容追加到 `<repo>/AGENTS.md`（Codex 系）或 `CLAUDE.md`（Claude Code）。
-
-**必须改的一处**：`<核心路径清单>` 换成你项目真实的核心路径。这是写手判断要不要请求评审的依据。
-
-### 步骤 7 — 建两个记录文件
-
-脚本会自动往 `precision.md` 追加带 `误报 ?` 的行，但表头和 `escapes.md` 要你建。空文件也建 —— 不然真到该记一笔时你会想「下次再说」。
-
-```bash
-cd <repo> && mkdir -p docs/reviews
-printf '# 逃逸记录\n\n日期 | 问题 | 哪次周期漏的 | 原因分类\n' > docs/reviews/escapes.md
-printf '# 误报记录\n\n日期 | sha | blocking 数 | 其中误报数\n'   > docs/reviews/precision.md
-```
-
-### 步骤 8 — 第一个真实周期
+### 步骤 4 — 第一个真实周期
 
 不要空跑假 request（`artifact: PIPELINE-TEST` 这种评审方会拒绝，因为它核验不到，那是正确行为）。直接拿一个**你自己已经审过**的真实提交跑：
 
@@ -249,7 +213,6 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
    ✋ escapes.md                        # 漏检记录，你填
    ✋ precision.md                      # 误报记录，脚本填一半
    ⚙ timing.md / skipped.md
-🤖 <repo>/docs/review-backlog.md       # should / nit 沉淀
 ```
 
 ---
@@ -406,10 +369,11 @@ git diff --quiet && git diff --cached --quiet \
   || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
 [ -f "${REQ}" ] || { echo "ERROR: 先写 ${REQ}"; exit 2; }
 
-read -r cur cap < <(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
-: "${cur:=1}"; : "${cap:=2}"
+parsed=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
+[ -n "${parsed}" ] || { echo "ERROR: ${REQ} 缺少或写错 round: n/cap 行"; exit 2; }
+read -r cur cap <<< "${parsed}"
 [ "${cur}" -le "${cap}" ] || {
-  echo "STOP: 轮次上限 ${cap} 已到。出口只有三种：带着已知问题接受并记入 backlog /"
+  echo "STOP: 轮次上限 ${cap} 已到。出口只有三种：带着已知问题接受并记入本轮 findings 的 ## Backlog /"
   echo "      把该条 finding 升级给强模型直接写补丁 / 判定框定有误退回重写计划。交给人决定。"
   exit 5
 }
@@ -652,6 +616,10 @@ should   = real but deferrable. nit = style/taste.
 Only blocking findings can cause another round.
 "I would have done it differently" is not a finding.
 
+A claim that something is impossible, infeasible, or must be downgraded needs
+the same evidence as a defect claim: show the candidate space you searched.
+Unsearched, it goes under Suspicions, never blocking.
+
 NOTE ON SCOPE: this contract targets correctness, not design quality.
 An abstraction that is correct today but will not survive the next requirement
 is a `should`, not a `blocking`. Design quality belongs to plan review.
@@ -713,7 +681,8 @@ Required sections:
 3. 运行 request-review，按退出码处理：
    0 → 读它输出的路径。对每条 finding 写一行 accept 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
-       只有 blocking 需要下一轮；should / nit 进 docs/review-backlog.md。
+       只有 blocking 需要下一轮；should / nit 留在本轮 findings，随
+       docs/reviews/<sha>.md 归档，不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
@@ -790,7 +759,8 @@ F3 accept — 已补测试 test_token_refresh_race
    - 若因环境、外部依赖或合理超时而无法完成，记录执行过的命令、退出状态和原因；
      不得把“未执行”写成“通过”，也不要无限等待。
 3. 确认每个准备写进“核心路径”的目录或文件真实存在。
-4. 确认用户指定的缺陷台账是否存在；未指定时使用 `docs/review-backlog.md`。
+4. 确认缺陷来源。默认从 `docs/reviews/` 的归档周期里捞未闭合的 should / nit；
+   用户另行指定则用指定的。
 
 ## 输出格式
 
@@ -822,10 +792,10 @@ F3 accept — 已补测试 test_token_refresh_race
 故意没做的抽象、选了 A 没选 B 的原因；每条都要附可核实的出处。
 
 ## 已知缺陷
-从用户指定的缺陷台账摘录；未指定时使用 `docs/review-backlog.md`，一条一行。若该文件
-不存在，明确写“尚未建立缺陷台账”，并列出完成其他章节的验证过程中已经确认的缺陷，
-逐条标注“非台账来源，本轮直接复核”；不要为本节额外发起全仓缺陷普查。同时在
-“待补充”中提出建立台账。
+默认从 `docs/reviews/` 的归档周期里摘录未闭合的 should / nit；用户另行指定则使用
+指定来源，一条一行。若该来源为空，明确写“尚无已知缺陷来源”，并列出完成其他章节的
+验证过程中已经确认的缺陷，逐条标注“非台账来源，本轮直接复核”；不要为本节额外发起
+全仓缺陷普查。同时在“待补充”中提出建立缺陷来源。
 
 ## 测试
 测试在哪、实测如何运行（包括必要的路径与环境前提）、哪些测试覆盖核心路径，以及
@@ -878,7 +848,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 
 ### 到顶的三个合法出口，agent 不得自行继续
 
-1. 带着已知问题接受并记入 backlog
+1. 带着已知问题接受并记入本轮 findings 的 `## Backlog`
 2. 把那条具体 finding 升级给强模型直接写补丁
 3. 判定框定有误，退回重写计划
 
@@ -961,8 +931,8 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 |---|---|---|
 | `command not found: request-review` | `~/.local/bin` 不在 PATH | 加进 `.zshrc` |
 | `ERROR: jq/herdr 不在 PATH 中` | agent 环境的 PATH 与你终端不同 | 脚本里用绝对路径 |
-| `ERROR: 缺 .review.conf` | 不在配好的仓库里，或忘了建 | 见步骤 4 |
-| `ERROR: REVIEW_WT 不存在` | 路径写错，或 worktree 被删了 | 见步骤 3 |
+| `ERROR: 缺 .review.conf` | 不在配好的仓库里，或忘了建 | 见步骤 2 |
+| `ERROR: REVIEW_WT 不存在` | 路径写错，或 worktree 被删了 | 见步骤 2 |
 | `STOP: 里有多个 agent` | worktree 里开了不止一个 agent | 关掉多余的 |
 | `STOP: 里跑的是 X，期望 claude` | 那个 pane 里是别的东西 | 去看看那个 pane |
 | `STOP: 启动 claude 失败` + `agent_name_taken` | 那个 pane 里已有同名 agent | 通常是 `transport_find` 没找到它；检查 `REVIEW_WT` 与 agent 的 `foreground_cwd` 是否完全一致 |

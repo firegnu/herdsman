@@ -12,8 +12,10 @@ mkdir -p "${BIN}" "${CFG}"
 
 install -m 0755 "${SRC}/bin/request-review" "${BIN}/request-review"
 install -m 0755 "${SRC}/bin/review-archive" "${BIN}/review-archive"
+install -m 0755 "${SRC}/bin/herdsman-init" "${BIN}/herdsman-init"
 echo "  ✓ ${BIN}/request-review"
 echo "  ✓ ${BIN}/review-archive"
+echo "  ✓ ${BIN}/herdsman-init"
 
 if [ -f "${CFG}/rubric.md" ]; then
   if cmp -s "${SRC}/config/rubric.md" "${CFG}/rubric.md"; then
@@ -41,4 +43,3 @@ esac
 
 echo
 echo "下一步：在项目目录里运行  herdsman-init <短名>"
-install -m 0755 "${SRC}/bin/herdsman-init" "${BIN}/herdsman-init" 2>/dev/null && echo "  ✓ ${BIN}/herdsman-init"
