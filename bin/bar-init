@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# 在当前 git 仓库里初始化有界对抗评审。
+# 用法： bar-init <短名>
+#
+# 幂等：已存在的东西不覆盖，只报告。
+set -uo pipefail
+
+SHORT="${1:-}"
+[ -n "${SHORT}" ] || { echo "用法: bar-init <短名>   例如: bar-init inksample"; exit 2; }
+case "${SHORT}" in
+  *[!a-z0-9-]*) echo "ERROR: 短名只允许小写字母、数字和连字符"; exit 2;;
+esac
+
+command -v git >/dev/null || { echo "ERROR: 缺 git"; exit 2; }
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ERROR: 不在 git 仓库中"; exit 2; }
+cd "${REPO}"
+
+WT="${HOME}/wt/${SHORT}-review"
+RDIR="${HOME}/.review/${SHORT}"
+
+echo "仓库:   ${REPO}"
+echo "worktree: ${WT}"
+echo "交接目录: ${RDIR}"
+echo
+
+# ---- 1. 评审 worktree ----
+if [ -d "${WT}" ]; then
+  echo "  = worktree 已存在，跳过"
+else
+  if git show-ref --verify --quiet refs/heads/review-wt; then
+    git worktree add "${WT}" review-wt >/dev/null \
+      || { echo "  ✗ worktree 创建失败"; exit 1; }
+  else
+    git worktree add "${WT}" -b review-wt >/dev/null \
+      || { echo "  ✗ worktree 创建失败"; exit 1; }
+  fi
+  echo "  ✓ 建好 worktree"
+fi
+
+# ---- 2. .review.conf ----
+if [ -f .review.conf ]; then
+  echo "  = .review.conf 已存在，跳过（如需改动请手动编辑）"
+else
+  cat > .review.conf <<EOF
+REVIEW_KIND=claude
+REVIEW_WT=${WT}
+REVIEW_DIR=${RDIR}
+REVIEW_WAIT=600
+EOF
+  echo "  ✓ 写好 .review.conf"
+fi
+
+touch .gitignore
+grep -qxF '.review.conf' .gitignore || { echo '.review.conf' >> .gitignore; echo "  ✓ .review.conf 加入 .gitignore"; }
+
+# ---- 3. 度量文件 ----
+mkdir -p docs/reviews
+if [ -f docs/reviews/escapes.md ]; then
+  echo "  = escapes.md 已存在"
+else
+  printf '# 逃逸记录\n\n日后发现的、本该被某次评审抓到的问题。\n\n日期 | 问题 | 哪次周期漏的 | 原因分类（证据不足 / 被范围冻结挡掉 / rubric 未覆盖 / 被豁免）\n' > docs/reviews/escapes.md
+  echo "  ✓ 建好 docs/reviews/escapes.md"
+fi
+if [ -f docs/reviews/precision.md ]; then
+  echo "  = precision.md 已存在"
+else
+  printf '# 误报记录\n\n脚本自动追加前三项，最后的「误报 ?」由你读完 findings 后填。\n\n日期 | sha | blocking 数 | 其中误报数\n' > docs/reviews/precision.md
+  echo "  ✓ 建好 docs/reviews/precision.md"
+fi
+
+# ---- 4. 交接目录 ----
+mkdir -p "${RDIR}"
+echo "  ✓ 交接目录就绪"
+
+# ---- 5. 常驻指令 ----
+TPL="${HOME}/.config/review/agents-section.md"
+for f in AGENTS.md CLAUDE.md; do
+  [ -f "${f}" ] || continue
+  if grep -q 'Applies to the implementing agent only' "${f}"; then
+    echo "  = ${f} 已含常驻指令"
+  else
+    echo "  ! ${f} 缺常驻指令 —— 见下"
+    NEED_AGENTS=1
+  fi
+done
+if [ ! -f AGENTS.md ] && [ ! -f CLAUDE.md ]; then
+  echo "  ! 未找到 AGENTS.md / CLAUDE.md —— 见下"
+  NEED_AGENTS=1
+fi
+
+echo
+echo "自动部分完成。剩下两件事必须你手动做："
+echo
+echo "  [1] 常驻指令"
+if [ "${NEED_AGENTS:-0}" = "1" ]; then
+  if [ -f "${TPL}" ]; then
+    echo "      cat ${TPL} >> AGENTS.md"
+  else
+    echo "      把 templates/agents-section.md 的内容追加到 AGENTS.md 或 CLAUDE.md"
+  fi
+  echo "      然后把里面的 <核心路径清单> 换成本项目真实路径"
+else
+  echo "      已就绪（记得核对 <核心路径清单> 是否为本项目真实路径）"
+fi
+echo
+echo "  [2] 项目简报 docs/reviewer-brief.md"
+if [ -f docs/reviewer-brief.md ]; then
+  echo "      已存在。改架构后记得更新头部 verified at 的 sha。"
+else
+  echo "      用 templates/brief-prompt.md 里的提示词让写手生成，"
+  echo "      生成后你亲自过一遍「不变量」那节。"
+  echo "      不写简报的话，评审方每轮从零爬全仓库，成本可能超过实施本身。"
+fi
+echo
+echo "两件都做完后，跑一个你已经审过的真实提交验证一遍（见 docs/QUICKSTART.md 最后一节）。"

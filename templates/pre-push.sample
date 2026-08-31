@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# 可选：把「要不要评审」从写手的自觉判断变成确定性检查。
+#
+# 安装：
+#   cp templates/pre-push.sample <repo>/.git/hooks/pre-push
+#   chmod +x <repo>/.git/hooks/pre-push
+#   然后改下面的 CORE_PATHS
+#
+# 作用：push 前检查即将推送的提交是否碰了核心路径，碰了但本周期没有
+# 评审归档记录就拒绝。绕过用 git push --no-verify。
+#
+# 这是整套流程里唯一一个「跳过了也不会报错」的环节的补丁。
+# 单人使用时严重性不高（你自己盯着），但省得靠记性。
+set -uo pipefail
+
+CORE_PATHS='^(src/core/|migrations/|auth/)'
+
+REPO=$(git rev-parse --show-toplevel)
+cd "${REPO}"
+
+remote_head=$(git rev-parse "@{u}" 2>/dev/null) || exit 0   # 无上游，放行
+changed=$(git diff --name-only "${remote_head}..HEAD")
+[ -n "${changed}" ] || exit 0
+
+hit=$(printf '%s\n' "${changed}" | grep -E "${CORE_PATHS}" || true)
+[ -n "${hit}" ] || exit 0
+
+# 碰了核心路径 —— 检查这段提交里有没有评审归档
+have=$(git log --oneline "${remote_head}..HEAD" --name-only \
+       | grep -c '^docs/reviews/[0-9a-f]\{7,\}\.md$' || true)
+
+if [ "${have:-0}" -eq 0 ]; then
+  echo "pre-push: 以下改动碰到核心路径，但本次推送中没有评审归档："
+  printf '  %s\n' ${hit}
+  echo
+  echo "跑一轮 request-review，或用 git push --no-verify 绕过（会留在 shell 历史里）。"
+  exit 1
+fi
+
+exit 0

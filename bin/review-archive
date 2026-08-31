@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# 周期结束后归档。原文原样拼接，不做摘要。
+# 用法：在配好 .review.conf 的仓库里运行，无参数。
+set -euo pipefail
+
+command -v git >/dev/null || { echo "ERROR: 缺 git"; exit 2; }
+
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "ERROR: 不在 git 仓库中"; exit 2; }
+CONF="$REPO/.review.conf"
+[ -f "$CONF" ] || { echo "ERROR: 缺 $CONF"; exit 2; }
+# shellcheck disable=SC1090
+. "$CONF"
+: "${REVIEW_DIR:?.review.conf 缺 REVIEW_DIR}"
+
+[ -f "$REVIEW_DIR/request.md" ] || { echo "ERROR: 没有 $REVIEW_DIR/request.md，本周期无可归档内容"; exit 2; }
+
+sha=$(git rev-parse --short HEAD)
+mkdir -p "$REPO/docs/reviews"
+out="$REPO/docs/reviews/$sha.md"
+
+{
+  echo "# Review cycle @ $sha"
+  echo
+  echo "归档于 $(date -Iseconds)"
+  echo
+  echo "## Request"
+  echo
+  cat "$REVIEW_DIR/request.md"
+  for f in "$REVIEW_DIR"/r*-findings.md "$REVIEW_DIR"/r*-responses.md; do
+    [ -e "$f" ] || continue
+    echo
+    echo "## $(basename "$f")"
+    echo
+    cat "$f"
+  done
+} > "$out"
+
+echo "$out"
