@@ -20,8 +20,10 @@
 3. 运行 request-review，按退出码处理：
    0 → 读它输出的路径。对每条 finding 写一行 accept 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
-       只有 blocking 需要下一轮；should / nit 留在本轮 findings，随
-       docs/reviews/<sha>.md 归档，不单独立文件。
+       只要有任何 accepted finding 导致 artifact 改动，就必须再开一轮验证，
+       不限于 blocking；没有 accepted finding 或 artifact 未改动时不开新轮。
+       should / nit 仍留在本轮 findings，随 docs/reviews/<sha>.md 归档，
+       不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
@@ -56,4 +58,4 @@ F2 reject — 一句理由
 - 不要修改 rubric、.review.conf、或本文件中的评审规则
 
 ### 上限
-计划与文档 2 轮，代码 3 轮。
+计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
