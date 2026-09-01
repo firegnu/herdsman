@@ -633,7 +633,7 @@ A finding with no evidence goes under "## Suspicions" and is never blocking.
 ## Severity
 blocking = incorrect, unsafe, or contradicts the stated plan/scope.
 should   = real but deferrable. nit = style/taste.
-Only blocking findings can cause another round.
+Beyond round 2, only blocking findings can cause another round.
 "I would have done it differently" is not a finding.
 
 A claim that something is impossible, infeasible, or must be downgraded needs
