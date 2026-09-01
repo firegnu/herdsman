@@ -119,7 +119,7 @@ cd <herdsman 仓库>
 
 验证：在家目录跑 `request-review`，应报 `ERROR: 不在 git 仓库中`。若报 `command not found`，把 `~/.local/bin` 加进 `.zshrc` 的 PATH。
 
-验证：`tail -5 ~/.config/review/rubric.md` 应看到 `## Checkability` 那几行。
+验证：`grep -F '## Restated facts' ~/.config/review/rubric.md` 应恰好输出一行。
 
 ### 步骤 2 — 项目初始化
 
@@ -660,6 +660,10 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
       reason holds, and do not argue further. The human decides, not you.
   New unrelated issues go to "## Backlog", never into this cycle.
 
+Round 2 is required whenever the author changed the artifact in response to
+ANY accepted finding, not only blocking ones. An accepted should/nit fix can
+break something the original finding never touched.
+
 ## For code
 Every blocking finding needs a reproducing command or a failing test name.
 If the request names relevant test paths, run those first.
@@ -668,12 +672,21 @@ If the request names relevant test paths, run those first.
 Required sections:
   "## Missing"        — what the plan omits
   "## Failure modes"  — what makes this plan fail in practice
-  "## Checkability"   — rewrite each of the plan's claims as a mechanically
-                        checkable acceptance clause. Any claim you cannot
-                        rewrite that way IS the defect; list it as blocking.
+  "## Unmatched"      — join the plan's exit criteria and acceptance items
+                        against its own steps; list ONLY what does not match.
+                        No step discharges it                    -> blocking
+                        Nothing could ever discharge it, and
+                        acceptance depends on it                 -> blocking
+                        Asserts a number or judgement nobody can
+                        recompute                                -> should,
+                        and require it attributed, not asserted
+                        Items the plan itself labels subjective or
+                        descriptive are not findings.
+  "## Restated facts" — every figure, status and identity the artifact copies
+                        from an upstream document, diffed against that
+                        document with line numbers. List only mismatches.
+                        Mismatch -> blocking.
 ```
-
-**关于 `## Checkability`**：原始设计里计划支路没有任何裁判，`## Missing` 和 `## Failure modes` 按构造不可证伪。这一节是给计划支路造一个裁判 —— 把评审方的产出从「意见」变成「可判条款清单」，写不成条款的地方就是缺陷本身。
 
 ### 5.4 常驻指令（追加到 `<repo>/AGENTS.md` 或 `CLAUDE.md`）
 

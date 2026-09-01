@@ -70,6 +70,10 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
       reason holds, and do not argue further. The human decides, not you.
   New unrelated issues go to "## Backlog", never into this cycle.
 
+Round 2 is required whenever the author changed the artifact in response to
+ANY accepted finding, not only blocking ones. An accepted should/nit fix can
+break something the original finding never touched.
+
 ## For code
 Every blocking finding needs a reproducing command or a failing test name.
 If the request names relevant test paths, run those first.
@@ -78,6 +82,17 @@ If the request names relevant test paths, run those first.
 Required sections:
   "## Missing"        — what the plan omits
   "## Failure modes"  — what makes this plan fail in practice
-  "## Checkability"   — rewrite each of the plan's claims as a mechanically
-                        checkable acceptance clause. Any claim you cannot
-                        rewrite that way IS the defect; list it as blocking.
+  "## Unmatched"      — join the plan's exit criteria and acceptance items
+                        against its own steps; list ONLY what does not match.
+                        No step discharges it                    -> blocking
+                        Nothing could ever discharge it, and
+                        acceptance depends on it                 -> blocking
+                        Asserts a number or judgement nobody can
+                        recompute                                -> should,
+                        and require it attributed, not asserted
+                        Items the plan itself labels subjective or
+                        descriptive are not findings.
+  "## Restated facts" — every figure, status and identity the artifact copies
+                        from an upstream document, diffed against that
+                        document with line numbers. List only mismatches.
+                        Mismatch -> blocking.
