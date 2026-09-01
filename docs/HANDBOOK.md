@@ -312,15 +312,28 @@ transport_find() {
   printf '%s' "${hits}"
 }
 
-# 在 REVIEW_WT 里取得一个可用 pane 并起评审 agent。输出 pane_id。
+# 在 REVIEW_WT 里取得评审 pane；已有匹配 agent 就复用，否则启动。输出 pane_id。
 # 优先复用上次创建过的 pane（记在 $PANE_CACHE），避免失败重试时堆积孤儿 pane。
 transport_spawn() {
-  local pane="" name err split cached
+  local pane="" name err split cached cached_agent="" cached_kind="" cached_cwd=""
   if [ -f "${PANE_CACHE}" ]; then
     cached=$(cat "${PANE_CACHE}")
     if [ -n "${cached}" ] && herdr pane get "${cached}" >/dev/null 2>&1; then
       pane="${cached}"
-      echo "NOTE: 复用上次创建的 pane ${pane}" >&2
+      cached_agent=$(herdr agent get "${pane}" 2>/dev/null) || cached_agent=""
+      cached_kind=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.agent // empty' 2>/dev/null)
+      cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.foreground_cwd // .result.agent.cwd // empty' 2>/dev/null)
+      if [ -n "${cached_kind}" ]; then
+        if [ "${cached_kind}" != "${REVIEW_KIND}" ] || [ "${cached_cwd}" != "${REVIEW_WT}" ]; then
+          echo "STOP: 缓存 pane ${pane} 已有 agent（kind=${cached_kind}, cwd=${cached_cwd:-unknown}），" >&2
+          echo "      期望 kind=${REVIEW_KIND}, cwd=${REVIEW_WT}。不会在已有 agent 的 pane 上再次执行 agent start。" >&2
+          return 1
+        fi
+        echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
+        printf '%s' "${pane}"
+        return 0
+      fi
+      echo "NOTE: 复用上次创建的空 pane ${pane}" >&2
     fi
   fi
 
@@ -350,24 +363,26 @@ transport_dispatch() {   # $1=pane_id  $2=prompt
   { herdr agent prompt "$1" "$2" >/dev/null; } 2>&1
 }
 
-# 等待刚启动的交互 agent 真正进入可接收 prompt 的空闲态。
+# 等待交互 agent 进入可接收 prompt 的已就绪、非工作态。
 transport_wait_ready() { # $1=pane_id
-  local pane="$1" deadline payload ready state
+  local pane="$1" deadline payload="" ready="unknown" state="unknown"
   deadline=$(( $(date +%s) + (REVIEW_START_TIMEOUT + 999) / 1000 ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     payload=$(herdr agent get "${pane}" 2>/dev/null) || payload=""
-    ready=$(printf '%s' "${payload}" | jq -r '.result.agent.interactive_ready // false' 2>/dev/null)
-    state=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
-    if [ "${ready}" = "true" ] && [ "${state}" = "idle" ]; then
-      return 0
-    fi
-    if [ "${state}" = "blocked" ]; then
-      echo "STOP: 评审方在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
-      return 1
-    fi
+    ready=$(printf '%s' "${payload}" | jq -r '.result.agent.interactive_ready // false' 2>/dev/null) || ready="false"
+    state=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null) || state="unknown"
+    : "${ready:=false}" "${state:=unknown}"
+    case "${state}" in
+      idle|done)
+        [ "${ready}" = "true" ] && return 0;;
+      blocked)
+        echo "STOP: 评审方在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
+        return 1;;
+    esac
     sleep 1
   done
-  echo "STOP: 评审方未在 ${REVIEW_START_TIMEOUT}ms 内进入 interactive_ready+idle（pane ${pane}）。" >&2
+  echo "STOP: 评审方未在 ${REVIEW_START_TIMEOUT}ms 内进入可接收状态（pane ${pane}）。" >&2
+  echo "      last: interactive_ready=${ready}, agent_status=${state}；期望 interactive_ready=true 且 agent_status=idle/done。" >&2
   return 1
 }
 
