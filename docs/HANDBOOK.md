@@ -347,7 +347,28 @@ transport_spawn() {
 
 # 注入 prompt。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
 transport_dispatch() {   # $1=pane_id  $2=prompt
-  herdr agent prompt "$1" "$2" --wait --timeout 300000 2>&1 >/dev/null
+  { herdr agent prompt "$1" "$2" >/dev/null; } 2>&1
+}
+
+# 等待刚启动的交互 agent 真正进入可接收 prompt 的空闲态。
+transport_wait_ready() { # $1=pane_id
+  local pane="$1" deadline payload ready state
+  deadline=$(( $(date +%s) + (REVIEW_START_TIMEOUT + 999) / 1000 ))
+  while [ "$(date +%s)" -lt "${deadline}" ]; do
+    payload=$(herdr agent get "${pane}" 2>/dev/null) || payload=""
+    ready=$(printf '%s' "${payload}" | jq -r '.result.agent.interactive_ready // false' 2>/dev/null)
+    state=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+    if [ "${ready}" = "true" ] && [ "${state}" = "idle" ]; then
+      return 0
+    fi
+    if [ "${state}" = "blocked" ]; then
+      echo "STOP: 评审方在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "STOP: 评审方未在 ${REVIEW_START_TIMEOUT}ms 内进入 interactive_ready+idle（pane ${pane}）。" >&2
+  return 1
 }
 
 # 查生命周期状态
@@ -420,6 +441,8 @@ if [ ! -f "${SENT}" ]; then
   rm -f "${OUT}"
   TARGET=$(git rev-parse HEAD)
 
+  transport_wait_ready "${RPANE}" || exit 4
+
   git -C "${REVIEW_WT}" reset --hard "${TARGET}" -q \
     || { echo "STOP: 无法将评审 worktree reset 到 ${TARGET}"; exit 4; }
 
@@ -432,14 +455,14 @@ Previous target sha: ${prev_sha:-unknown}
 "
   fi
 
-  err=$(transport_dispatch "${RPANE}" "Review request.
+  if err=$(transport_dispatch "${RPANE}" "Review request.
 Rubric: ${HOME}/.config/review/rubric.md
 Request: ${REQ}
 Round: ${cur}/${cap}
 Target sha: ${TARGET}
-${prev_block}Write findings to ${OUT} and reply with only that path.")
-
-  if [ -n "${err}" ]; then
+${prev_block}Write findings to ${OUT} and reply with only that path."); then
+    { date +%s; echo "${TARGET}"; echo "${RPANE}"; } > "${SENT}"
+  else
     code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
     : "${code:=unknown_error}"
     case "${code}" in
@@ -451,15 +474,12 @@ ${prev_block}Write findings to ${OUT} and reply with only that path.")
         echo "STOP: 评审方在注入前消失了（pane ${RPANE}）。重试一次本命令即可。"
         exit 4;;
       agent_prompt_stalled|timeout)
-        # 已知缺陷或正常超时：prompt 可能已送达。绝不重发，落到轮询。
-        { date +%s; echo "${TARGET}"; echo "${RPANE}"; } > "${SENT}"
-        echo "NOTE: ${code}（prompt 可能已送达）。不重发，转入哨兵轮询。" >&2;;
+        echo "STOP: ${code}，无法确认评审请求是否送达（pane ${RPANE}）。" >&2
+        echo "      未写 ${SENT}；请你亲自查看 pane，确认状态后再决定是否重试。" >&2
+        exit 4;;
       *)
         echo "STOP: 注入失败：${err}"; exit 4;;
     esac
-  fi
-  if [ ! -f "${SENT}" ]; then
-    { date +%s; echo "${TARGET}"; echo "${RPANE}"; } > "${SENT}"
   fi
 else
   START=$(sed -n '1p' "${SENT}")
@@ -994,7 +1014,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | 写手 bash 工具长时阻塞 | `sleep 180` 完整等回，`REVIEW_WAIT=600` 可用 |
 | 多行 prompt 注入 | 六行模板完整送达，作为单条消息处理 |
 | 文件哨兵 | 末行 `REVIEW-COMPLETE` 无尾随空行；判据仍用「最后一个非空行」以容错 |
-| `agent_prompt_stalled` 误报（issue #2690） | 本机不复现；脚本仍保留规避（不重发，落到轮询） |
+| prompt 派送与审阅等待 | 不用 `--wait`；命令成功即记录已送达，完成状态只由 findings 文件哨兵轮询 |
 | agent 退出后名字清除 | 确认，返回 `agent_not_found` |
 | `pane wait-output` 作完成信号 | **不可用** —— 它会立即检查已有输出，注入的 prompt 就在屏幕上，哨兵词会瞬间假匹配 |
 | blocked 状态识别 | 写手侧无法测（跳过确认模式不弹窗）；评审方侧保留确认模式时可触发 |
