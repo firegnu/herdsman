@@ -202,7 +202,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
    🤖 request.md                       # 写手每轮改写
    🤖 r<n>-findings.md                 # 评审方写
    🤖 r<n>-responses.md                # 写手写
-   ⚙ .r<n>.sent                        # 防重发标记
+   ⚙ .r<n>.sent                        # 防重发标记 + 已派发 reviewer 身份
    ⚙ .pane                             # pane 缓存
    ⚙ .cycle / .cycle-request.md        # 周期快照，供归档
 ✋ <repo>/.review.conf                  # 路由配置（加 .gitignore）
@@ -215,6 +215,8 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
    ⚙ timing.md / skipped.md
 ```
 
+新写入的 `.r<n>.sent` 依次保存发送时间、target SHA、派发时 pane ID、稳定 `terminal_id` 和规范化 `agent_session`。续等按 terminal/session 恢复同一 reviewer；旧版三行 marker 只为在途轮次保留兼容，会按保存 pane 的 kind 与稳定 `cwd` 校验并 fail closed。
+
 ---
 
 ## 第 5 部分：所有模板原文
@@ -225,7 +227,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 #!/usr/bin/env bash
 # 有界对抗评审 —— 由实施方(写手 agent)调用，无参数。
 #
-# 寻址方式：按 foreground_cwd == $REVIEW_WT 找评审方，不依赖 agent 名字。
+# 寻址方式：按 cwd == ${REVIEW_WT} 找评审方，不依赖 agent 名字。
 # 找不到就自己建 pane 并起一个。从不关闭任何 pane —— 关不关由人决定。
 #
 # 退出码：
@@ -264,7 +266,7 @@ ARCHIVE_DIR="${REPO}/docs/reviews"; mkdir -p "${ARCHIVE_DIR}"
 # （正常收尾 / reject 升级 / 轮次到顶 / 半途放弃）记录都不会丢。
 archive_previous_cycle() {
   local sha out n f
-  ls "${DIR}"/r*-findings.md >/dev/null 2>&1 || return 0
+  ls "${DIR}"/r*-findings.md >/dev/null 2>&1 || return 0   # 没有残留
   sha=$(cat "${CYCLE_SHA}" 2>/dev/null); : "${sha:=unknown}"
   out="${ARCHIVE_DIR}/${sha}.md"
   {
@@ -302,7 +304,7 @@ transport_find() {
   hits=$(herdr agent list 2>/dev/null \
     | jq -r --arg wt "${REVIEW_WT}" \
         '.result.agents[]
-         | select((.foreground_cwd // .cwd) == $wt)
+         | select((.cwd // .foreground_cwd) == $wt)
          | "\(.pane_id) \(.agent)"')
   n=$(printf '%s' "${hits}" | grep -c . || true)
   if [ "${n:-0}" -gt 1 ]; then
@@ -313,7 +315,7 @@ transport_find() {
 }
 
 # 在 REVIEW_WT 里取得评审 pane；已有匹配 agent 就复用，否则启动。输出 pane_id。
-# 优先复用上次创建过的 pane（记在 $PANE_CACHE），但 pane ID 不是持久身份：
+# 优先复用上次创建过的 pane（记在 ${PANE_CACHE}），但 pane ID 不是持久身份：
 # 不存在或已指向不匹配 agent 时废弃缓存，绝不操作那个 agent。
 transport_spawn() {
   local pane="" name err split cached cached_agent="" cached_kind="" cached_cwd=""
@@ -325,7 +327,7 @@ transport_spawn() {
         pane="${cached}"
         cached_agent=$(herdr agent get "${pane}" 2>/dev/null) || cached_agent=""
         cached_kind=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.agent // empty' 2>/dev/null)
-        cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.foreground_cwd // .result.agent.cwd // empty' 2>/dev/null)
+        cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
         if [ -n "${cached_kind}" ]; then
           if [ "${cached_kind}" = "${REVIEW_KIND}" ] && [ "${cached_cwd}" = "${REVIEW_WT}" ]; then
             echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
@@ -395,6 +397,45 @@ transport_spawn() {
   printf '%s' "${pane}"
 }
 
+# 返回当前 reviewer 的规范 JSON；首次派发前保存稳定 terminal/session 身份。
+transport_identity() {  # $1=pane_id
+  local pane="$1" payload="" kind="" cwd="" terminal=""
+  payload=$(herdr agent get "${pane}" 2>/dev/null) || payload=""
+  kind=$(printf '%s' "${payload}" | jq -r '.result.agent.agent // empty' 2>/dev/null)
+  cwd=$(printf '%s' "${payload}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
+  terminal=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
+  if [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] || [ -z "${terminal}" ]; then
+    echo "STOP: 无法确认 pane ${pane} 的 reviewer 身份（kind=${kind:-unknown}, cwd=${cwd:-unknown}, terminal_id=${terminal:-missing}）。" >&2
+    return 1
+  fi
+  printf '%s' "${payload}" | jq -cS '.result.agent'
+}
+
+# 已发送轮次只恢复保存的 reviewer；身份不存在或变化时 fail closed，绝不新建或重发。
+transport_resume() {    # $1=pane_id  $2=terminal_id(legacy 可空)  $3=agent_session JSON(可空)
+  local saved_pane="$1" saved_terminal="$2" saved_session="$3"
+  local payload="" agent="" pane="" kind="" cwd="" session=""
+  if [ -n "${saved_terminal}" ]; then
+    payload=$(herdr agent list 2>/dev/null) || payload=""
+    agent=$(printf '%s' "${payload}" | jq -cS --arg terminal "${saved_terminal}" \
+      '.result.agents[] | select(.terminal_id == $terminal)' 2>/dev/null)
+  else
+    payload=$(herdr agent get "${saved_pane}" 2>/dev/null) || payload=""
+    agent=$(printf '%s' "${payload}" | jq -cS '.result.agent // empty' 2>/dev/null)
+  fi
+  pane=$(printf '%s' "${agent}" | jq -r '.pane_id // empty' 2>/dev/null)
+  kind=$(printf '%s' "${agent}" | jq -r '.agent // empty' 2>/dev/null)
+  cwd=$(printf '%s' "${agent}" | jq -r '.cwd // .foreground_cwd // empty' 2>/dev/null)
+  session=$(printf '%s' "${agent}" | jq -cS '.agent_session // empty' 2>/dev/null)
+  if [ -z "${pane}" ] || [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] \
+    || { [ -n "${saved_session}" ] && [ "${session}" != "${saved_session}" ]; }; then
+    echo "STOP: 已发送轮次保存的 reviewer 不存在或身份已变化（pane=${saved_pane}, terminal_id=${saved_terminal:-legacy}）。" >&2
+    echo "      不会创建第二个 reviewer，也不会重发 prompt；请你亲自确认当前评审状态。" >&2
+    return 1
+  fi
+  printf '%s' "${pane}"
+}
+
 # 注入 prompt。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
 transport_dispatch() {   # $1=pane_id  $2=prompt
   { herdr agent prompt "$1" "$2" >/dev/null; } 2>&1
@@ -451,11 +492,18 @@ read -r cur cap <<< "${parsed}"
   exit 5
 }
 
+OUT="${DIR}/r${cur}-findings.md"
+SENT="${DIR}/.r${cur}.sent"
+
 # ---- 新周期开始：先归档上一周期，再记录本周期的 request 与 sha ----
 if [ "${cur}" -eq 1 ]; then
-  archive_previous_cycle
-  cp "${REQ}" "${CYCLE_REQ}"
-  git rev-parse --short HEAD > "${CYCLE_SHA}"
+  current_target=$(git rev-parse HEAD)
+  sent_target=$(sed -n '2p' "${SENT}" 2>/dev/null)
+  if [ ! -f "${SENT}" ] || { [ -n "${sent_target}" ] && [ "${sent_target}" != "${current_target}" ]; }; then
+    archive_previous_cycle
+    cp "${REQ}" "${CYCLE_REQ}"
+    git rev-parse --short HEAD > "${CYCLE_SHA}"
+  fi
 fi
 
 # ---- 上一轮存在 reject → 分歧不是缺陷，立即升级，不消耗轮次 ----
@@ -466,30 +514,40 @@ if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ] && grep -qiE '^[[:space:]]*F[0-9
   exit 5
 fi
 
-OUT="${DIR}/r${cur}-findings.md"
-SENT="${DIR}/.r${cur}.sent"
 START=$(date +%s)
 
-# ---- 定位或拉起评审方 ----
-if ! found=$(transport_find); then
-  echo "STOP: ${REVIEW_WT} 里有多个 agent（见上）。同一个 worktree 只应有一个评审方。"
-  echo "      关掉多余的，或把它们移到别处，再重试。"
-  exit 4
-fi
-if [ -n "${found}" ]; then
-  RPANE=$(printf '%s' "${found}" | awk '{print $1}')
-  RKIND=$(printf '%s' "${found}" | awk '{print $2}')
-  [ "${RKIND}" = "${REVIEW_KIND}" ] || {
-    echo "STOP: ${REVIEW_WT} 里跑的是 ${RKIND}，期望 ${REVIEW_KIND}。请你确认那个 pane 里是什么。"
-    exit 4
-  }
+# ---- 已发送：只恢复保存的 reviewer 并续等；绝不再发现、创建或派发 ----
+if [ -f "${SENT}" ]; then
+  START=$(sed -n '1p' "${SENT}")
+  saved_target=$(sed -n '2p' "${SENT}")
+  saved_pane=$(sed -n '3p' "${SENT}")
+  saved_terminal=$(sed -n '4p' "${SENT}")
+  saved_session=$(sed -n '5p' "${SENT}")
+  [ "${saved_target}" = "$(git rev-parse HEAD)" ] \
+    || { echo "STOP: ${SENT} 的 target 与当前 HEAD 不一致，需人工确认。"; exit 4; }
+  [ -n "${saved_pane}" ] || { echo "STOP: ${SENT} 缺保存的 reviewer pane，需人工确认。"; exit 4; }
+  RPANE=$(transport_resume "${saved_pane}" "${saved_terminal}" "${saved_session}") || exit 4
+  echo "NOTE: round ${cur} 已发送，继续等待 reviewer ${RPANE}；不会重发 prompt。" >&2
 else
-  echo "NOTE: ${REVIEW_WT} 里没有评审方，正在拉起 ${REVIEW_KIND} …" >&2
-  RPANE=$(transport_spawn) || exit 4
-fi
+  # ---- 未发送：定位或拉起评审方 ----
+  if ! found=$(transport_find); then
+    echo "STOP: ${REVIEW_WT} 里有多个 agent（见上）。同一个 worktree 只应有一个评审方。"
+    echo "      关掉多余的，或把它们移到别处，再重试。"
+    exit 4
+  fi
+  if [ -n "${found}" ]; then
+    RPANE=$(printf '%s' "${found}" | awk '{print $1}')
+    RKIND=$(printf '%s' "${found}" | awk '{print $2}')
+    [ "${RKIND}" = "${REVIEW_KIND}" ] || {
+      echo "STOP: ${REVIEW_WT} 里跑的是 ${RKIND}，期望 ${REVIEW_KIND}。请你确认那个 pane 里是什么。"
+      exit 4
+    }
+  else
+    echo "NOTE: ${REVIEW_WT} 里没有评审方，正在拉起 ${REVIEW_KIND} …" >&2
+    RPANE=$(transport_spawn) || exit 4
+  fi
 
-# ---- 注入（仅首次；续等时跳过，防双投）----
-if [ ! -f "${SENT}" ]; then
+  # ---- 首次注入 ----
   rm -f "${OUT}"
   TARGET=$(git rev-parse HEAD)
 
@@ -507,13 +565,17 @@ Previous target sha: ${prev_sha:-unknown}
 "
   fi
 
+  identity=$(transport_identity "${RPANE}") || exit 4
+  terminal=$(printf '%s' "${identity}" | jq -r '.terminal_id')
+  session=$(printf '%s' "${identity}" | jq -cS '.agent_session // empty')
+
   if err=$(transport_dispatch "${RPANE}" "Review request.
 Rubric: ${HOME}/.config/review/rubric.md
 Request: ${REQ}
 Round: ${cur}/${cap}
 Target sha: ${TARGET}
 ${prev_block}Write findings to ${OUT} and reply with only that path."); then
-    { date +%s; echo "${TARGET}"; echo "${RPANE}"; } > "${SENT}"
+    { date +%s; echo "${TARGET}"; echo "${RPANE}"; echo "${terminal}"; echo "${session}"; } > "${SENT}"
   else
     code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
     : "${code:=unknown_error}"
@@ -533,10 +595,6 @@ ${prev_block}Write findings to ${OUT} and reply with only that path."); then
         echo "STOP: 注入失败：${err}"; exit 4;;
     esac
   fi
-else
-  START=$(sed -n '1p' "${SENT}")
-  saved=$(sed -n '3p' "${SENT}")
-  [ -n "${saved}" ] && RPANE="${saved}"
 fi
 
 # ---- 完成处理 ----
@@ -546,6 +604,7 @@ finish() {
   sha=$(git rev-parse --short HEAD)
   printf '%s | %s | round %s/%s | %ss\n' \
     "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" >> "${ARCHIVE_DIR}/timing.md"
+  # precision 半自动：脚本填 blocking 条数，误报数留问号给人改
   # 容忍格式漂移：允许 ##/###、列表符号、粗体包裹，分隔符可为 | 或 :
   nb=$(grep -icE '^[[:space:]]*[#*_ -]*F[0-9]+[[:space:]*_]*[|:][[:space:]*_]*blocking' "${OUT}" 2>/dev/null || true)
   printf '%s | %s | blocking %s | 误报 ?\n' "$(date +%F)" "${sha}" "${nb:-0}" \
@@ -1020,7 +1079,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `ERROR: REVIEW_WT 不存在` | 路径写错，或 worktree 被删了 | 见步骤 2 |
 | `STOP: 里有多个 agent` | worktree 里开了不止一个 agent | 关掉多余的 |
 | `STOP: 里跑的是 X，期望 claude` | 那个 pane 里是别的东西 | 去看看那个 pane |
-| `STOP: 启动 claude 失败` + `agent_name_taken` | 那个 pane 里已有同名 agent | 通常是 `transport_find` 没找到它；检查 `REVIEW_WT` 与 agent 的 `foreground_cwd` 是否完全一致 |
+| `STOP: 启动 claude 失败` + `agent_name_taken` | 已有同名 agent，但发现阶段漏掉了它 | 检查 `REVIEW_WT` 与 agent 的稳定 `cwd` 是否完全一致；已发送轮次不应进入启动路径 |
 | `STOP: 停在对话框` | 评审方弹了审批 | 亲自去那个 pane 看，**不要让 agent 代答** |
 | 评审方拒绝执行 | request 里的 sha 或路径不存在 | 这是正确行为；修正 request |
 | `exit 3` 一直不结束 | 评审方卡住或任务太大 | 看它屏幕；必要时关掉那个 pane，下次自动重建 |
@@ -1050,6 +1109,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
       "agent_status": "idle",        // 生命周期状态，不是 "state"
       "name": "probe-cx",            // rename 之后才有
       "pane_id": "w34:pA",
+      "terminal_id": "term_...",     // 稳定终端身份，不随公开 pane ID 变化
       "cwd": "...",
       "foreground_cwd": "...",
       "workspace_id": "w34",
@@ -1097,14 +1157,17 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 
 ### 11.5 herdr 耦合面
 
-herdr 只出现在 `request-review` 的四个 `transport_*` 函数里（脚本中有注释框标出）：
+herdr 只出现在 `request-review` 的 `transport_*` 函数里（脚本中有注释框标出）：
 
 - `transport_find` — 按 cwd 找 agent
 - `transport_spawn` — 建 pane 起 agent
+- `transport_identity` — 首次派发前保存 terminal/session 身份
+- `transport_resume` — 已发送轮次按保存身份恢复并校验 agent
 - `transport_dispatch` — 注入 prompt
+- `transport_wait_ready` — 等待 agent 可接收首次 prompt
 - `transport_state` — 查生命周期状态
 
-其余全部逻辑（轮次、编号、范围冻结、reject 升级、哨兵、归档、度量）只依赖 git 和文件系统。日后想换 tmux 或走非交互路线，只改这四个函数。worktree 是纯 git 的，不用动。
+其余全部逻辑（轮次、编号、范围冻结、reject 升级、哨兵、归档、度量）只依赖 git 和文件系统。日后想换 tmux 或走非交互路线，只改这些函数。worktree 是纯 git 的，不用动。
 
 ---
 

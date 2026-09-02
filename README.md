@@ -76,7 +76,7 @@ install.sh
 
 ## herdr 耦合面
 
-herdr 只出现在 `bin/request-review` 的四个 `transport_*` 函数里（脚本中有注释框标出）。其余全部逻辑只依赖 git 和文件系统。想换 tmux 或走非交互路线，只改那四个函数。
+herdr 只出现在 `bin/request-review` 的 `transport_*` 函数里（脚本中有注释框标出）。其余全部逻辑只依赖 git 和文件系统。想换 tmux 或走非交互路线，只改这些函数。
 
 ## 已知局限
 
