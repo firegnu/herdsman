@@ -316,6 +316,7 @@ transport_find() {
 # 优先复用上次创建过的 pane（记在 $PANE_CACHE），避免失败重试时堆积孤儿 pane。
 transport_spawn() {
   local pane="" name err split cached cached_agent="" cached_kind="" cached_cwd=""
+  local process_info="" deadline ready_checks=0
   if [ -f "${PANE_CACHE}" ]; then
     cached=$(cat "${PANE_CACHE}")
     if [ -n "${cached}" ] && herdr pane get "${cached}" >/dev/null 2>&1; then
@@ -343,6 +344,35 @@ transport_spawn() {
     pane=$(printf '%s' "${split}" | jq -r '.result.pane.pane_id // empty')
     [ -n "${pane}" ] || { echo "STOP: pane split 未返回 pane_id: ${split}" >&2; return 1; }
     printf '%s' "${pane}" > "${PANE_CACHE}"
+  fi
+
+  # login shell 会在启动脚本执行前短暂看似空闲；完整谓词须连续稳定 500ms。
+  deadline=$(( $(date +%s) + 5 ))
+  while [ "$(date +%s)" -lt "${deadline}" ]; do
+    process_info=$(herdr pane process-info --pane "${pane}" 2>&1) || true
+    if printf '%s' "${process_info}" | jq -e --arg pane "${pane}" '
+      .result.process_info as $p
+      | ($p.foreground_processes // []) as $fg
+      | $p.pane_id == $pane
+        and ($p.shell_pid | type == "number")
+        and $p.shell_pid > 0
+        and $p.foreground_process_group_id == $p.shell_pid
+        and ($fg | length) == 1
+        and $fg[0].pid == $p.shell_pid
+        and ($fg[0].name | type == "string")
+        and ($fg[0].name | test("(^|[/\\\\])-?(sh|bash|dash|zsh|fish|ksh|mksh|csh|tcsh)(\\.exe)?$"; "i"))
+    ' >/dev/null 2>&1; then
+      ready_checks=$((ready_checks + 1))
+      [ "${ready_checks}" -ge 11 ] && break
+    else
+      ready_checks=0
+    fi
+    sleep 0.05
+  done
+  if [ "${ready_checks}" -lt 11 ]; then
+    echo "STOP: pane ${pane} 未在 5s 内连续 500ms 保持可用 shell；不会执行 agent start。" >&2
+    echo "herdr 原始状态: ${process_info:-<empty>}" >&2
+    return 1
   fi
 
   name="rv-$(basename "${REPO}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)"
