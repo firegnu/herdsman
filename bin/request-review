@@ -89,28 +89,35 @@ transport_find() {
 }
 
 # 在 REVIEW_WT 里取得评审 pane；已有匹配 agent 就复用，否则启动。输出 pane_id。
-# 优先复用上次创建过的 pane（记在 ${PANE_CACHE}），避免失败重试时堆积孤儿 pane。
+# 优先复用上次创建过的 pane（记在 ${PANE_CACHE}），但 pane ID 不是持久身份：
+# 不存在或已指向不匹配 agent 时废弃缓存，绝不操作那个 agent。
 transport_spawn() {
   local pane="" name err split cached cached_agent="" cached_kind="" cached_cwd=""
   local process_info="" deadline ready_checks=0
   if [ -f "${PANE_CACHE}" ]; then
     cached=$(cat "${PANE_CACHE}")
-    if [ -n "${cached}" ] && herdr pane get "${cached}" >/dev/null 2>&1; then
-      pane="${cached}"
-      cached_agent=$(herdr agent get "${pane}" 2>/dev/null) || cached_agent=""
-      cached_kind=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.agent // empty' 2>/dev/null)
-      cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.foreground_cwd // .result.agent.cwd // empty' 2>/dev/null)
-      if [ -n "${cached_kind}" ]; then
-        if [ "${cached_kind}" != "${REVIEW_KIND}" ] || [ "${cached_cwd}" != "${REVIEW_WT}" ]; then
-          echo "STOP: 缓存 pane ${pane} 已有 agent（kind=${cached_kind}, cwd=${cached_cwd:-unknown}），" >&2
-          echo "      期望 kind=${REVIEW_KIND}, cwd=${REVIEW_WT}。不会在已有 agent 的 pane 上再次执行 agent start。" >&2
-          return 1
+    if [ -n "${cached}" ]; then
+      if herdr pane get "${cached}" >/dev/null 2>&1; then
+        pane="${cached}"
+        cached_agent=$(herdr agent get "${pane}" 2>/dev/null) || cached_agent=""
+        cached_kind=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.agent // empty' 2>/dev/null)
+        cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.foreground_cwd // .result.agent.cwd // empty' 2>/dev/null)
+        if [ -n "${cached_kind}" ]; then
+          if [ "${cached_kind}" = "${REVIEW_KIND}" ] && [ "${cached_cwd}" = "${REVIEW_WT}" ]; then
+            echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
+            printf '%s' "${pane}"
+            return 0
+          fi
+          echo "NOTE: 缓存 pane ${pane} 已指向其他 agent（kind=${cached_kind}, cwd=${cached_cwd:-unknown}），废弃缓存并新建；不会操作该 agent。" >&2
+          rm -f "${PANE_CACHE}"
+          pane=""
+        else
+          echo "NOTE: 复用上次创建的空 pane ${pane}" >&2
         fi
-        echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
-        printf '%s' "${pane}"
-        return 0
+      else
+        echo "NOTE: 缓存 pane ${cached} 已不存在，废弃缓存并新建。" >&2
+        rm -f "${PANE_CACHE}"
       fi
-      echo "NOTE: 复用上次创建的空 pane ${pane}" >&2
     fi
   fi
 
