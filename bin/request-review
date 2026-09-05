@@ -6,10 +6,11 @@
 #
 # 退出码：
 #   0 = 评审完成，stdout 为 findings 文件路径
-#   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖）
+#   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
+#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
-#   5 = 流程到界（轮次上限 / 上轮存在 reject）
+#   5 = 流程到界（轮次上限 / 上轮存在 reject / 上轮把 blocking 标成 defer）
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -25,6 +26,7 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_KIND:=claude}"
 : "${REVIEW_WAIT:=600}"
 : "${REVIEW_START_TIMEOUT:=60000}"
+: "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
 
@@ -43,6 +45,8 @@ archive_previous_cycle() {
   ls "${DIR}"/r*-findings.md >/dev/null 2>&1 || return 0   # 没有残留
   sha=$(cat "${CYCLE_SHA}" 2>/dev/null); : "${sha:=unknown}"
   out="${ARCHIVE_DIR}/${sha}.md"
+  # 绝不覆盖：同名文件可能是写手手写并已提交的，覆盖会弄脏工作区且丢内容
+  n=2; while [ -e "${out}" ]; do out="${ARCHIVE_DIR}/${sha}-${n}.md"; n=$((n + 1)); done
   {
     echo "# Review cycle @ ${sha}"
     echo
@@ -65,6 +69,22 @@ archive_previous_cycle() {
 sentinel_ok() {
   [ -f "$1" ] || return 1
   [ "$(grep -v '^[[:space:]]*$' "$1" | tail -1)" = "REVIEW-COMPLETE" ]
+}
+
+# ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
+finish() {
+  local elapsed sha nb
+  elapsed=$(( $(date +%s) - START ))
+  sha=$(git rev-parse --short "${TARGET:-HEAD}")
+  printf '%s | %s | round %s/%s | %ss\n' \
+    "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" >> "${ARCHIVE_DIR}/timing.md"
+  # precision 半自动：脚本填 blocking 条数，误报数留问号给人改
+  # 容忍格式漂移：允许 ##/###、列表符号、粗体包裹，分隔符可为 | 或 :
+  nb=$(grep -icE '^[[:space:]]*[#*_ -]*F[0-9]+[[:space:]*_]*[|:][[:space:]*_]*blocking' "${OUT}" 2>/dev/null || true)
+  printf '%s | %s | blocking %s | 误报 ?\n' "$(date +%F)" "${sha}" "${nb:-0}" \
+    >> "${ARCHIVE_DIR}/precision.md"
+  echo "${OUT}"
+  exit 0
 }
 
 # ============================================================
@@ -122,7 +142,10 @@ transport_spawn() {
   fi
 
   if [ -z "${pane}" ]; then
-    split=$(herdr pane split --direction right --cwd "${REVIEW_WT}" --no-focus 2>&1) \
+    # --current 让新 pane 挂在写手自己的 pane 旁边；省略目标 herdr 会用 UI 当前聚焦的 pane，
+    # 那可能是人正在看的任何地方。脚本在 herdr 外运行时没有 HERDR_PANE_ID，退回旧行为。
+    # shellcheck disable=SC2086
+    split=$(herdr pane split ${HERDR_PANE_ID:+--current} --direction right --cwd "${REVIEW_WT}" --no-focus 2>&1) \
       || { echo "STOP: 无法创建 pane: ${split}" >&2; return 1; }
     pane=$(printf '%s' "${split}" | jq -r '.result.pane.pane_id // empty')
     [ -n "${pane}" ] || { echo "STOP: pane split 未返回 pane_id: ${split}" >&2; return 1; }
@@ -253,8 +276,6 @@ if [ "${SKIP_REVIEW:-0}" = "1" ]; then
 fi
 
 # ---- 前置条件 ----
-git diff --quiet && git diff --cached --quiet \
-  || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
 [ -f "${REQ}" ] || { echo "ERROR: 先写 ${REQ}"; exit 2; }
 
 parsed=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
@@ -266,8 +287,64 @@ read -r cur cap <<< "${parsed}"
   exit 5
 }
 
+# ---- 评审单元：kind 决定评审方执行哪套契约；base 决定它读哪段 diff ----
+kind=$(sed -n 's|^kind:[[:space:]]*\([a-z]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
+case "${kind}" in
+  code|plan) ;;
+  "") echo "ERROR: ${REQ} 缺 kind: code|plan 行 —— 一个 request 只装一种产物"; exit 2;;
+  *)  echo "ERROR: ${REQ} 的 kind 只能是 code 或 plan，现在是 ${kind}"; exit 2;;
+esac
+
+base=$(sed -n 's|^base sha:[[:space:]]*\([^[:space:]]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
+[ -n "${base}" ] || { echo "ERROR: ${REQ} 缺 base sha 行"; exit 2; }
+base=$(git rev-parse --verify -q "${base}^{commit}") \
+  || { echo "ERROR: base sha 不是本仓库的提交：$(sed -n 's|^base sha:[[:space:]]*||p' "${REQ}" | tail -1)"; exit 2; }
+git merge-base --is-ancestor "${base}" HEAD \
+  || { echo "ERROR: base sha ${base} 不是 HEAD 的祖先。base 必须是本次评审改动之前的提交"; exit 2; }
+
+# 配了 REVIEW_PLAN_PATHS 时，round 1 校验 diff 与 kind 一致（round 2+ 范围已冻结，不再校验）。
+# 模式按 shell case 匹配，* 可跨 /。
+if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}" ]; then
+  plan_hits=""; other_hits=""
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    matched=0
+    set -f   # 模式只用于 case 匹配，不能被展开成 cwd 里的真实路径
+    for pat in ${REVIEW_PLAN_PATHS}; do
+      # shellcheck disable=SC2254
+      case "${f}" in ${pat}) matched=1; break;; esac
+    done
+    set +f
+    if [ "${matched}" -eq 1 ]; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
+  done < <(git diff --name-only "${base}" HEAD)
+  if [ "${kind}" = code ] && [ -n "${plan_hits}" ]; then
+    echo "ERROR: kind: code 的 request 混入了计划文档（REVIEW_PLAN_PATHS）。拆成单独 commit 以 kind: plan 送审，或按路由规则自行闭合："
+    printf '%s' "${plan_hits}"; exit 2
+  fi
+  if [ "${kind}" = plan ] && [ -n "${other_hits}" ]; then
+    echo "ERROR: kind: plan 的 request 混入了计划文档以外的文件。计划单独 commit，其余另行处理："
+    printf '%s' "${other_hits}"; exit 2
+  fi
+fi
+
 OUT="${DIR}/r${cur}-findings.md"
 SENT="${DIR}/.r${cur}.sent"
+
+# ---- 已完成但尚未领取的评审优先交付。HEAD 动过也不算新周期：写手往往先提交了别的东西
+#      才回来领结果，把它当新周期会归档一份没人读过的 findings 再让评审方白审一遍。----
+if [ -f "${SENT}" ] && sentinel_ok "${OUT}" && [ ! -f "${DIR}/r${cur}-responses.md" ]; then
+  START=$(sed -n '1p' "${SENT}"); TARGET=$(sed -n '2p' "${SENT}")
+  [ "${TARGET}" = "$(git rev-parse HEAD)" ] \
+    || echo "NOTE: round ${cur} @ ${TARGET:0:7} 已完成且未处理，先交付它；HEAD 已是 $(git rev-parse --short HEAD)。" >&2
+  finish
+fi
+
+# 只在即将派发时要求工作区干净。续等时 target 已钉在 .sent 里，而且脚本自己会弄脏
+# 工作区（归档、timing、precision），再查一次只会把写手挡在已完成的评审外面。
+if [ ! -f "${SENT}" ]; then
+  git diff --quiet && git diff --cached --quiet \
+    || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
+fi
 
 # ---- 新周期开始：先归档上一周期，再记录本周期的 request 与 sha ----
 if [ "${cur}" -eq 1 ]; then
@@ -288,6 +365,20 @@ if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ] && grep -qiE '^[[:space:]]*F[0-9
   exit 5
 fi
 
+# ---- 上一轮把 blocking 标成 defer → defer 只允许 should / nit，blocking 交给人 ----
+if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ]; then
+  PREV_OUT="${DIR}/r${prev}-findings.md"; bad=""
+  for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+defer' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
+    # 严重度行的容错规则与 finish 里的 precision 统计保持一致
+    grep -qiE "^[[:space:]]*[#*_ -]*${id}[[:space:]*_]*[|:][[:space:]*_]*blocking" "${PREV_OUT}" 2>/dev/null \
+      && bad="${bad} ${id}"
+  done
+  if [ -n "${bad}" ]; then
+    echo "STOP: round ${prev} 把 blocking 标成 defer，blocking 只能 accept 或 reject，需人工裁决：${bad}"
+    exit 5
+  fi
+fi
+
 START=$(date +%s)
 
 # ---- 已发送：只恢复保存的 reviewer 并续等；绝不再发现、创建或派发 ----
@@ -301,6 +392,7 @@ if [ -f "${SENT}" ]; then
     || { echo "STOP: ${SENT} 的 target 与当前 HEAD 不一致，需人工确认。"; exit 4; }
   [ -n "${saved_pane}" ] || { echo "STOP: ${SENT} 缺保存的 reviewer pane，需人工确认。"; exit 4; }
   RPANE=$(transport_resume "${saved_pane}" "${saved_terminal}" "${saved_session}") || exit 4
+  TARGET="${saved_target}"
   echo "NOTE: round ${cur} 已发送，继续等待 reviewer ${RPANE}；不会重发 prompt。" >&2
 else
   # ---- 未发送：定位或拉起评审方 ----
@@ -371,21 +463,6 @@ ${prev_block}Write findings to ${OUT} and reply with only that path."); then
   fi
 fi
 
-# ---- 完成处理 ----
-finish() {
-  local elapsed sha nb
-  elapsed=$(( $(date +%s) - START ))
-  sha=$(git rev-parse --short HEAD)
-  printf '%s | %s | round %s/%s | %ss\n' \
-    "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" >> "${ARCHIVE_DIR}/timing.md"
-  # precision 半自动：脚本填 blocking 条数，误报数留问号给人改
-  # 容忍格式漂移：允许 ##/###、列表符号、粗体包裹，分隔符可为 | 或 :
-  nb=$(grep -icE '^[[:space:]]*[#*_ -]*F[0-9]+[[:space:]*_]*[|:][[:space:]*_]*blocking' "${OUT}" 2>/dev/null || true)
-  printf '%s | %s | blocking %s | 误报 ?\n' "$(date +%F)" "${sha}" "${nb:-0}" \
-    >> "${ARCHIVE_DIR}/precision.md"
-  echo "${OUT}"
-  exit 0
-}
 
 # --wait 返回后先查一次哨兵，再进轮询
 sentinel_ok "${OUT}" && finish

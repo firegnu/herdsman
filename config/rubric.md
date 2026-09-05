@@ -12,15 +12,21 @@ have reproducible evidence behind it.
    If that delta exceeds 50 commits or touches paths the brief calls core,
    say so as a finding: the brief is stale and must be re-verified.
 3. The request file at the absolute path given in the injected prompt.
+   Its `kind:` line is `code` or `plan` and selects which contract below
+   applies ("For code" or "For plans and documents"). Apply only that one.
+   Files of the other kind inside the diff are context: read them if you
+   need them, but they get no findings under this request.
 4. If Round > 1, read the previous round's two files, whose absolute paths are
    given in the injected prompt:
      - the previous findings file — this is where your finding ids come from
-     - the previous responses file — the author's accept/reject per id
+     - the previous responses file — the author's accept/reject/defer per id
    Assume you remember nothing from the previous round. These two files are the
    only record. If either is missing, stop and say so.
-5. The artifact itself at the target sha. In Round > 1 also read the diff
-   between the previous round's target sha and this one — that is what the
-   author changed in response.
+5. The artifact at the target sha. For `kind: code` that is the diff from
+   the request's base sha to the target sha; for `kind: plan` it is the
+   named document in full. In Round > 1 also read the diff between the
+   previous round's target sha and this one — that is what the author
+   changed in response.
 
 If the target sha or any path in the request does not exist, stop and say so.
 Do not proceed on a request you cannot verify.
@@ -68,17 +74,19 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
     - the fix broke something else           -> regressed
     - author rejected -> report "disputed", state in one sentence whether their
       reason holds, and do not argue further. The human decides, not you.
+    - author deferred (allowed for should/nit only) -> report "deferred" and
+      nothing else. It is archived as backlog; do not verify or argue.
   New unrelated issues go to "## Backlog", never into this cycle.
 
 Round 2 is required whenever the author changed the artifact in response to
 ANY accepted finding, not only blocking ones. An accepted should/nit fix can
 break something the original finding never touched.
 
-## For code
+## For code (kind: code)
 Every blocking finding needs a reproducing command or a failing test name.
 If the request names relevant test paths, run those first.
 
-## For plans and documents
+## For plans and documents (kind: plan)
 Required sections:
   "## Missing"        — what the plan omits
   "## Failure modes"  — what makes this plan fail in practice

@@ -46,6 +46,9 @@ REVIEW_KIND=claude
 REVIEW_WT=${WT}
 REVIEW_DIR=${RDIR}
 REVIEW_WAIT=600
+# 可选：计划/设计文档的路径模式，空格分隔，按 shell case 匹配（* 可跨 /）。
+# 配了以后 round 1 会校验：kind: code 的 diff 不含这些路径，kind: plan 的 diff 只含这些路径。
+# REVIEW_PLAN_PATHS="docs/plans/*"
 EOF
   echo "  ✓ 写好 .review.conf"
 fi
@@ -66,6 +69,12 @@ if [ -f docs/reviews/precision.md ]; then
 else
   printf '# 误报记录\n\n脚本自动追加前三项，最后的「误报 ?」由你读完 findings 后填。\n\n日期 | sha | blocking 数 | 其中误报数\n' > docs/reviews/precision.md
   echo "  ✓ 建好 docs/reviews/precision.md"
+fi
+if [ -f docs/reviews/self-closed.md ]; then
+  echo "  = self-closed.md 已存在"
+else
+  printf '# 自行闭合记录\n\n写手按路由规则判定不送审的提交。escapes.md 出现漏网时回来查它是按哪条放过去的。\n\n日期 | sha | 命中路由第几项 | 一句理由\n' > docs/reviews/self-closed.md
+  echo "  ✓ 建好 docs/reviews/self-closed.md"
 fi
 
 # ---- 4. 交接目录 ----

@@ -29,16 +29,32 @@ lockfile 刷新，以及只新增且不改变共享 fixture 或既有验收语�
 文件数量、diff 行数和文件扩展名不单独构成送审理由。
 相关检查因本次改动失败时，任务尚未完成：先修复，不得用评审代替验证。
 不确定命中哪一项，或不能确认第 2 项条件全部成立时：请求评审。
+自行闭合时向 docs/reviews/self-closed.md 追加一行：
+`日期 | sha | 命中第几项 | 一句理由`。
 你不得设置 SKIP_REVIEW —— 该变量只由人设置。
+
+### 评审单元（送审前先切 commit）
+一个 request 只装一种产物，由 request.md 的 `kind:` 声明，评审方据此只执行一套契约：
+- `code`：代码及其直接相关的测试、docstring
+- `plan`：用于约束后续实施或验收的计划或设计文档
+
+状态记录——进度摘要、plan 状态、README 指针、Decision Board、reviewer brief 标记
+之类——单独 commit，按路由第 1 项自行闭合，不送审，不得与 code 或 plan 同一 commit。
+一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
+`base sha` 必须是本次评审改动之前紧邻的提交；request-review 会校验它是 HEAD 的祖先，
+配置了 REVIEW_PLAN_PATHS 的项目还会校验 round 1 的 diff 与 kind 一致，不符则 exit 2。
 
 ### 流程
 1. 提交产物（工作区必须干净）
-2. 写 $REVIEW_DIR/request.md，含 round: n/cap；sha 与路径必须真实
+2. 写 $REVIEW_DIR/request.md，含 kind 与 round: n/cap；sha 与路径必须真实
 3. 运行 request-review，按退出码处理：
-   0 → 读它输出的路径。对每条 finding 写一行 accept 或 reject 加一句理由，
+   0 → 读它输出的路径。对每条 finding 写一行 accept、defer 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
+       accept = 本轮改；defer = 承认但本轮不改，只限 should / nit，随本轮归档进 Backlog；
+       reject = 不同意，交人裁决。blocking 只能 accept 或 reject。
        只要有任何 accepted finding 导致 artifact 改动，就必须再开一轮验证，
-       不限于 blocking；没有 accepted finding 或 artifact 未改动时不开新轮。
+       不限于 blocking；没有 accepted finding 或 artifact 未改动时不开新轮，
+       全部 defer 即一轮结束。
        should / nit 仍留在本轮 findings，随 docs/reviews/<sha>.md 归档，
        不单独立文件。
    3 → 再次运行 request-review 继续等待。
@@ -47,8 +63,9 @@ lockfile 刷新，以及只新增且不改变共享 fixture 或既有验收语�
 
 ### request.md 格式
 ```
-artifact:      <被评审的东西>
-base sha:      <上一个提交>
+artifact:      <被评审的路径或路径集合，不写清单式描述>
+kind:          <code 或 plan>
+base sha:      <本次评审改动之前紧邻的提交>
 target sha:    <本次提交>
 round:         1/3
 out of scope:  <本次明确不做的>
@@ -62,9 +79,10 @@ checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
 一行一条，行首顶格，不加标题、列表符号或粗体：
 
 F1 accept — 一句理由
-F2 reject — 一句理由
+F2 defer — 一句理由
+F3 reject — 一句理由
 
-脚本靠 `^F<n> accept|reject` 解析，格式漂移会导致 reject 检测失效。
+脚本靠 `^F<n> accept|defer|reject` 解析，格式漂移会导致 reject / defer 检测失效。
 
 ### 你不得做的事
 - 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
@@ -73,6 +91,8 @@ F2 reject — 一句理由
 - 不要替评审方回答审批或提问对话框
 - 不要关闭不是自己创建的 pane，不要运行 herdr server stop
 - 不要修改 rubric、.review.conf、或本文件中的评审规则
+- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
+  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
 
 ### 上限
 计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。

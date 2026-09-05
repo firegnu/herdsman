@@ -64,32 +64,37 @@
 
 ③ 写手判断：这次要不要评审？
    完成产物并运行相关检查 → 按 AGENTS.md 依次判断必审项、核心路径安全出口
-   必须评审 → 继续；满足自行闭合条件 → 结束
+   必须评审 → 继续；满足自行闭合条件 → 记一行 self-closed.md，结束
 
-④ 写手：git commit
-        写 ~/.review/<项目>/request.md（artifact、base sha、target sha、round: 1/3）
+④ 写手：按种类切 commit —— 代码一个、计划文档一个、状态记录一个
+        状态记录直接提交不送审；代码和计划各自一个周期
+        写 ~/.review/<项目>/request.md（artifact、kind、base sha、target sha、round: 1/3）
         跑 request-review
 
-⑤ 脚本：检查工作区干净 → 读 round → 归档上一周期并清空交接目录
+⑤ 脚本：检查工作区干净 → 读 round → 校验 kind、base sha 是 HEAD 祖先
+        （配了 REVIEW_PLAN_PATHS 则 round 1 还校验 diff 与 kind 一致）
+        → 归档上一周期并清空交接目录
         按 cwd 找评审方（没有就建 pane 起一个）
         把 review worktree reset --hard 到 target sha
         注入 prompt（rubric 路径、request 路径、round、target sha）
         --wait 返回后校验哨兵，未满足则每 10 秒轮询
 
-⑥ 评审方：读 rubric → brief → request → 代码
+⑥ 评审方：读 rubric → brief → request → 按 kind 只执行一套契约 → diff
           写 r<n>-findings.md，末行 REVIEW-COMPLETE，停
 
 ⑦ 脚本：认到哨兵 → 打印路径 → exit 0
         顺手写 timing.md 和 precision.md
 
 ⑧ 写手：读 findings
-        对每条写一行 accept/reject + 理由 → r<n>-responses.md
+        对每条写一行 accept/defer/reject + 理由 → r<n>-responses.md
+        defer 只限 should/nit：承认但本轮不改，随归档进 Backlog
         必须先写完再动代码 —— 这是判断闸门
 
 ⑨ 分叉：
-   没有 blocking          → 结束
-   有 blocking，全 accept → 改代码 → 回到 ④，round 改成 2/3
-   有任何 reject          → 下一轮开头脚本 exit 5，写手停下报告给你 → ⑩
+   没有 accept（全 defer）  → 结束，一轮
+   有 accept 且改了 artifact → 改代码 → 回到 ④，round 改成 2/3
+   有任何 reject            → 下一轮开头脚本 exit 5，写手停下报告给你 → ⑩
+   把 blocking 标成 defer   → 同上 exit 5 → ⑩
 
 ⑩ 你裁决那条争议 → 告诉写手继续或收工
 ```
@@ -128,9 +133,11 @@ cd <repo>
 herdsman-init <短名>
 ```
 
-它自动创建评审 worktree，写 `.review.conf` 和 `.gitignore` 条目，建立 `docs/reviews/`、两个度量文件与交接目录。命令幂等，已存在的内容不会被覆盖。
+它自动创建评审 worktree，写 `.review.conf` 和 `.gitignore` 条目，建立 `docs/reviews/`、三个度量文件与交接目录。命令幂等，已存在的内容不会被覆盖。
 
-`.review.conf` 有四个变量：`REVIEW_KIND` 是评审 agent 类型，`REVIEW_WT` 是评审 worktree，`REVIEW_DIR` 是交接目录，`REVIEW_WAIT` 是等待秒数；其中路径值必须是绝对路径。
+`.review.conf` 有四个必填变量：`REVIEW_KIND` 是评审 agent 类型，`REVIEW_WT` 是评审 worktree，`REVIEW_DIR` 是交接目录，`REVIEW_WAIT` 是等待秒数；其中路径值必须是绝对路径。
+
+可选的 `REVIEW_PLAN_PATHS` 是计划/设计文档的路径模式（空格分隔，按 shell `case` 匹配，`*` 可跨 `/`，如 `"docs/plans/*"`）。配了以后 round 1 会校验 `kind: code` 的 diff 不含这些路径、`kind: plan` 的 diff 只含这些路径，混装 exit 2。不配就不校验，只靠常驻指令约束写手。
 
 没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
@@ -154,7 +161,8 @@ cd <repo>
 . .review.conf
 mkdir -p "$REVIEW_DIR"
 cat > "$REVIEW_DIR/request.md" <<EOF
-artifact:      $(git rev-parse --short HEAD) 这个提交的改动
+artifact:      $(git diff --name-only HEAD~1 HEAD | tr '\n' ' ')
+kind:          code
 base sha:      $(git rev-parse HEAD~1)
 target sha:    $(git rev-parse HEAD)
 round:         1/3
@@ -172,6 +180,18 @@ request-review; echo "exit=$?"
 **然后对照**：你自己审的结论 vs 它的报告。它漏了什么、有没有编造无证据的 blocking、有没有把 taste 包装成 blocking。这次对照比任何配置都值钱，它给出第一个漏检率数据点。
 
 如果结果显示它漏了大部分你自己能发现的问题，结论不是「调 rubric」，而是**这个模型在评审位上不合适 —— 换模型比调提示词有效得多**。
+
+### 升级已有项目
+
+本仓库更新后，三层东西各有各的到达方式：
+
+| 层 | 到达方式 | 已有项目要做什么 |
+|---|---|---|
+| `bin/*`、`config/rubric.md` | `./install.sh` 全局覆盖 | 重跑一次 `install.sh` |
+| `templates/agents-section.md` | 手工追加到各项目 AGENTS.md / CLAUDE.md | 把旧的那一段整体替换（`herdsman-init` 只检测存在，不检测版本） |
+| `.review.conf`、`docs/reviews/*.md` | 项目私有 | 不必动；想启用混装校验就加 `REVIEW_PLAN_PATHS`；重跑 `herdsman-init` 会补建缺的度量文件 |
+
+request.md 的格式变化（`kind:` 必填、`base sha` 校验）由脚本在下一次 `request-review` 时以 exit 2 直接告诉写手，不需要额外通知。
 
 ---
 
@@ -212,6 +232,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
    ⚙ <sha>.md                          # 周期归档，下一周期开始时自动生成
    ✋ escapes.md                        # 漏检记录，你填
    ✋ precision.md                      # 误报记录，脚本填一半
+   🤖 self-closed.md                    # 写手自行闭合的记录，追溯漏网用
    ⚙ timing.md / skipped.md
 ```
 
@@ -232,10 +253,11 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 #
 # 退出码：
 #   0 = 评审完成，stdout 为 findings 文件路径
-#   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖）
+#   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
+#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
-#   5 = 流程到界（轮次上限 / 上轮存在 reject）
+#   5 = 流程到界（轮次上限 / 上轮存在 reject / 上轮把 blocking 标成 defer）
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -251,6 +273,7 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_KIND:=claude}"
 : "${REVIEW_WAIT:=600}"
 : "${REVIEW_START_TIMEOUT:=60000}"
+: "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
 
@@ -269,6 +292,8 @@ archive_previous_cycle() {
   ls "${DIR}"/r*-findings.md >/dev/null 2>&1 || return 0   # 没有残留
   sha=$(cat "${CYCLE_SHA}" 2>/dev/null); : "${sha:=unknown}"
   out="${ARCHIVE_DIR}/${sha}.md"
+  # 绝不覆盖：同名文件可能是写手手写并已提交的，覆盖会弄脏工作区且丢内容
+  n=2; while [ -e "${out}" ]; do out="${ARCHIVE_DIR}/${sha}-${n}.md"; n=$((n + 1)); done
   {
     echo "# Review cycle @ ${sha}"
     echo
@@ -291,6 +316,22 @@ archive_previous_cycle() {
 sentinel_ok() {
   [ -f "$1" ] || return 1
   [ "$(grep -v '^[[:space:]]*$' "$1" | tail -1)" = "REVIEW-COMPLETE" ]
+}
+
+# ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
+finish() {
+  local elapsed sha nb
+  elapsed=$(( $(date +%s) - START ))
+  sha=$(git rev-parse --short "${TARGET:-HEAD}")
+  printf '%s | %s | round %s/%s | %ss\n' \
+    "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" >> "${ARCHIVE_DIR}/timing.md"
+  # precision 半自动：脚本填 blocking 条数，误报数留问号给人改
+  # 容忍格式漂移：允许 ##/###、列表符号、粗体包裹，分隔符可为 | 或 :
+  nb=$(grep -icE '^[[:space:]]*[#*_ -]*F[0-9]+[[:space:]*_]*[|:][[:space:]*_]*blocking' "${OUT}" 2>/dev/null || true)
+  printf '%s | %s | blocking %s | 误报 ?\n' "$(date +%F)" "${sha}" "${nb:-0}" \
+    >> "${ARCHIVE_DIR}/precision.md"
+  echo "${OUT}"
+  exit 0
 }
 
 # ============================================================
@@ -348,7 +389,10 @@ transport_spawn() {
   fi
 
   if [ -z "${pane}" ]; then
-    split=$(herdr pane split --direction right --cwd "${REVIEW_WT}" --no-focus 2>&1) \
+    # --current 让新 pane 挂在写手自己的 pane 旁边；省略目标 herdr 会用 UI 当前聚焦的 pane，
+    # 那可能是人正在看的任何地方。脚本在 herdr 外运行时没有 HERDR_PANE_ID，退回旧行为。
+    # shellcheck disable=SC2086
+    split=$(herdr pane split ${HERDR_PANE_ID:+--current} --direction right --cwd "${REVIEW_WT}" --no-focus 2>&1) \
       || { echo "STOP: 无法创建 pane: ${split}" >&2; return 1; }
     pane=$(printf '%s' "${split}" | jq -r '.result.pane.pane_id // empty')
     [ -n "${pane}" ] || { echo "STOP: pane split 未返回 pane_id: ${split}" >&2; return 1; }
@@ -479,8 +523,6 @@ if [ "${SKIP_REVIEW:-0}" = "1" ]; then
 fi
 
 # ---- 前置条件 ----
-git diff --quiet && git diff --cached --quiet \
-  || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
 [ -f "${REQ}" ] || { echo "ERROR: 先写 ${REQ}"; exit 2; }
 
 parsed=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
@@ -492,8 +534,64 @@ read -r cur cap <<< "${parsed}"
   exit 5
 }
 
+# ---- 评审单元：kind 决定评审方执行哪套契约；base 决定它读哪段 diff ----
+kind=$(sed -n 's|^kind:[[:space:]]*\([a-z]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
+case "${kind}" in
+  code|plan) ;;
+  "") echo "ERROR: ${REQ} 缺 kind: code|plan 行 —— 一个 request 只装一种产物"; exit 2;;
+  *)  echo "ERROR: ${REQ} 的 kind 只能是 code 或 plan，现在是 ${kind}"; exit 2;;
+esac
+
+base=$(sed -n 's|^base sha:[[:space:]]*\([^[:space:]]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
+[ -n "${base}" ] || { echo "ERROR: ${REQ} 缺 base sha 行"; exit 2; }
+base=$(git rev-parse --verify -q "${base}^{commit}") \
+  || { echo "ERROR: base sha 不是本仓库的提交：$(sed -n 's|^base sha:[[:space:]]*||p' "${REQ}" | tail -1)"; exit 2; }
+git merge-base --is-ancestor "${base}" HEAD \
+  || { echo "ERROR: base sha ${base} 不是 HEAD 的祖先。base 必须是本次评审改动之前的提交"; exit 2; }
+
+# 配了 REVIEW_PLAN_PATHS 时，round 1 校验 diff 与 kind 一致（round 2+ 范围已冻结，不再校验）。
+# 模式按 shell case 匹配，* 可跨 /。
+if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}" ]; then
+  plan_hits=""; other_hits=""
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    matched=0
+    set -f   # 模式只用于 case 匹配，不能被展开成 cwd 里的真实路径
+    for pat in ${REVIEW_PLAN_PATHS}; do
+      # shellcheck disable=SC2254
+      case "${f}" in ${pat}) matched=1; break;; esac
+    done
+    set +f
+    if [ "${matched}" -eq 1 ]; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
+  done < <(git diff --name-only "${base}" HEAD)
+  if [ "${kind}" = code ] && [ -n "${plan_hits}" ]; then
+    echo "ERROR: kind: code 的 request 混入了计划文档（REVIEW_PLAN_PATHS）。拆成单独 commit 以 kind: plan 送审，或按路由规则自行闭合："
+    printf '%s' "${plan_hits}"; exit 2
+  fi
+  if [ "${kind}" = plan ] && [ -n "${other_hits}" ]; then
+    echo "ERROR: kind: plan 的 request 混入了计划文档以外的文件。计划单独 commit，其余另行处理："
+    printf '%s' "${other_hits}"; exit 2
+  fi
+fi
+
 OUT="${DIR}/r${cur}-findings.md"
 SENT="${DIR}/.r${cur}.sent"
+
+# ---- 已完成但尚未领取的评审优先交付。HEAD 动过也不算新周期：写手往往先提交了别的东西
+#      才回来领结果，把它当新周期会归档一份没人读过的 findings 再让评审方白审一遍。----
+if [ -f "${SENT}" ] && sentinel_ok "${OUT}" && [ ! -f "${DIR}/r${cur}-responses.md" ]; then
+  START=$(sed -n '1p' "${SENT}"); TARGET=$(sed -n '2p' "${SENT}")
+  [ "${TARGET}" = "$(git rev-parse HEAD)" ] \
+    || echo "NOTE: round ${cur} @ ${TARGET:0:7} 已完成且未处理，先交付它；HEAD 已是 $(git rev-parse --short HEAD)。" >&2
+  finish
+fi
+
+# 只在即将派发时要求工作区干净。续等时 target 已钉在 .sent 里，而且脚本自己会弄脏
+# 工作区（归档、timing、precision），再查一次只会把写手挡在已完成的评审外面。
+if [ ! -f "${SENT}" ]; then
+  git diff --quiet && git diff --cached --quiet \
+    || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
+fi
 
 # ---- 新周期开始：先归档上一周期，再记录本周期的 request 与 sha ----
 if [ "${cur}" -eq 1 ]; then
@@ -514,6 +612,20 @@ if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ] && grep -qiE '^[[:space:]]*F[0-9
   exit 5
 fi
 
+# ---- 上一轮把 blocking 标成 defer → defer 只允许 should / nit，blocking 交给人 ----
+if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ]; then
+  PREV_OUT="${DIR}/r${prev}-findings.md"; bad=""
+  for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+defer' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
+    # 严重度行的容错规则与 finish 里的 precision 统计保持一致
+    grep -qiE "^[[:space:]]*[#*_ -]*${id}[[:space:]*_]*[|:][[:space:]*_]*blocking" "${PREV_OUT}" 2>/dev/null \
+      && bad="${bad} ${id}"
+  done
+  if [ -n "${bad}" ]; then
+    echo "STOP: round ${prev} 把 blocking 标成 defer，blocking 只能 accept 或 reject，需人工裁决：${bad}"
+    exit 5
+  fi
+fi
+
 START=$(date +%s)
 
 # ---- 已发送：只恢复保存的 reviewer 并续等；绝不再发现、创建或派发 ----
@@ -527,6 +639,7 @@ if [ -f "${SENT}" ]; then
     || { echo "STOP: ${SENT} 的 target 与当前 HEAD 不一致，需人工确认。"; exit 4; }
   [ -n "${saved_pane}" ] || { echo "STOP: ${SENT} 缺保存的 reviewer pane，需人工确认。"; exit 4; }
   RPANE=$(transport_resume "${saved_pane}" "${saved_terminal}" "${saved_session}") || exit 4
+  TARGET="${saved_target}"
   echo "NOTE: round ${cur} 已发送，继续等待 reviewer ${RPANE}；不会重发 prompt。" >&2
 else
   # ---- 未发送：定位或拉起评审方 ----
@@ -597,21 +710,6 @@ ${prev_block}Write findings to ${OUT} and reply with only that path."); then
   fi
 fi
 
-# ---- 完成处理 ----
-finish() {
-  local elapsed sha nb
-  elapsed=$(( $(date +%s) - START ))
-  sha=$(git rev-parse --short HEAD)
-  printf '%s | %s | round %s/%s | %ss\n' \
-    "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" >> "${ARCHIVE_DIR}/timing.md"
-  # precision 半自动：脚本填 blocking 条数，误报数留问号给人改
-  # 容忍格式漂移：允许 ##/###、列表符号、粗体包裹，分隔符可为 | 或 :
-  nb=$(grep -icE '^[[:space:]]*[#*_ -]*F[0-9]+[[:space:]*_]*[|:][[:space:]*_]*blocking' "${OUT}" 2>/dev/null || true)
-  printf '%s | %s | blocking %s | 误报 ?\n' "$(date +%F)" "${sha}" "${nb:-0}" \
-    >> "${ARCHIVE_DIR}/precision.md"
-  echo "${OUT}"
-  exit 0
-}
 
 # --wait 返回后先查一次哨兵，再进轮询
 sentinel_ok "${OUT}" && finish
@@ -706,15 +804,21 @@ have reproducible evidence behind it.
    If that delta exceeds 50 commits or touches paths the brief calls core,
    say so as a finding: the brief is stale and must be re-verified.
 3. The request file at the absolute path given in the injected prompt.
+   Its `kind:` line is `code` or `plan` and selects which contract below
+   applies ("For code" or "For plans and documents"). Apply only that one.
+   Files of the other kind inside the diff are context: read them if you
+   need them, but they get no findings under this request.
 4. If Round > 1, read the previous round's two files, whose absolute paths are
    given in the injected prompt:
      - the previous findings file — this is where your finding ids come from
-     - the previous responses file — the author's accept/reject per id
+     - the previous responses file — the author's accept/reject/defer per id
    Assume you remember nothing from the previous round. These two files are the
    only record. If either is missing, stop and say so.
-5. The artifact itself at the target sha. In Round > 1 also read the diff
-   between the previous round's target sha and this one — that is what the
-   author changed in response.
+5. The artifact at the target sha. For `kind: code` that is the diff from
+   the request's base sha to the target sha; for `kind: plan` it is the
+   named document in full. In Round > 1 also read the diff between the
+   previous round's target sha and this one — that is what the author
+   changed in response.
 
 If the target sha or any path in the request does not exist, stop and say so.
 Do not proceed on a request you cannot verify.
@@ -726,15 +830,8 @@ End the file with a single line: REVIEW-COMPLETE
 
 ## Finding format
 Stable ids assigned in round 1, never renumbered.
-The first line of each finding must start at column 1 and be exactly:
 
 F<n> | blocking | should | nit
-
-No markdown heading marks, no list bullets, no bold. A downstream script
-parses these lines; formatting variants break it.
-
-Then, on following lines:
-
 claim:    one sentence
 evidence: file:line, or a command that reproduces it
 fix-hint: optional, one sentence, no patches
@@ -769,17 +866,19 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
     - the fix broke something else           -> regressed
     - author rejected -> report "disputed", state in one sentence whether their
       reason holds, and do not argue further. The human decides, not you.
+    - author deferred (allowed for should/nit only) -> report "deferred" and
+      nothing else. It is archived as backlog; do not verify or argue.
   New unrelated issues go to "## Backlog", never into this cycle.
 
 Round 2 is required whenever the author changed the artifact in response to
 ANY accepted finding, not only blocking ones. An accepted should/nit fix can
 break something the original finding never touched.
 
-## For code
+## For code (kind: code)
 Every blocking finding needs a reproducing command or a failing test name.
 If the request names relevant test paths, run those first.
 
-## For plans and documents
+## For plans and documents (kind: plan)
 Required sections:
   "## Missing"        — what the plan omits
   "## Failure modes"  — what makes this plan fail in practice
@@ -803,7 +902,7 @@ Required sections:
 
 评审方也在同一 repo，会读到同一份文件，标题必须写明适用对象。
 
-```markdown
+````markdown
 ## Applies to the implementing agent only
 
 ### 任务完成后的评审路由（你只读此清单，不得自行豁免）
@@ -834,27 +933,60 @@ lockfile 刷新，以及只新增且不改变共享 fixture 或既有验收语�
 文件数量、diff 行数和文件扩展名不单独构成送审理由。
 相关检查因本次改动失败时，任务尚未完成：先修复，不得用评审代替验证。
 不确定命中哪一项，或不能确认第 2 项条件全部成立时：请求评审。
+自行闭合时向 docs/reviews/self-closed.md 追加一行：
+`日期 | sha | 命中第几项 | 一句理由`。
 你不得设置 SKIP_REVIEW —— 该变量只由人设置。
+
+### 评审单元（送审前先切 commit）
+一个 request 只装一种产物，由 request.md 的 `kind:` 声明，评审方据此只执行一套契约：
+- `code`：代码及其直接相关的测试、docstring
+- `plan`：用于约束后续实施或验收的计划或设计文档
+
+状态记录——进度摘要、plan 状态、README 指针、Decision Board、reviewer brief 标记
+之类——单独 commit，按路由第 1 项自行闭合，不送审，不得与 code 或 plan 同一 commit。
+一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
+`base sha` 必须是本次评审改动之前紧邻的提交；request-review 会校验它是 HEAD 的祖先，
+配置了 REVIEW_PLAN_PATHS 的项目还会校验 round 1 的 diff 与 kind 一致，不符则 exit 2。
 
 ### 流程
 1. 提交产物（工作区必须干净）
-2. 写 $REVIEW_DIR/request.md，含 round: n/cap；sha 与路径必须真实
+2. 写 $REVIEW_DIR/request.md，含 kind 与 round: n/cap；sha 与路径必须真实
 3. 运行 request-review，按退出码处理：
-   0 → 读它输出的路径。对每条 finding 写一行 accept 或 reject 加一句理由，
+   0 → 读它输出的路径。对每条 finding 写一行 accept、defer 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
-       只有 blocking 需要下一轮；should / nit 留在本轮 findings，随
-       docs/reviews/<sha>.md 归档，不单独立文件。
+       accept = 本轮改；defer = 承认但本轮不改，只限 should / nit，随本轮归档进 Backlog；
+       reject = 不同意，交人裁决。blocking 只能 accept 或 reject。
+       只要有任何 accepted finding 导致 artifact 改动，就必须再开一轮验证，
+       不限于 blocking；没有 accepted finding 或 artifact 未改动时不开新轮，
+       全部 defer 即一轮结束。
+       should / nit 仍留在本轮 findings，随 docs/reviews/<sha>.md 归档，
+       不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
+
+### request.md 格式
+```
+artifact:      <被评审的路径或路径集合，不写清单式描述>
+kind:          <code 或 plan>
+base sha:      <本次评审改动之前紧邻的提交>
+target sha:    <本次提交>
+round:         1/3
+out of scope:  <本次明确不做的>
+risk areas:    <自我声明的风险点>
+test paths:    <相关测试目录，填了能显著缩短评审时间>
+checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
+```
+只放事实与自我声明的风险点，不放辩解。
 
 ### responses 文件格式
 一行一条，行首顶格，不加标题、列表符号或粗体：
 
 F1 accept — 一句理由
-F2 reject — 一句理由
+F2 defer — 一句理由
+F3 reject — 一句理由
 
-脚本靠 `^F<n> accept|reject` 解析，格式漂移会导致 reject 检测失效。
+脚本靠 `^F<n> accept|defer|reject` 解析，格式漂移会导致 reject / defer 检测失效。
 
 ### 你不得做的事
 - 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
@@ -863,26 +995,32 @@ F2 reject — 一句理由
 - 不要替评审方回答审批或提问对话框
 - 不要关闭不是自己创建的 pane，不要运行 herdr server stop
 - 不要修改 rubric、.review.conf、或本文件中的评审规则
+- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
+  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
 
 ### 上限
-计划与文档 2 轮，代码 3 轮。
-```
+计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
+````
 
 ### 5.5 `$REVIEW_DIR/request.md`（写手每轮改写）
 
 ```markdown
 artifact:      docs/plan-auth.md
+kind:          plan
 base sha:      1a2b3c4
 target sha:    3f9a1c2
 round:         1/3
 out of scope:  数据库迁移、前端改动
 risk areas:    token 刷新的并发路径；错误分支的回滚语义
 test paths:    tests/auth/
+checks:        npm run lint && npm run typecheck
 ```
 
 只放事实与自我声明的风险点，**不放辩解** —— 转述权的限制就落在这个模板上。
 
-`round:` 一行是脚本解析的唯一真相源。
+`round:`、`kind:`、`base sha:` 三行是脚本解析的：`round` 决定轮次；`kind` 只能是 `code` 或 `plan`，评审方据此只执行 rubric 里对应的一套契约；`base sha` 必须是 HEAD 的祖先，评审方从 `base..target` 圈定读什么。三者缺一或不合法 exit 2。
+
+`artifact:` 写路径或路径集合，不写「runner、addendum、tests、summary…」这种清单式描述 —— 清单越长，评审方越只能把 target 下相关的东西全翻一遍。
 
 **sha 和路径必须真实** —— 评审方会自行核验（实测中它会先 `ls` 再决定是否执行），写错会被直接拒绝。
 
@@ -894,7 +1032,10 @@ test paths:    tests/auth/
 F1 accept — 漏了并发路径，已加锁，fix 3f9a1c2
 F2 reject — 该行为在 request 中声明为 out-of-scope
 F3 accept — 已补测试 test_token_refresh_race
+F4 defer — 命名问题成立，但本轮不改，留 Backlog
 ```
+
+`defer` 只允许用于 should / nit：承认 finding 成立，本轮不改，随本周期归档进 Backlog，不触发新一轮。blocking 写 defer 会在下一次调用时 exit 5 交给你 —— 跟 reject 的拦截点一样。这个选项存在的原因：没有它，写手会把所有 should / nit 全 accept 全改，于是零 blocking 的周期也要买一整轮验证。
 
 ---
 
@@ -1027,6 +1168,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `timing.md` | 脚本自动写墙钟时长 | 脚本 | 当场 |
 | `escapes.md` | 日后发现的、本该被某次评审抓到的问题 | 你 | 周到月 |
 | `skipped.md` | 豁免记录 | 脚本 | 当场 |
+| `self-closed.md` | 写手按路由规则自行闭合的提交：sha、命中第几项、理由 | 写手 | 当场 |
 
 ### 那个问号
 
@@ -1051,6 +1193,10 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 ### 统计漏检而非发现数量
 
 发现数量是最容易自我欺骗的指标。
+
+### self-closed.md 是路由规则唯一的校准数据
+
+送审的那一半有 precision.md 和 timing.md；自行闭合的那一半原本没有任何记录，规则对不对无从判断。有了这份记录，escapes.md 出现一条漏网时就能追到「按哪条规则放过去的」，那才是改路由清单的依据。在此之前不要凭感觉调路由。
 
 ---
 
@@ -1094,11 +1240,17 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `ERROR: jq/herdr 不在 PATH 中` | agent 环境的 PATH 与你终端不同 | 脚本里用绝对路径 |
 | `ERROR: 缺 .review.conf` | 不在配好的仓库里，或忘了建 | 见步骤 2 |
 | `ERROR: REVIEW_WT 不存在` | 路径写错，或 worktree 被删了 | 见步骤 2 |
+| `ERROR: 缺 kind` / `kind 只能是 code 或 plan` | request.md 没声明评审单元种类 | 补 `kind:` 行；混合产物先拆 commit |
+| `ERROR: base sha ... 不是 HEAD 的祖先` | base 填成了别的分支或未来的提交 | base 写本次改动之前紧邻的提交 |
+| `ERROR: kind: code 的 request 混入了计划文档` | 代码和计划文档同一个 commit | 拆成两个 commit，各自一个周期；状态记录单独提交不送审 |
+| `STOP: 把 blocking 标成 defer` | 写手想把 blocking 推到以后 | 你裁决：改成 accept 或 reject |
 | `STOP: 里有多个 agent` | worktree 里开了不止一个 agent | 关掉多余的 |
 | `STOP: 里跑的是 X，期望 claude` | 那个 pane 里是别的东西 | 去看看那个 pane |
 | `STOP: 启动 claude 失败` + `agent_name_taken` | 已有同名 agent，但发现阶段漏掉了它 | 检查 `REVIEW_WT` 与 agent 的稳定 `cwd` 是否完全一致；已发送轮次不应进入启动路径 |
 | `STOP: 停在对话框` | 评审方弹了审批 | 亲自去那个 pane 看，**不要让 agent 代答** |
 | 评审方拒绝执行 | request 里的 sha 或路径不存在 | 这是正确行为；修正 request |
+| 提交后重跑 round 1，findings 被归档、评审方重审 | 旧版脚本把 HEAD 变化当新周期 | 已修：已完成且无 responses 的评审优先交付，不看 HEAD |
+| `docs/reviews/<sha>-2.md` 出现 | 写手手写并提交了同名归档，脚本另存了一份 | 二选一删掉，提醒写手不要手写归档 |
 | `exit 3` 一直不结束 | 评审方卡住或任务太大 | 看它屏幕；必要时关掉那个 pane，下次自动重建 |
 | 非 0/2/3/4/5 的退出码 | 脚本崩溃 | 让写手原样报告，不要重试 |
 

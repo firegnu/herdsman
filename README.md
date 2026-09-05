@@ -64,14 +64,15 @@ install.sh
 
 ```
 你 → 写手：做 X
-写手改代码 → 判断要不要评审 → commit → 写 request.md → request-review
-  脚本：找/建评审方 → worktree reset 到 target sha → 注入 → 等哨兵
-  评审方：读 rubric → brief → request → 代码 → 写 findings → 停
+写手改代码 → 判断要不要评审 → 按种类切 commit（代码 / 计划 / 状态记录）
+  状态记录直接提交；代码或计划各写一份 request.md（含 kind）→ request-review
+  脚本：校验 kind、base sha → 找/建评审方 → worktree reset 到 target sha → 注入 → 等哨兵
+  评审方：读 rubric → brief → request → 按 kind 只执行一套契约 → 写 findings → 停
   脚本：exit 0，打印路径，记 timing / precision
 写手：读 findings → 写 responses（先写后改）→ 改代码
-  无 blocking → 结束
-  有 blocking → round 2，回到上面
-  有 reject   → exit 5，交给你裁决
+  accept 且改了 artifact → round 2，回到上面
+  全部 defer（仅 should/nit）→ 结束
+  有 reject / defer 了 blocking → exit 5，交给你裁决
 ```
 
 ## herdr 耦合面
