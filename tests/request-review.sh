@@ -55,7 +55,7 @@ reviewer() {
 case "$1 $2" in
   'agent list')
     case "${MOCK_SCENARIO}" in
-      new|live)
+      new|live|lost-once|lost|stalled-working)
         printf '{"result":{"agents":['; reviewer reviewer-pane working; printf ']}}\n';;
       changed)
         printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","pane_id":"reviewer-pane","terminal_id":"term-review","cwd":"/other","foreground_cwd":"%s","interactive_ready":true}]}}\n' "${MOCK_REVIEW_WT}";;
@@ -66,8 +66,15 @@ case "$1 $2" in
     ;;
   'agent get')
     case "${MOCK_SCENARIO}:$3" in
-      new:reviewer-pane|live:reviewer-pane)
+      new:reviewer-pane|live:reviewer-pane|lost-once:reviewer-pane|lost:reviewer-pane)
         printf '{"result":{"agent":'; reviewer reviewer-pane idle; printf '}}\n';;
+      stalled-working:reviewer-pane)
+        # idle until a prompt has been sent, then working even though herdr said stalled
+        if [ "$(grep -c '^agent prompt ' "${MOCK_LOG}")" -eq 0 ]; then
+          printf '{"result":{"agent":'; reviewer reviewer-pane idle; printf '}}\n'
+        else
+          printf '{"result":{"agent":'; reviewer reviewer-pane working; printf '}}\n'
+        fi;;
       stale:old-pane)
         printf '{"result":{"agent":{"agent":"claude","agent_status":"working","pane_id":"old-pane","terminal_id":"term-other","cwd":"/Users/firegnu/.local/share/blender_mcp/mcp","foreground_cwd":"/Users/firegnu/.local/share/blender_mcp/mcp","interactive_ready":true}}}\n';;
       stale:new-pane)
@@ -86,6 +93,12 @@ case "$1 $2" in
     printf '{"result":{"process_info":{"pane_id":"%s","shell_pid":123,"foreground_process_group_id":123,"foreground_processes":[{"pid":123,"name":"bash"}]}}}\n' "$4";;
   'agent start') exit 0;;
   'agent prompt')
+    # lost-once: the first prompt lands in the agent's startup window and never registers;
+    # lost: no prompt ever registers. herdr reports both as agent_prompt_stalled.
+    if [ "${MOCK_SCENARIO}" = lost ] || [ "${MOCK_SCENARIO}" = stalled-working ] \
+      || { [ "${MOCK_SCENARIO}" = lost-once ] && [ "$(grep -c '^agent prompt ' "${MOCK_LOG}")" -eq 1 ]; }; then
+      printf '{"error":{"code":"agent_prompt_stalled"}}\n' >&2; exit 1
+    fi
     printf '{"result":{"agent":'; reviewer "$3" working; printf '}}\n';;
   *) echo "unexpected herdr call: $*" >&2; exit 1;;
 esac
@@ -279,6 +292,33 @@ assert_eq "$(sed -n '4p' "${SENT}")" term-review 'saved terminal identity'
 assert_eq "$(sed -n '5p' "${SENT}")" '{"agent":"claude","kind":"id","source":"herdr:claude","value":"session-review"}' 'saved session identity'
 cp "${SENT}" "${TMP}/sent-with-identity"
 echo 'PASS new request dispatches once using stable cwd'
+
+# Delivery is confirmed by the reviewer's state change, not by the prompt command's exit
+# status: a prompt swallowed in the agent's startup window is resent once.
+cp "${SENT}" "${TMP}/sent-keep"; rm -f "${SENT}"
+run_review lost-once
+assert_eq "${RUN_STATUS}" 3 'lost-once status'
+assert_eq "$(call_count '^agent prompt reviewer-pane ')" 2 'lost-once prompt count'
+[ -f "${SENT}" ] || fail 'lost-once did not record the confirmed delivery'
+echo 'PASS swallowed prompt is resent once and confirmed'
+
+# When no prompt registers the script fails closed: no sent marker, human looks at the pane.
+rm -f "${SENT}"
+run_review lost
+assert_eq "${RUN_STATUS}" 4 'lost status'
+assert_eq "$(call_count '^agent prompt reviewer-pane ')" 2 'lost prompt count'
+[ ! -f "${SENT}" ] || fail 'lost wrote a sent marker without delivery'
+grep -q 'STOP: .*送达' "${TMP}/stdout" "${TMP}/stderr" || fail 'lost stdout lacks delivery STOP'
+echo 'PASS undelivered prompt fails closed without a sent marker'
+
+# herdr's stalled report is not trusted over the reviewer's own state: already working
+# means delivered, so nothing is resent.
+run_review stalled-working
+assert_eq "${RUN_STATUS}" 3 'stalled-working status'
+assert_eq "$(call_count '^agent prompt reviewer-pane ')" 1 'stalled-working prompt count'
+[ -f "${SENT}" ] || fail 'stalled-working did not record delivery'
+cp "${TMP}/sent-keep" "${SENT}"
+echo 'PASS stalled report with a working reviewer counts as delivered'
 
 # A sent round resumes the saved reviewer and never discovers, creates, or prompts again.
 printf 'partial findings\n' > "${REVIEW_DIR}/r1-findings.md"

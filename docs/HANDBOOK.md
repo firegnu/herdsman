@@ -492,9 +492,12 @@ transport_resume() {    # $1=pane_id  $2=terminal_id(legacy 可空)  $3=agent_se
   printf '%s' "${pane}"
 }
 
-# 注入 prompt。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
+# 注入 prompt 并等评审方状态变为 working/blocked，那才是送达证据：herdr 在 agent 进程
+# 出现后几秒就报 interactive_ready，但 Claude 自身初始化还没完，这段空窗里 prompt 会被
+# 静默吞掉而命令仍返回成功（09-06 复现）。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
 transport_dispatch() {   # $1=pane_id  $2=prompt
-  { herdr agent prompt "$1" "$2" >/dev/null; } 2>&1
+  { herdr agent prompt "$1" "$2" --wait --until working --until blocked \
+      --timeout "${REVIEW_START_TIMEOUT}" >/dev/null; } 2>&1
 }
 
 # 等待交互 agent 进入可接收 prompt 的已就绪、非工作态。
@@ -553,17 +556,29 @@ acquire_reviewer() {     # $1=target sha
 }
 
 # 注入 prompt 并写已发送标记（start、target、pane、terminal、session）。失败返回 1（已打印 STOP）。
+# 送达以状态变化为准。herdr 报 stalled/timeout 时先核实状态：已在 working/blocked 就是
+# 送达（herdr 有过 stalled 误报）；仍 idle 才重发一次；再失败就 fail closed，不写标记。
 send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
-  local identity terminal session err code
+  local identity terminal session err code attempt st
   identity=$(transport_identity "$1") || return 1
   terminal=$(printf '%s' "${identity}" | jq -r '.terminal_id')
   session=$(printf '%s' "${identity}" | jq -cS '.agent_session // empty')
-  if err=$(transport_dispatch "$1" "$4"); then
-    { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
-    return 0
-  fi
-  code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
-  : "${code:=unknown_error}"
+  for attempt in 1 2; do
+    if err=$(transport_dispatch "$1" "$4"); then
+      { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
+      return 0
+    fi
+    code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
+    : "${code:=unknown_error}"
+    case "${code}" in agent_prompt_stalled|timeout) ;; *) break;; esac
+    st=$(transport_state "$1")
+    case "${st}" in
+      working|blocked)
+        { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
+        return 0;;
+    esac
+    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，评审方仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
+  done
   case "${code}" in
     agent_blocked)
       echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。" >&2
@@ -571,7 +586,7 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
     agent_not_found|agent_not_running)
       echo "STOP: 评审方在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
     agent_prompt_stalled|timeout)
-      echo "STOP: ${code}，无法确认评审请求是否送达（pane $1）。" >&2
+      echo "STOP: ${code}，重发一次后评审方仍 ${st:-unknown}，评审请求未送达（pane $1）。" >&2
       echo "      未写 $3；请你亲自查看 pane，确认状态后再决定是否重试。" >&2;;
     *)
       echo "STOP: 注入失败：${err}" >&2;;
@@ -1427,7 +1442,8 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | 写手 bash 工具长时阻塞 | `sleep 180` 完整等回，`REVIEW_WAIT=600` 可用 |
 | 多行 prompt 注入 | 六行模板完整送达，作为单条消息处理 |
 | 文件哨兵 | 末行 `REVIEW-COMPLETE` 无尾随空行；判据仍用「最后一个非空行」以容错 |
-| prompt 派送与审阅等待 | 不用 `--wait`；命令成功即记录已送达，完成状态只由 findings 文件哨兵轮询 |
+| prompt 派送与审阅等待 | `--wait --until working --until blocked`，评审方状态变化才算送达；报 stalled/timeout 时核实状态，仍 idle 才重发一次，再失败不写 `.sent`。完成状态只由 findings 文件哨兵轮询 |
+| 启动空窗 | herdr 在 claude 进程出现后约 4s 报 `interactive_ready`，但 Claude 自身初始化可能还没完成，此时 `agent prompt` 返回成功而输入被吞（09-06 复现，与就绪判定差不到 1s）。所以就绪判定只是省时，送达以状态变化为准 |
 | agent 退出后名字清除 | 确认，返回 `agent_not_found` |
 | `pane wait-output` 作完成信号 | **不可用** —— 它会立即检查已有输出，注入的 prompt 就在屏幕上，哨兵词会瞬间假匹配 |
 | blocked 状态识别 | 写手侧无法测（跳过确认模式不弹窗）；评审方侧保留确认模式时可触发 |
@@ -1451,7 +1467,7 @@ herdr 只出现在 `request-review` 的 `transport_*` 函数里（脚本中有�
 - `transport_spawn` — 建 pane 起 agent
 - `transport_identity` — 首次派发前保存 terminal/session 身份
 - `transport_resume` — 已发送轮次按保存身份恢复并校验 agent
-- `transport_dispatch` — 注入 prompt
+- `transport_dispatch` — 注入 prompt 并等状态变化作送达证据
 - `transport_wait_ready` — 等待 agent 可接收首次 prompt
 - `transport_state` — 查生命周期状态
 

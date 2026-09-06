@@ -238,9 +238,12 @@ transport_resume() {    # $1=pane_id  $2=terminal_id(legacy 可空)  $3=agent_se
   printf '%s' "${pane}"
 }
 
-# 注入 prompt。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
+# 注入 prompt 并等评审方状态变为 working/blocked，那才是送达证据：herdr 在 agent 进程
+# 出现后几秒就报 interactive_ready，但 Claude 自身初始化还没完，这段空窗里 prompt 会被
+# 静默吞掉而命令仍返回成功（09-06 复现）。成功返回空；失败在 stdout 给出 herdr 的错误 JSON。
 transport_dispatch() {   # $1=pane_id  $2=prompt
-  { herdr agent prompt "$1" "$2" >/dev/null; } 2>&1
+  { herdr agent prompt "$1" "$2" --wait --until working --until blocked \
+      --timeout "${REVIEW_START_TIMEOUT}" >/dev/null; } 2>&1
 }
 
 # 等待交互 agent 进入可接收 prompt 的已就绪、非工作态。
@@ -299,17 +302,29 @@ acquire_reviewer() {     # $1=target sha
 }
 
 # 注入 prompt 并写已发送标记（start、target、pane、terminal、session）。失败返回 1（已打印 STOP）。
+# 送达以状态变化为准。herdr 报 stalled/timeout 时先核实状态：已在 working/blocked 就是
+# 送达（herdr 有过 stalled 误报）；仍 idle 才重发一次；再失败就 fail closed，不写标记。
 send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
-  local identity terminal session err code
+  local identity terminal session err code attempt st
   identity=$(transport_identity "$1") || return 1
   terminal=$(printf '%s' "${identity}" | jq -r '.terminal_id')
   session=$(printf '%s' "${identity}" | jq -cS '.agent_session // empty')
-  if err=$(transport_dispatch "$1" "$4"); then
-    { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
-    return 0
-  fi
-  code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
-  : "${code:=unknown_error}"
+  for attempt in 1 2; do
+    if err=$(transport_dispatch "$1" "$4"); then
+      { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
+      return 0
+    fi
+    code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
+    : "${code:=unknown_error}"
+    case "${code}" in agent_prompt_stalled|timeout) ;; *) break;; esac
+    st=$(transport_state "$1")
+    case "${st}" in
+      working|blocked)
+        { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
+        return 0;;
+    esac
+    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，评审方仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
+  done
   case "${code}" in
     agent_blocked)
       echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。" >&2
@@ -317,7 +332,7 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
     agent_not_found|agent_not_running)
       echo "STOP: 评审方在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
     agent_prompt_stalled|timeout)
-      echo "STOP: ${code}，无法确认评审请求是否送达（pane $1）。" >&2
+      echo "STOP: ${code}，重发一次后评审方仍 ${st:-unknown}，评审请求未送达（pane $1）。" >&2
       echo "      未写 $3；请你亲自查看 pane，确认状态后再决定是否重试。" >&2;;
     *)
       echo "STOP: 注入失败：${err}" >&2;;
