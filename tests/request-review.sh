@@ -428,3 +428,22 @@ assert_eq "${RUN_STATUS}" 3 'claimed review new cycle status'
 assert_eq "$(call_count '^agent prompt ')" 1 'claimed review new cycle prompt count'
 [ -f "${REPO}/docs/reviews/${OLD_HEAD:0:7}.md" ] || [ -f "${REPO}/docs/reviews/unknown.md" ] || fail 'previous cycle not archived'
 echo 'PASS claimed review lets round 1 start a new cycle'
+
+# A finished round 2+ (findings claimed by responses) is a closed cycle: the stale
+# request.md must not make the next commit look like a continuation. It is triaged.
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/r*-findings.md "${REVIEW_DIR}"/r*-responses.md "${REVIEW_DIR}"/.cycle* "${REVIEW_DIR}"/.triage*
+OLD_HEAD=$(git -C "${REPO}" rev-parse HEAD)
+write_request code "${OLD_HEAD}" 2/3
+printf 'F1 | should\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r2-findings.md"
+printf 'F1 defer — later\n' > "${REVIEW_DIR}/r2-responses.md"
+printf '%s\n%s\nreviewer-pane\nterm-review\n{"agent":"claude","kind":"id","source":"herdr:claude","value":"session-review"}\n' \
+  "$(date +%s)" "${OLD_HEAD}" > "${REVIEW_DIR}/.r2.sent"
+commit_file notes2.md 'status record after closed cycle'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'closed round-2 cycle then text commit status'
+grep -q '^SKIP:' "${TMP}/stdout" || fail 'closed round-2 cycle text commit not skipped'
+commit_file src/w.py 'code after closed cycle'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'closed round-2 cycle then code commit status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'closed round-2 cycle triage prompt count'
+echo 'PASS closed round-2 cycle does not block triage of later commits'

@@ -441,12 +441,14 @@ if [ "${SKIP_REVIEW:-0}" = "1" ]; then
   echo "SKIPPED: 已记入 docs/reviews/skipped.md"; exit 0
 fi
 
-# ---- 路由：只有针对 HEAD 的 request（或已进入第 2 轮之后）才是明确的评审请求 ----
+# ---- 路由：只有针对 HEAD 的 request，或仍未答复的第 2 轮之后，才是明确的评审请求 ----
+# 第 n 轮的 findings 一旦有了 responses，这个周期就是结束的；留下的 request.md 不能让
+# 后续提交被当成续等（会因 target 与 HEAD 不一致 exit 4），它们照常走 triage。
 explicit=0
 if [ -f "${REQ}" ]; then
   req_round=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/.*|\1|p' "${REQ}" | tail -1)
   req_target=$(sed -n 's|^target sha:[[:space:]]*\([^[:space:]]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
-  if [ "${req_round:-1}" -gt 1 ]; then explicit=1
+  if [ "${req_round:-1}" -gt 1 ] && [ ! -f "${DIR}/r${req_round}-responses.md" ]; then explicit=1
   elif [ -n "${req_target}" ] && [ "$(git rev-parse --verify -q "${req_target}^{commit}")" = "$(git rev-parse HEAD)" ]; then explicit=1
   fi
 fi
