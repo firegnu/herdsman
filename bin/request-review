@@ -14,7 +14,7 @@
 #       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
-#   5 = 流程到界（轮次上限 / 上轮存在 reject / 上轮把 blocking 标成 defer）
+#   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = triage 判定需要评审，stdout 为 REVIEW: <理由>；写 request.md 后再次运行
 set -uo pipefail
 
@@ -60,13 +60,13 @@ archive_previous_cycle() {
       echo; echo "## Request"; echo; cat "${CYCLE_REQ}"
     fi
     for n in 1 2 3 4 5; do
-      for f in "${DIR}/r${n}-findings.md" "${DIR}/r${n}-responses.md"; do
+      for f in "${DIR}/r${n}-findings.md" "${DIR}/r${n}-responses.md" "${DIR}/r${n}-decision.md"; do
         [ -f "${f}" ] || continue
         echo; echo "## $(basename "${f}")"; echo; cat "${f}"
       done
     done
   } > "${out}"
-  rm -f "${DIR}"/r*-findings.md "${DIR}"/r*-responses.md "${DIR}"/.r*.sent "${CYCLE_REQ}" "${CYCLE_SHA}"
+  rm -f "${DIR}"/r*-findings.md "${DIR}"/r*-responses.md "${DIR}"/r*-decision.md "${DIR}"/.r*.sent "${CYCLE_REQ}" "${CYCLE_SHA}"
   echo "NOTE: 上一周期已归档到 ${out}，交接目录已清空。" >&2
 }
 
@@ -535,24 +535,28 @@ if [ "${cur}" -eq 1 ]; then
   fi
 fi
 
-# ---- 上一轮存在 reject → 分歧不是缺陷，立即升级，不消耗轮次 ----
-prev=$((cur - 1)); PREV_RESP="${DIR}/r${prev}-responses.md"
-if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ] && grep -qiE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}"; then
-  echo "STOP: round ${prev} 存在 reject，需人工裁决，不要进入下一轮："
-  grep -iE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}"
-  exit 5
-fi
-
-# ---- 上一轮把 blocking 标成 defer → defer 只允许 should / nit，blocking 交给人 ----
+# ---- 上一轮存在 reject 或把 blocking 标成 defer → 分歧不是缺陷，升级给人，不消耗轮次 ----
+# 人的裁决记在 r<prev>-decision.md，一行一条：`F<n> uphold|overrule — 理由`
+# （uphold = 写手的 reject/defer 成立；overrule = finding 成立，写手须改）。每个待裁决
+# 的 id 都有裁决行才放行；周期、findings、responses 都不动，评审方在下一轮看到裁决路径。
+prev=$((cur - 1)); PREV_RESP="${DIR}/r${prev}-responses.md"; PREV_DEC="${DIR}/r${prev}-decision.md"
 if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ]; then
-  PREV_OUT="${DIR}/r${prev}-findings.md"; bad=""
+  PREV_OUT="${DIR}/r${prev}-findings.md"; pending=""; undecided=""
+  for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
+    pending="${pending} ${id}(reject)"
+  done
   for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+defer' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
     # 严重度行的容错规则与 finish 里的 precision 统计保持一致
     grep -qiE "^[[:space:]]*[#*_ -]*${id}[[:space:]*_]*[|:][[:space:]*_]*blocking" "${PREV_OUT}" 2>/dev/null \
-      && bad="${bad} ${id}"
+      && pending="${pending} ${id}(blocking-defer)"
   done
-  if [ -n "${bad}" ]; then
-    echo "STOP: round ${prev} 把 blocking 标成 defer，blocking 只能 accept 或 reject，需人工裁决：${bad}"
+  for item in ${pending}; do
+    id="${item%%(*}"
+    grep -qiE "^[[:space:]]*${id}[[:space:]]+(uphold|overrule)" "${PREV_DEC}" 2>/dev/null || undecided="${undecided} ${item}"
+  done
+  if [ -n "${undecided}" ]; then
+    echo "STOP: round ${prev} 有待人工裁决的 finding，不进入下一轮：${undecided}"
+    echo "      人裁决后逐条记入 ${PREV_DEC}（每行 F<n> uphold|overrule — 理由），再次运行即可继续本周期。"
     exit 5
   fi
 fi
@@ -583,7 +587,10 @@ else
     prev_sha=$(sed -n '2p' "${DIR}/.r${prev}.sent" 2>/dev/null)
     prev_block="Previous findings: ${DIR}/r${prev}-findings.md
 Previous responses: ${DIR}/r${prev}-responses.md
-Previous target sha: ${prev_sha:-unknown}
+"
+    [ -f "${PREV_DEC}" ] && prev_block="${prev_block}Previous decisions: ${PREV_DEC}
+"
+    prev_block="${prev_block}Previous target sha: ${prev_sha:-unknown}
 "
   fi
 

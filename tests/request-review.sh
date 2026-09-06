@@ -389,6 +389,35 @@ assert_eq "${RUN_STATUS}" 3 'deferred should status'
 assert_eq "$(call_count '^agent prompt ')" 1 'deferred should prompt count'
 echo 'PASS defer stops on blocking and passes on should'
 
+# A reject stops for the human. Once the human's ruling is recorded in r<n>-decision.md
+# for every rejected (or blocking-deferred) id, the next round proceeds on the same cycle:
+# findings and responses stay, no round is consumed, the reviewer is told where the ruling is.
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/r*-decision.md
+printf 'F1 | blocking\nclaim: x\nF2 | nit\nclaim: y\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"
+printf 'F1 accept — fixed\nF2 reject — by design\n' > "${REVIEW_DIR}/r1-responses.md"
+run_review new
+assert_eq "${RUN_STATUS}" 5 'reject without decision status'
+grep -q 'r1-decision.md' "${TMP}/stdout" || fail 'reject stop does not name the decision file'
+printf 'F9 uphold — wrong id\n' > "${REVIEW_DIR}/r1-decision.md"
+run_review new
+assert_eq "${RUN_STATUS}" 5 'reject with incomplete decision status'
+grep -q 'F2' "${TMP}/stdout" || fail 'incomplete decision: stdout does not name F2'
+printf 'F2 uphold — 同意，继续吧\n' > "${REVIEW_DIR}/r1-decision.md"
+run_review new
+assert_eq "${RUN_STATUS}" 3 'reject with decision status'
+assert_eq "$(call_count '^agent prompt ')" 1 'reject with decision prompt count'
+grep -q "^Previous decisions: ${REVIEW_DIR}/r1-decision.md" "${MOCK_LOG}" || fail 'decision path not in prompt'
+[ -f "${REVIEW_DIR}/r1-findings.md" ] && [ -f "${REVIEW_DIR}/r1-responses.md" ] || fail 'decision run lost round-1 files'
+grep -q '^round: *2/3' "${REVIEW_DIR}/request.md" || fail 'decision run changed the round'
+# The same ruling file covers a deferred blocking.
+rm -f "${REVIEW_DIR}"/.r*.sent
+printf 'F1 defer — later\nF2 accept — fixed\n' > "${REVIEW_DIR}/r1-responses.md"
+printf 'F1 uphold — 允许推迟\n' > "${REVIEW_DIR}/r1-decision.md"
+run_review new
+assert_eq "${RUN_STATUS}" 3 'deferred blocking with decision status'
+rm -f "${REVIEW_DIR}"/r*-decision.md
+echo 'PASS human decision file unblocks reject and blocking defer'
+
 # Archiving never overwrites an existing file: a hand-written or committed
 # archive under the same sha gets a suffixed sibling instead.
 rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/r*-responses.md

@@ -252,7 +252,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 ### 5.1 `~/.local/bin/request-review`
 
 ```bash
-#!/usr/bin/env bash
+#!/usr/bin/env bash#!/usr/bin/env bash
 # 有界对抗评审 —— 由实施方(写手 agent)调用，无参数。
 #
 # 路由：交接目录里没有针对 HEAD 的 request.md 时，先判定这次提交要不要评审 ——
@@ -268,7 +268,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 #       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
-#   5 = 流程到界（轮次上限 / 上轮存在 reject / 上轮把 blocking 标成 defer）
+#   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = triage 判定需要评审，stdout 为 REVIEW: <理由>；写 request.md 后再次运行
 set -uo pipefail
 
@@ -314,13 +314,13 @@ archive_previous_cycle() {
       echo; echo "## Request"; echo; cat "${CYCLE_REQ}"
     fi
     for n in 1 2 3 4 5; do
-      for f in "${DIR}/r${n}-findings.md" "${DIR}/r${n}-responses.md"; do
+      for f in "${DIR}/r${n}-findings.md" "${DIR}/r${n}-responses.md" "${DIR}/r${n}-decision.md"; do
         [ -f "${f}" ] || continue
         echo; echo "## $(basename "${f}")"; echo; cat "${f}"
       done
     done
   } > "${out}"
-  rm -f "${DIR}"/r*-findings.md "${DIR}"/r*-responses.md "${DIR}"/.r*.sent "${CYCLE_REQ}" "${CYCLE_SHA}"
+  rm -f "${DIR}"/r*-findings.md "${DIR}"/r*-responses.md "${DIR}"/r*-decision.md "${DIR}"/.r*.sent "${CYCLE_REQ}" "${CYCLE_SHA}"
   echo "NOTE: 上一周期已归档到 ${out}，交接目录已清空。" >&2
 }
 
@@ -789,24 +789,28 @@ if [ "${cur}" -eq 1 ]; then
   fi
 fi
 
-# ---- 上一轮存在 reject → 分歧不是缺陷，立即升级，不消耗轮次 ----
-prev=$((cur - 1)); PREV_RESP="${DIR}/r${prev}-responses.md"
-if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ] && grep -qiE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}"; then
-  echo "STOP: round ${prev} 存在 reject，需人工裁决，不要进入下一轮："
-  grep -iE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}"
-  exit 5
-fi
-
-# ---- 上一轮把 blocking 标成 defer → defer 只允许 should / nit，blocking 交给人 ----
+# ---- 上一轮存在 reject 或把 blocking 标成 defer → 分歧不是缺陷，升级给人，不消耗轮次 ----
+# 人的裁决记在 r<prev>-decision.md，一行一条：`F<n> uphold|overrule — 理由`
+# （uphold = 写手的 reject/defer 成立；overrule = finding 成立，写手须改）。每个待裁决
+# 的 id 都有裁决行才放行；周期、findings、responses 都不动，评审方在下一轮看到裁决路径。
+prev=$((cur - 1)); PREV_RESP="${DIR}/r${prev}-responses.md"; PREV_DEC="${DIR}/r${prev}-decision.md"
 if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ]; then
-  PREV_OUT="${DIR}/r${prev}-findings.md"; bad=""
+  PREV_OUT="${DIR}/r${prev}-findings.md"; pending=""; undecided=""
+  for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
+    pending="${pending} ${id}(reject)"
+  done
   for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+defer' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
     # 严重度行的容错规则与 finish 里的 precision 统计保持一致
     grep -qiE "^[[:space:]]*[#*_ -]*${id}[[:space:]*_]*[|:][[:space:]*_]*blocking" "${PREV_OUT}" 2>/dev/null \
-      && bad="${bad} ${id}"
+      && pending="${pending} ${id}(blocking-defer)"
   done
-  if [ -n "${bad}" ]; then
-    echo "STOP: round ${prev} 把 blocking 标成 defer，blocking 只能 accept 或 reject，需人工裁决：${bad}"
+  for item in ${pending}; do
+    id="${item%%(*}"
+    grep -qiE "^[[:space:]]*${id}[[:space:]]+(uphold|overrule)" "${PREV_DEC}" 2>/dev/null || undecided="${undecided} ${item}"
+  done
+  if [ -n "${undecided}" ]; then
+    echo "STOP: round ${prev} 有待人工裁决的 finding，不进入下一轮：${undecided}"
+    echo "      人裁决后逐条记入 ${PREV_DEC}（每行 F<n> uphold|overrule — 理由），再次运行即可继续本周期。"
     exit 5
   fi
 fi
@@ -837,7 +841,10 @@ else
     prev_sha=$(sed -n '2p' "${DIR}/.r${prev}.sent" 2>/dev/null)
     prev_block="Previous findings: ${DIR}/r${prev}-findings.md
 Previous responses: ${DIR}/r${prev}-responses.md
-Previous target sha: ${prev_sha:-unknown}
+"
+    [ -f "${PREV_DEC}" ] && prev_block="${prev_block}Previous decisions: ${PREV_DEC}
+"
+    prev_block="${prev_block}Previous target sha: ${prev_sha:-unknown}
 "
   fi
 
@@ -1018,6 +1025,10 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
     - the fix broke something else           -> regressed
     - author rejected -> report "disputed", state in one sentence whether their
       reason holds, and do not argue further. The human decides, not you.
+    - a "Previous decisions" file is given and lists the id as uphold -> the
+      human sided with the author: report "upheld" and nothing else, do not
+      re-raise it. Listed as overrule -> the human sided with you: verify the
+      fix as if the author had accepted.
     - author deferred (allowed for should/nit only) -> report "deferred" and
       nothing else. It is archived as backlog; do not verify or argue.
   New unrelated issues go to "## Backlog", never into this cycle.
@@ -1055,6 +1066,7 @@ Required sections:
 评审方也在同一 repo，会读到同一份文件，标题必须写明适用对象。
 
 ````markdown
+
 ## Applies to the implementing agent only
 
 ### 评审路由（你不做判断，脚本和评审方做）
@@ -1096,6 +1108,10 @@ Required sections:
        不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
+       5 因 reject 或 blocking defer 停下时：人裁决后，把裁决逐字记入同目录
+       r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
+       uphold = 你的 reject/defer 成立，overrule = finding 成立、你须改），再次运行
+       即在本周期继续下一轮，不重置、不消耗轮次。裁决只能来自人；没有人的话不得写此文件。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
 
 ### request.md 格式
@@ -1168,7 +1184,7 @@ F3 accept — 已补测试 test_token_refresh_race
 F4 defer — 命名问题成立，但本轮不改，留 Backlog
 ```
 
-`defer` 只允许用于 should / nit：承认 finding 成立，本轮不改，随本周期归档进 Backlog，不触发新一轮。blocking 写 defer 会在下一次调用时 exit 5 交给你 —— 跟 reject 的拦截点一样。这个选项存在的原因：没有它，写手会把所有 should / nit 全 accept 全改，于是零 blocking 的周期也要买一整轮验证。
+`defer` 只允许用于 should / nit：承认 finding 成立，本轮不改，随本周期归档进 Backlog，不触发新一轮。blocking 写 defer 会在下一次调用时 exit 5 交给你 —— 跟 reject 的拦截点一样。你裁决后写手把结论记入同目录 `r<n>-decision.md`（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`），再运行就在本周期继续下一轮：findings、responses 不动，不消耗轮次；评审方会在 prompt 里拿到裁决文件路径，upheld 的不再提，overruled 的按 accept 验证。这个选项存在的原因：没有它，写手会把所有 should / nit 全 accept 全改，于是零 blocking 的周期也要买一整轮验证。
 
 ---
 
@@ -1376,7 +1392,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `ERROR: 缺 kind` / `kind 只能是 code 或 plan` | request.md 没声明评审单元种类 | 补 `kind:` 行；混合产物先拆 commit |
 | `ERROR: base sha ... 不是 HEAD 的祖先` | base 填成了别的分支或未来的提交 | base 写本次改动之前紧邻的提交 |
 | `ERROR: kind: code 的 request 混入了计划文档` | 代码和计划文档同一个 commit | 拆成两个 commit，各自一个周期；状态记录单独提交不送审 |
-| `STOP: 把 blocking 标成 defer` | 写手想把 blocking 推到以后 | 你裁决：改成 accept 或 reject |
+| `STOP: 有待人工裁决的 finding` | 写手 reject 了 finding，或把 blocking 标成 defer | 你裁决，写手记入 `r<n>-decision.md`（`F<n> uphold|overrule — 理由`）后再运行，本周期继续 |
 | `exit 6` / `REVIEW: …` | triage 判定要审 | 写手写 request.md 再运行，正常 |
 | `STOP: triage 文件第一行不是 REVIEW 或 SKIP` | 评审方没按格式写 | 看 triage.md，手动改成 REVIEW/SKIP 后重跑，或删掉重发 |
 | 想跳过 triage 直接审 | — | 写 request.md（target sha = HEAD）再运行即可 |

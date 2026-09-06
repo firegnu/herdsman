@@ -40,6 +40,10 @@
        不单独立文件。
    3 → 再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
+       5 因 reject 或 blocking defer 停下时：人裁决后，把裁决逐字记入同目录
+       r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
+       uphold = 你的 reject/defer 成立，overrule = finding 成立、你须改），再次运行
+       即在本周期继续下一轮，不重置、不消耗轮次。裁决只能来自人；没有人的话不得写此文件。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
 
 ### request.md 格式

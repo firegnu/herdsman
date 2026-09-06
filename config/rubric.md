@@ -102,6 +102,10 @@ Round 2+: VERIFICATION ONLY. Scope is frozen at round 1.
     - the fix broke something else           -> regressed
     - author rejected -> report "disputed", state in one sentence whether their
       reason holds, and do not argue further. The human decides, not you.
+    - a "Previous decisions" file is given and lists the id as uphold -> the
+      human sided with the author: report "upheld" and nothing else, do not
+      re-raise it. Listed as overrule -> the human sided with you: verify the
+      fix as if the author had accepted.
     - author deferred (allowed for should/nit only) -> report "deferred" and
       nothing else. It is archived as backlog; do not verify or argue.
   New unrelated issues go to "## Backlog", never into this cycle.
