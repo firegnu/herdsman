@@ -30,6 +30,9 @@ else
   echo "  ✓ ${CFG}/rubric.md"
 fi
 
+install -m 0644 "${SRC}/templates/agents-section.md" "${CFG}/agents-section.md"
+echo "  ✓ ${CFG}/agents-section.md"
+
 echo
 missing=0
 for c in jq herdr git; do

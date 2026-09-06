@@ -62,14 +62,17 @@
 
 ② 写手干活，改代码
 
-③ 写手判断：这次要不要评审？
-   完成产物并运行相关检查 → 按 AGENTS.md 依次判断必审项、核心路径安全出口
-   必须评审 → 继续；满足自行闭合条件 → 记一行 self-closed.md，结束
+③ 写手：按种类切 commit —— 代码一个、计划文档一个、状态记录一个
+        每个 commit 后跑 request-review，不自己判断要不要审
 
-④ 写手：按种类切 commit —— 代码一个、计划文档一个、状态记录一个
-        状态记录直接提交不送审；代码和计划各自一个周期
-        写 ~/.review/<项目>/request.md（artifact、kind、base sha、target sha、round: 1/3）
-        跑 request-review
+③' 脚本路由：只改 .md/.rst/.txt → SKIP，记 self-closed.md，exit 0
+            触及 REVIEW_PLAN_PATHS → REVIEW（kind: plan），exit 6
+            其余 → 给评审方发 triage prompt（读 diff + brief，不跑测试）
+                   评审方一行 REVIEW / SKIP + 理由 → SKIP exit 0 / REVIEW exit 6
+   写手：exit 0 → 结束；exit 6 → 继续 ④
+
+④ 写手：写 ~/.review/<项目>/request.md（artifact、kind、base sha、target sha=HEAD、round: 1/3）
+        跑 request-review。有针对 HEAD 的 request.md 就是明确的评审请求，不再 triage
 
 ⑤ 脚本：检查工作区干净 → 读 round → 校验 kind、base sha 是 HEAD 祖先
         （配了 REVIEW_PLAN_PATHS 则 round 1 还校验 diff 与 kind 一致）
@@ -100,6 +103,8 @@
 ```
 
 **你只出现在 ①、⑩，以及轮次到顶时。** 其余全自动。
+
+路由里没有写手的判断：机械规则由脚本执行，语义判断由评审方做（它没有"少审一次"的利益）。项目知识全部来自 `docs/reviewer-brief.md`，常驻指令模板对所有项目一字不差。写手保留的只有"主动请求评审"的权力：直接写 request.md 运行即可。
 
 第二轮跟第一轮的区别只在 ⑤：注入的 prompt 多三行（上一轮 findings/responses 路径、上一轮 target sha），评审方按 rubric 逐条报 resolved / not-resolved / regressed / disputed，不重新评审。
 
@@ -147,10 +152,12 @@ herdsman-init <短名>
 
 ### 步骤 3 — 两件必须手工做的事
 
-1. 把第 5.4 节的 `agents-section.md` 追加到 `<repo>/AGENTS.md`（Codex 系）或 `CLAUDE.md`（Claude Code），然后把 `<核心路径清单>` 换成本项目真实路径。
-2. 用第 6 部分的提示词让写手生成 `docs/reviewer-brief.md`，生成后你亲自过一遍「不变量」那节。
+1. 把 `~/.config/review/agents-section.md`（第 5.4 节）追加到 `<repo>/AGENTS.md`（Codex 系）或 `CLAUDE.md`（Claude Code）。模板对所有项目一样，不需要改。
+2. 用第 6 部分的提示词让写手生成 `docs/reviewer-brief.md`，生成后你亲自过一遍「核心路径」和「不变量」两节——**triage 的项目知识全部来自这两节**。
 
-**这一步不要跳过。** 简报是空的话，评审方每轮从零爬全仓库，成本可能超过实施本身。
+**这一步不要跳过。** 简报是空的话，评审方每轮从零爬全仓库，triage 也只能一律说 REVIEW。
+
+有计划/设计文档目录的项目，在 `.review.conf` 加 `REVIEW_PLAN_PATHS`，否则 `.md` 计划会被当成纯文本跳过。
 
 ### 步骤 4 — 第一个真实周期
 
@@ -188,8 +195,8 @@ request-review; echo "exit=$?"
 | 层 | 到达方式 | 已有项目要做什么 |
 |---|---|---|
 | `bin/*`、`config/rubric.md` | `./install.sh` 全局覆盖 | 重跑一次 `install.sh` |
-| `templates/agents-section.md` | 手工追加到各项目 AGENTS.md / CLAUDE.md | 把旧的那一段整体替换（`herdsman-init` 只检测存在，不检测版本） |
-| `.review.conf`、`docs/reviews/*.md` | 项目私有 | 不必动；想启用混装校验就加 `REVIEW_PLAN_PATHS`；重跑 `herdsman-init` 会补建缺的度量文件 |
+| `templates/agents-section.md` | `install.sh` 装到 `~/.config/review/`，再手工追加到各项目 AGENTS.md / CLAUDE.md | 把旧的那一段整体替换（`herdsman-init` 只检测存在，不检测版本）；旧的核心路径清单不用保留，triage 读 brief |
+| `.review.conf`、`docs/reviews/*.md` | 项目私有 | 有计划文档目录的加 `REVIEW_PLAN_PATHS`（否则 .md 计划会被当纯文本跳过）；重跑 `herdsman-init` 会补建缺的度量文件 |
 
 request.md 的格式变化（`kind:` 必填、`base sha` 校验）由脚本在下一次 `request-review` 时以 exit 2 直接告诉写手，不需要额外通知。
 
@@ -232,7 +239,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
    ⚙ <sha>.md                          # 周期归档，下一周期开始时自动生成
    ✋ escapes.md                        # 漏检记录，你填
    ✋ precision.md                      # 误报记录，脚本填一半
-   🤖 self-closed.md                    # 写手自行闭合的记录，追溯漏网用
+   ⚙ self-closed.md                     # 未送审记录（脚本或 triage 判的），追溯漏网用
    ⚙ timing.md / skipped.md
 ```
 
@@ -248,16 +255,21 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 #!/usr/bin/env bash
 # 有界对抗评审 —— 由实施方(写手 agent)调用，无参数。
 #
+# 路由：交接目录里没有针对 HEAD 的 request.md 时，先判定这次提交要不要评审 ——
+# 纯文本文档改动直接跳过；触及 REVIEW_PLAN_PATHS 直接要求评审；其余交评审方 triage。
+# 有针对 HEAD 的 request.md（或已在第 2 轮之后）则视为明确要求评审，不经 triage。
+#
 # 寻址方式：按 cwd == ${REVIEW_WT} 找评审方，不依赖 agent 名字。
 # 找不到就自己建 pane 并起一个。从不关闭任何 pane —— 关不关由人决定。
 #
 # 退出码：
-#   0 = 评审完成，stdout 为 findings 文件路径
+#   0 = 评审完成，stdout 为 findings 文件路径；或 triage 判定跳过，stdout 为 SKIP: <理由>
 #   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
 #       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在 reject / 上轮把 blocking 标成 defer）
+#   6 = triage 判定需要评审，stdout 为 REVIEW: <理由>；写 request.md 后再次运行
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -312,10 +324,10 @@ archive_previous_cycle() {
   echo "NOTE: 上一周期已归档到 ${out}，交接目录已清空。" >&2
 }
 
-# 忽略尾部空行，取最后一个非空行
+# 忽略尾部空行，取最后一个非空行。$2 可指定哨兵词，默认 REVIEW-COMPLETE
 sentinel_ok() {
   [ -f "$1" ] || return 1
-  [ "$(grep -v '^[[:space:]]*$' "$1" | tail -1)" = "REVIEW-COMPLETE" ]
+  [ "$(grep -v '^[[:space:]]*$' "$1" | tail -1)" = "${2:-REVIEW-COMPLETE}" ]
 }
 
 # ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
@@ -515,6 +527,152 @@ transport_state() {      # $1=pane_id
 
 # ============================================================
 
+# 定位或拉起评审方，等它就绪，把评审 worktree reset 到 $1。输出 pane_id；失败返回 1（已打印 STOP）。
+acquire_reviewer() {     # $1=target sha
+  local found pane rkind
+  if ! found=$(transport_find); then
+    echo "STOP: ${REVIEW_WT} 里有多个 agent（见上）。同一个 worktree 只应有一个评审方。" >&2
+    echo "      关掉多余的，或把它们移到别处，再重试。" >&2
+    return 1
+  fi
+  if [ -n "${found}" ]; then
+    pane=$(printf '%s' "${found}" | awk '{print $1}')
+    rkind=$(printf '%s' "${found}" | awk '{print $2}')
+    [ "${rkind}" = "${REVIEW_KIND}" ] || {
+      echo "STOP: ${REVIEW_WT} 里跑的是 ${rkind}，期望 ${REVIEW_KIND}。请你确认那个 pane 里是什么。" >&2
+      return 1
+    }
+  else
+    echo "NOTE: ${REVIEW_WT} 里没有评审方，正在拉起 ${REVIEW_KIND} …" >&2
+    pane=$(transport_spawn) || return 1
+  fi
+  transport_wait_ready "${pane}" || return 1
+  git -C "${REVIEW_WT}" reset --hard "$1" -q \
+    || { echo "STOP: 无法将评审 worktree reset 到 $1" >&2; return 1; }
+  printf '%s' "${pane}"
+}
+
+# 注入 prompt 并写已发送标记（start、target、pane、terminal、session）。失败返回 1（已打印 STOP）。
+send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
+  local identity terminal session err code
+  identity=$(transport_identity "$1") || return 1
+  terminal=$(printf '%s' "${identity}" | jq -r '.terminal_id')
+  session=$(printf '%s' "${identity}" | jq -cS '.agent_session // empty')
+  if err=$(transport_dispatch "$1" "$4"); then
+    { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
+    return 0
+  fi
+  code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
+  : "${code:=unknown_error}"
+  case "${code}" in
+    agent_blocked)
+      echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。" >&2
+      echo "      请你亲自查看 pane $1，不要让 agent 代答。" >&2;;
+    agent_not_found|agent_not_running)
+      echo "STOP: 评审方在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
+    agent_prompt_stalled|timeout)
+      echo "STOP: ${code}，无法确认评审请求是否送达（pane $1）。" >&2
+      echo "      未写 $3；请你亲自查看 pane，确认状态后再决定是否重试。" >&2;;
+    *)
+      echo "STOP: 注入失败：${err}" >&2;;
+  esac
+  return 1
+}
+
+# 等哨兵；期间评审方 blocked 则退出 4，超时退出 3。
+wait_sentinel() {        # $1=file  $2=word  $3=pane_id
+  local deadline st
+  sentinel_ok "$1" "$2" && return 0
+  deadline=$(( $(date +%s) + REVIEW_WAIT ))
+  while [ "$(date +%s)" -lt "${deadline}" ]; do
+    sleep 10
+    sentinel_ok "$1" "$2" && return 0
+    st=$(transport_state "$3")
+    if [ "${st}" = "blocked" ]; then
+      echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
+      exit 4
+    fi
+  done
+  echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行 request-review 继续等待，不会重发 prompt。"
+  exit 3
+}
+
+# ---- 路由：判定 HEAD 这次提交要不要评审。总是以 exit 结束。----
+TRIAGE_OUT="${DIR}/triage.md"
+TRIAGE_SENT="${DIR}/.triage.sent"
+TRIAGE_MARK="${DIR}/.triage"     # 三行：sha / 判定 / 理由
+
+# 记录判定并退出：SKIP 记入 self-closed.md 后 exit 0；REVIEW exit 6。
+triage_conclude() {      # $1=sha  $2=REVIEW|SKIP  $3=谁判的  $4=理由
+  printf '%s\n%s\n%s\n' "$1" "$2" "$4" > "${TRIAGE_MARK}"
+  if [ "$2" = SKIP ]; then
+    [ -f "${ARCHIVE_DIR}/self-closed.md" ] \
+      || printf '# 未送审记录\n\n脚本判定不需评审的提交。escapes.md 出现漏网时回来查它是按什么放过去的。\n\n日期 | sha | 依据 | 理由\n' > "${ARCHIVE_DIR}/self-closed.md"
+    printf '%s | %s | %s | %s\n' "$(date +%F)" "$(git rev-parse --short "$1")" "$3" "$4" >> "${ARCHIVE_DIR}/self-closed.md"
+    echo "SKIP: $4"; exit 0
+  fi
+  echo "REVIEW: $4"; exit 6
+}
+
+triage_head() {
+  local head files f plan_hits text_only pat matched verdict reason pane saved
+  head=$(git rev-parse HEAD)
+  git diff --quiet && git diff --cached --quiet \
+    || { echo "ERROR: 工作区未提交。先提交，再运行 request-review 判定要不要评审"; exit 2; }
+
+  # 已对这个 HEAD 判过：直接复用，不再问评审方
+  if [ -f "${TRIAGE_MARK}" ] && [ "$(sed -n '1p' "${TRIAGE_MARK}")" = "${head}" ]; then
+    verdict=$(sed -n '2p' "${TRIAGE_MARK}"); reason=$(sed -n '3p' "${TRIAGE_MARK}")
+    if [ "${verdict}" = SKIP ]; then echo "SKIP: ${reason}（已记录）"; exit 0; fi
+    echo "REVIEW: ${reason}（已判定，写 ${REQ} 后再运行）"; exit 6
+  fi
+
+  files=$(git diff-tree --no-commit-id --name-only -r HEAD)
+  plan_hits=""; text_only=1
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    case "${f}" in *.md|*.markdown|*.rst|*.txt) ;; *) text_only=0;; esac
+    if [ -n "${REVIEW_PLAN_PATHS}" ]; then
+      matched=0; set -f
+      for pat in ${REVIEW_PLAN_PATHS}; do
+        # shellcheck disable=SC2254
+        case "${f}" in ${pat}) matched=1; break;; esac
+      done
+      set +f
+      [ "${matched}" -eq 1 ] && plan_hits="${plan_hits}${f} "
+    fi
+  done <<< "${files}"
+  [ -z "${plan_hits}" ] || triage_conclude "${head}" REVIEW 脚本 "触及计划文档路径（kind: plan）：${plan_hits}"
+  [ "${text_only}" -eq 0 ] || triage_conclude "${head}" SKIP 纯文本 "只改了 .md/.rst/.txt，视为状态记录"
+
+  # 交评审方判定。已发送且 sha 未变则续等；sha 变了则丢弃旧的重发。
+  if [ -f "${TRIAGE_SENT}" ] && [ "$(sed -n '2p' "${TRIAGE_SENT}")" != "${head}" ]; then
+    rm -f "${TRIAGE_SENT}" "${TRIAGE_OUT}"
+  fi
+  if [ -f "${TRIAGE_SENT}" ]; then
+    saved=$(sed -n '3p' "${TRIAGE_SENT}")
+    pane=$(transport_resume "${saved}" "$(sed -n '4p' "${TRIAGE_SENT}")" "$(sed -n '5p' "${TRIAGE_SENT}")") || exit 4
+    echo "NOTE: triage 已发送，继续等待 reviewer ${pane}；不会重发 prompt。" >&2
+  else
+    rm -f "${TRIAGE_OUT}"
+    pane=$(acquire_reviewer "${head}") || exit 4
+    send_prompt "${pane}" "${head}" "${TRIAGE_SENT}" "Triage request.
+Rubric: ${HOME}/.config/review/rubric.md
+Commit: ${head}
+Subject: $(git log -1 --format=%s HEAD)
+Decide REVIEW or SKIP per the rubric's Triage section. Do not run tests, do not gather evidence.
+Write to ${TRIAGE_OUT}: first line REVIEW or SKIP, second line one sentence why, last line TRIAGE-COMPLETE.
+Reply with only that path." || exit 4
+  fi
+  wait_sentinel "${TRIAGE_OUT}" TRIAGE-COMPLETE "${pane}"
+  verdict=$(grep -v '^[[:space:]]*$' "${TRIAGE_OUT}" | sed -n '1p' | tr -d '[:space:]*_#' | tr '[:lower:]' '[:upper:]')
+  reason=$(grep -v '^[[:space:]]*$' "${TRIAGE_OUT}" | sed -n '2p')
+  case "${verdict}" in
+    SKIP|REVIEW) triage_conclude "${head}" "${verdict}" triage "${reason:-无理由}";;
+    *) echo "STOP: triage 文件第一行不是 REVIEW 或 SKIP：${TRIAGE_OUT}"; exit 4;;
+  esac
+}
+
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----
 if [ "${SKIP_REVIEW:-0}" = "1" ]; then
   printf '%s | %s | %s\n' "$(date +%F)" "$(git rev-parse --short HEAD)" "${1:-未填写原因}" \
@@ -522,8 +680,18 @@ if [ "${SKIP_REVIEW:-0}" = "1" ]; then
   echo "SKIPPED: 已记入 docs/reviews/skipped.md"; exit 0
 fi
 
+# ---- 路由：只有针对 HEAD 的 request（或已进入第 2 轮之后）才是明确的评审请求 ----
+explicit=0
+if [ -f "${REQ}" ]; then
+  req_round=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/.*|\1|p' "${REQ}" | tail -1)
+  req_target=$(sed -n 's|^target sha:[[:space:]]*\([^[:space:]]\{1,\}\).*|\1|p' "${REQ}" | tail -1)
+  if [ "${req_round:-1}" -gt 1 ]; then explicit=1
+  elif [ -n "${req_target}" ] && [ "$(git rev-parse --verify -q "${req_target}^{commit}")" = "$(git rev-parse HEAD)" ]; then explicit=1
+  fi
+fi
+[ "${explicit}" -eq 1 ] || triage_head
+
 # ---- 前置条件 ----
-[ -f "${REQ}" ] || { echo "ERROR: 先写 ${REQ}"; exit 2; }
 
 parsed=$(sed -n 's|^round:[[:space:]]*\([0-9]\{1,\}\)/\([0-9]\{1,\}\).*|\1 \2|p' "${REQ}" | tail -1)
 [ -n "${parsed}" ] || { echo "ERROR: ${REQ} 缺少或写错 round: n/cap 行"; exit 2; }
@@ -642,32 +810,10 @@ if [ -f "${SENT}" ]; then
   TARGET="${saved_target}"
   echo "NOTE: round ${cur} 已发送，继续等待 reviewer ${RPANE}；不会重发 prompt。" >&2
 else
-  # ---- 未发送：定位或拉起评审方 ----
-  if ! found=$(transport_find); then
-    echo "STOP: ${REVIEW_WT} 里有多个 agent（见上）。同一个 worktree 只应有一个评审方。"
-    echo "      关掉多余的，或把它们移到别处，再重试。"
-    exit 4
-  fi
-  if [ -n "${found}" ]; then
-    RPANE=$(printf '%s' "${found}" | awk '{print $1}')
-    RKIND=$(printf '%s' "${found}" | awk '{print $2}')
-    [ "${RKIND}" = "${REVIEW_KIND}" ] || {
-      echo "STOP: ${REVIEW_WT} 里跑的是 ${RKIND}，期望 ${REVIEW_KIND}。请你确认那个 pane 里是什么。"
-      exit 4
-    }
-  else
-    echo "NOTE: ${REVIEW_WT} 里没有评审方，正在拉起 ${REVIEW_KIND} …" >&2
-    RPANE=$(transport_spawn) || exit 4
-  fi
-
-  # ---- 首次注入 ----
+  # ---- 未发送：定位或拉起评审方，首次注入 ----
   rm -f "${OUT}"
   TARGET=$(git rev-parse HEAD)
-
-  transport_wait_ready "${RPANE}" || exit 4
-
-  git -C "${REVIEW_WT}" reset --hard "${TARGET}" -q \
-    || { echo "STOP: 无法将评审 worktree reset 到 ${TARGET}"; exit 4; }
+  RPANE=$(acquire_reviewer "${TARGET}") || exit 4
 
   prev_block=""
   if [ "${prev}" -ge 1 ]; then
@@ -678,55 +824,16 @@ Previous target sha: ${prev_sha:-unknown}
 "
   fi
 
-  identity=$(transport_identity "${RPANE}") || exit 4
-  terminal=$(printf '%s' "${identity}" | jq -r '.terminal_id')
-  session=$(printf '%s' "${identity}" | jq -cS '.agent_session // empty')
-
-  if err=$(transport_dispatch "${RPANE}" "Review request.
+  send_prompt "${RPANE}" "${TARGET}" "${SENT}" "Review request.
 Rubric: ${HOME}/.config/review/rubric.md
 Request: ${REQ}
 Round: ${cur}/${cap}
 Target sha: ${TARGET}
-${prev_block}Write findings to ${OUT} and reply with only that path."); then
-    { date +%s; echo "${TARGET}"; echo "${RPANE}"; echo "${terminal}"; echo "${session}"; } > "${SENT}"
-  else
-    code=$(printf '%s' "${err}" | jq -r '.error.code // empty' 2>/dev/null) || code=""
-    : "${code:=unknown_error}"
-    case "${code}" in
-      agent_blocked)
-        echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。"
-        echo "      请你亲自查看 pane ${RPANE}，不要让 agent 代答。"
-        exit 4;;
-      agent_not_found|agent_not_running)
-        echo "STOP: 评审方在注入前消失了（pane ${RPANE}）。重试一次本命令即可。"
-        exit 4;;
-      agent_prompt_stalled|timeout)
-        echo "STOP: ${code}，无法确认评审请求是否送达（pane ${RPANE}）。" >&2
-        echo "      未写 ${SENT}；请你亲自查看 pane，确认状态后再决定是否重试。" >&2
-        exit 4;;
-      *)
-        echo "STOP: 注入失败：${err}"; exit 4;;
-    esac
-  fi
+${prev_block}Write findings to ${OUT} and reply with only that path." || exit 4
 fi
 
-
-# --wait 返回后先查一次哨兵，再进轮询
-sentinel_ok "${OUT}" && finish
-
-deadline=$(( $(date +%s) + REVIEW_WAIT ))
-while [ "$(date +%s)" -lt "${deadline}" ]; do
-  sleep 10
-  sentinel_ok "${OUT}" && finish
-  st=$(transport_state "${RPANE}")
-  if [ "${st}" = "blocked" ]; then
-    echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane ${RPANE}。"
-    exit 4
-  fi
-done
-
-echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行 request-review 继续等待，不会重发 prompt。"
-exit 3
+wait_sentinel "${OUT}" REVIEW-COMPLETE "${RPANE}"
+finish
 ```
 
 **改这个脚本时的两条 lint**（我踩过三次坑）：
@@ -798,7 +905,35 @@ do not run other agents, and do not redesign. You judge one artifact.
 You may compile, run tests, and search your own worktree. Every objection must
 have reproducible evidence behind it.
 
-## Read order
+## Triage (when the injected prompt says "Triage request")
+You decide whether this commit needs a review at all. Read the brief, then
+`git show <sha>` in your worktree. Do not run tests, do not gather evidence,
+do not write findings. This should take a minute, not ten.
+
+Answer REVIEW when any of these holds:
+- the diff touches a path or module the brief calls core, or could violate
+  an invariant or frozen contract the brief lists
+- it adds, changes or removes a public interface, CLI behavior, a data
+  format crossing a module boundary, persisted state, a schema, a
+  migration, or the meaning of a config option
+- it touches auth, permissions, security, concurrency, transactions,
+  idempotency, or destructive operations
+- it moves responsibility between modules, changes cross-module data flow,
+  or changes build, release, deploy or rollback behavior
+- it deletes, weakens or rewrites an existing regression assertion, shared
+  fixture, or acceptance baseline
+- it visibly departs from a plan that was reviewed
+- you cannot tell from the diff and the brief
+
+Otherwise answer SKIP. File count, line count and file extension are not
+reasons by themselves. A SKIP is a judgement you sign: the commit is
+recorded under your reason in docs/reviews/self-closed.md.
+
+Write to the path given in the prompt: first line exactly REVIEW or SKIP,
+second line one sentence why, last line TRIAGE-COMPLETE. Reply with only
+that path.
+
+## Read order (for a review request)
 1. <repo>/docs/reviewer-brief.md — project brief. Note its "verified at" sha.
 2. git log --oneline --stat <brief-sha>..HEAD — only the delta since the brief.
    If that delta exceeds 50 commits or touches paths the brief calls core,
@@ -905,36 +1040,17 @@ Required sections:
 ````markdown
 ## Applies to the implementing agent only
 
-### 任务完成后的评审路由（你只读此清单，不得自行豁免）
-完成当前产物并运行相关检查后，在请求评审与自行闭合之间二选一。
-计划和实现分别在各自完成时判断；计划已经评审，不代表实现自动免审。
-按以下顺序判断；命中前一项后，不得用后一项豁免。
+### 评审路由（你不做判断，脚本和评审方做）
+每次提交后运行 request-review。没有针对 HEAD 的 request.md 时，它先判定这次提交
+要不要评审：只改 .md/.rst/.txt 的直接跳过；触及 REVIEW_PLAN_PATHS 的直接要求评审；其余
+交给评审方 triage（只读 diff 和 reviewer-brief，不跑测试，约一分钟）。按退出码办：
+- 0 且输出 `SKIP: …` → 结束，已记入 docs/reviews/self-closed.md
+- 6 且输出 `REVIEW: …` → 写 request.md（target sha 为 HEAD）后再次运行，进入评审周期
+- 3 → 再次运行继续等待
 
-**1. 必须评审。** 满足任一条即走 request-review：
-- 人明确要求评审
-- 当前产物是用于约束后续实施或验收的计划或设计文档；调研记录、状态记录和会议纪要不算
-- 修改项目文档明确声明的不变量或冻结合同
-- 新增、修改或删除公开接口、CLI 行为、对外或跨模块数据格式、持久化状态、schema、迁移或配置语义
-- 涉及认证、权限、安全、并发、事务、幂等或破坏性操作
-- 移动模块职责、改变既有跨模块数据流，或改变构建、发布、部署、回滚行为
-- 删除、放宽或改写既有回归断言、共享 fixture 或验收基线
-- 实现实质偏离已经确认或评审过的计划
-
-**2. 核心路径内的低风险语义修改。** 对
-<核心路径清单：如 src/core/、migrations/、auth/> 作语义修改、但未命中第 1 项时，
-只有同时满足以下条件才能自行闭合；否则请求评审：
-- 改动局限于一个模块，不移动职责或改变跨模块数据流
-- 有直接覆盖目标行为的确定性回归或验收检查，且已经通过
-
-**3. 其余改动。** 未命中前两项且相关检查通过时自行闭合。典型情况包括：
-纯文案与注释、格式化、仅修改依赖版本号且不含代码适配、声明未变的生成物或
-lockfile 刷新，以及只新增且不改变共享 fixture 或既有验收语义的测试。
-
-文件数量、diff 行数和文件扩展名不单独构成送审理由。
+人明确要求评审时，直接写 request.md 运行，不经 triage。你可以随时主动请求评审；
+你不得推翻 REVIEW，不得跳过 request-review 就结束含代码的任务。
 相关检查因本次改动失败时，任务尚未完成：先修复，不得用评审代替验证。
-不确定命中哪一项，或不能确认第 2 项条件全部成立时：请求评审。
-自行闭合时向 docs/reviews/self-closed.md 追加一行：
-`日期 | sha | 命中第几项 | 一句理由`。
 你不得设置 SKIP_REVIEW —— 该变量只由人设置。
 
 ### 评审单元（送审前先切 commit）
@@ -943,14 +1059,14 @@ lockfile 刷新，以及只新增且不改变共享 fixture 或既有验收语�
 - `plan`：用于约束后续实施或验收的计划或设计文档
 
 状态记录——进度摘要、plan 状态、README 指针、Decision Board、reviewer brief 标记
-之类——单独 commit，按路由第 1 项自行闭合，不送审，不得与 code 或 plan 同一 commit。
+之类——单独 commit，不得与 code 或 plan 同一 commit；纯文本的会被脚本直接跳过。
 一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
 `base sha` 必须是本次评审改动之前紧邻的提交；request-review 会校验它是 HEAD 的祖先，
 配置了 REVIEW_PLAN_PATHS 的项目还会校验 round 1 的 diff 与 kind 一致，不符则 exit 2。
 
-### 流程
+### 评审周期（triage 判 REVIEW 或人要求评审之后）
 1. 提交产物（工作区必须干净）
-2. 写 $REVIEW_DIR/request.md，含 kind 与 round: n/cap；sha 与路径必须真实
+2. 写 $REVIEW_DIR/request.md，含 kind、target sha（= HEAD）与 round: n/cap；sha 与路径必须真实
 3. 运行 request-review，按退出码处理：
    0 → 读它输出的路径。对每条 finding 写一行 accept、defer 或 reject 加一句理由，
        写入同目录 r<n>-responses.md，**然后**才改代码。
@@ -1168,7 +1284,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `timing.md` | 脚本自动写墙钟时长 | 脚本 | 当场 |
 | `escapes.md` | 日后发现的、本该被某次评审抓到的问题 | 你 | 周到月 |
 | `skipped.md` | 豁免记录 | 脚本 | 当场 |
-| `self-closed.md` | 写手按路由规则自行闭合的提交：sha、命中第几项、理由 | 写手 | 当场 |
+| `self-closed.md` | 未送审的提交：sha、依据（纯文本 / triage）、理由 | 脚本 | 当场 |
 
 ### 那个问号
 
@@ -1194,9 +1310,9 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 
 发现数量是最容易自我欺骗的指标。
 
-### self-closed.md 是路由规则唯一的校准数据
+### self-closed.md 是 triage 唯一的校准数据
 
-送审的那一半有 precision.md 和 timing.md；自行闭合的那一半原本没有任何记录，规则对不对无从判断。有了这份记录，escapes.md 出现一条漏网时就能追到「按哪条规则放过去的」，那才是改路由清单的依据。在此之前不要凭感觉调路由。
+送审的那一半有 precision.md 和 timing.md；没送审的那一半靠这份记录。escapes.md 出现一条漏网时，先查它是被「纯文本」规则放的还是 triage 放的、理由是什么。另外盯一眼 REVIEW 率（归档数 ÷ 归档数 + triage SKIP 数）：接近 100% 说明评审方偏保守，等于代码全审，安全但贵。
 
 ---
 
@@ -1244,6 +1360,9 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `ERROR: base sha ... 不是 HEAD 的祖先` | base 填成了别的分支或未来的提交 | base 写本次改动之前紧邻的提交 |
 | `ERROR: kind: code 的 request 混入了计划文档` | 代码和计划文档同一个 commit | 拆成两个 commit，各自一个周期；状态记录单独提交不送审 |
 | `STOP: 把 blocking 标成 defer` | 写手想把 blocking 推到以后 | 你裁决：改成 accept 或 reject |
+| `exit 6` / `REVIEW: …` | triage 判定要审 | 写手写 request.md 再运行，正常 |
+| `STOP: triage 文件第一行不是 REVIEW 或 SKIP` | 评审方没按格式写 | 看 triage.md，手动改成 REVIEW/SKIP 后重跑，或删掉重发 |
+| 想跳过 triage 直接审 | — | 写 request.md（target sha = HEAD）再运行即可 |
 | `STOP: 里有多个 agent` | worktree 里开了不止一个 agent | 关掉多余的 |
 | `STOP: 里跑的是 X，期望 claude` | 那个 pane 里是别的东西 | 去看看那个 pane |
 | `STOP: 启动 claude 失败` + `agent_name_taken` | 已有同名 agent，但发现阶段漏掉了它 | 检查 `REVIEW_WT` 与 agent 的稳定 `cwd` 是否完全一致；已发送轮次不应进入启动路径 |

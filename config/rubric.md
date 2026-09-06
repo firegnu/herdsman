@@ -6,7 +6,35 @@ do not run other agents, and do not redesign. You judge one artifact.
 You may compile, run tests, and search your own worktree. Every objection must
 have reproducible evidence behind it.
 
-## Read order
+## Triage (when the injected prompt says "Triage request")
+You decide whether this commit needs a review at all. Read the brief, then
+`git show <sha>` in your worktree. Do not run tests, do not gather evidence,
+do not write findings. This should take a minute, not ten.
+
+Answer REVIEW when any of these holds:
+- the diff touches a path or module the brief calls core, or could violate
+  an invariant or frozen contract the brief lists
+- it adds, changes or removes a public interface, CLI behavior, a data
+  format crossing a module boundary, persisted state, a schema, a
+  migration, or the meaning of a config option
+- it touches auth, permissions, security, concurrency, transactions,
+  idempotency, or destructive operations
+- it moves responsibility between modules, changes cross-module data flow,
+  or changes build, release, deploy or rollback behavior
+- it deletes, weakens or rewrites an existing regression assertion, shared
+  fixture, or acceptance baseline
+- it visibly departs from a plan that was reviewed
+- you cannot tell from the diff and the brief
+
+Otherwise answer SKIP. File count, line count and file extension are not
+reasons by themselves. A SKIP is a judgement you sign: the commit is
+recorded under your reason in docs/reviews/self-closed.md.
+
+Write to the path given in the prompt: first line exactly REVIEW or SKIP,
+second line one sentence why, last line TRIAGE-COMPLETE. Reply with only
+that path.
+
+## Read order (for a review request)
 1. <repo>/docs/reviewer-brief.md — project brief. Note its "verified at" sha.
 2. git log --oneline --stat <brief-sha>..HEAD — only the delta since the brief.
    If that delta exceeds 50 commits or touches paths the brief calls core,

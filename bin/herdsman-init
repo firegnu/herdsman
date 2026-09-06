@@ -46,8 +46,9 @@ REVIEW_KIND=claude
 REVIEW_WT=${WT}
 REVIEW_DIR=${RDIR}
 REVIEW_WAIT=600
-# 可选：计划/设计文档的路径模式，空格分隔，按 shell case 匹配（* 可跨 /）。
-# 配了以后 round 1 会校验：kind: code 的 diff 不含这些路径，kind: plan 的 diff 只含这些路径。
+# 计划/设计文档的路径模式，空格分隔，按 shell case 匹配（* 可跨 /）。
+# 触及这些路径的提交直接要求评审（kind: plan）；不配的话 .md 计划文档会被当成纯文本跳过。
+# 配了以后 round 1 还会校验：kind: code 的 diff 不含这些路径，kind: plan 的 diff 只含这些路径。
 # REVIEW_PLAN_PATHS="docs/plans/*"
 EOF
   echo "  ✓ 写好 .review.conf"
@@ -73,7 +74,7 @@ fi
 if [ -f docs/reviews/self-closed.md ]; then
   echo "  = self-closed.md 已存在"
 else
-  printf '# 自行闭合记录\n\n写手按路由规则判定不送审的提交。escapes.md 出现漏网时回来查它是按哪条放过去的。\n\n日期 | sha | 命中路由第几项 | 一句理由\n' > docs/reviews/self-closed.md
+  printf '# 未送审记录\n\n脚本判定不需评审的提交。escapes.md 出现漏网时回来查它是按什么放过去的。\n\n日期 | sha | 依据 | 理由\n' > docs/reviews/self-closed.md
   echo "  ✓ 建好 docs/reviews/self-closed.md"
 fi
 
@@ -107,10 +108,11 @@ if [ "${NEED_AGENTS:-0}" = "1" ]; then
   else
     echo "      把 templates/agents-section.md 的内容追加到 AGENTS.md 或 CLAUDE.md"
   fi
-  echo "      然后把里面的 <核心路径清单> 换成本项目真实路径"
+  echo "      模板对所有项目一样，不需要改；项目知识在 [2] 的简报里"
 else
-  echo "      已就绪（记得核对 <核心路径清单> 是否为本项目真实路径）"
+  echo "      已就绪"
 fi
+echo "      若有计划/设计文档目录，在 .review.conf 里配 REVIEW_PLAN_PATHS，否则 .md 计划会被当纯文本跳过"
 echo
 echo "  [2] 项目简报 docs/reviewer-brief.md"
 if [ -f docs/reviewer-brief.md ]; then

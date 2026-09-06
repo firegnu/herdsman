@@ -6,7 +6,7 @@
 
 ## 它解决什么
 
-写手写完代码，自己请求评审、自己读报告、自己逐条表态，然后继续。你不当中介。
+写手写完代码，脚本和评审方决定要不要审，写手自己读报告、自己逐条表态，然后继续。你不当中介。
 
 评审不是自由讨论 —— 是一次阻塞调用：注入请求 → 评审方写文件 → 哨兵行标记完成 → 写手继续。没有回程，评审方永不主动发起任何调用。
 
@@ -64,8 +64,9 @@ install.sh
 
 ```
 你 → 写手：做 X
-写手改代码 → 判断要不要评审 → 按种类切 commit（代码 / 计划 / 状态记录）
-  状态记录直接提交；代码或计划各写一份 request.md（含 kind）→ request-review
+写手改代码 → 按种类切 commit（代码 / 计划 / 状态记录）→ 每个 commit 后 request-review
+  脚本路由：纯文本 → SKIP；触及计划路径 → REVIEW；其余问评审方 triage（读 diff + brief，一分钟）
+  SKIP → 记 self-closed.md，结束；REVIEW → 写手写 request.md（含 kind）→ request-review
   脚本：校验 kind、base sha → 找/建评审方 → worktree reset 到 target sha → 注入 → 等哨兵
   评审方：读 rubric → brief → request → 按 kind 只执行一套契约 → 写 findings → 停
   脚本：exit 0，打印路径，记 timing / precision

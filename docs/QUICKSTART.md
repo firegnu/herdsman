@@ -29,23 +29,24 @@ cd <repo>
 herdsman-init <短名>
 ```
 
-它会建评审 worktree、写 `.review.conf`、加 `.gitignore`、建两个度量文件和交接目录，
+它会建评审 worktree、写 `.review.conf`、加 `.gitignore`、建三个度量文件和交接目录，
 然后告诉你还剩哪两件手动的事。幂等，重复跑不会覆盖已有内容。
 
 ### B2 — 常驻指令（手动）
 
 ```bash
-cat ~/src/bar/templates/agents-section.md >> AGENTS.md
+cat ~/.config/review/agents-section.md >> AGENTS.md
 ```
 
-（Claude Code 系则追加到 `CLAUDE.md`。）
+（Claude Code 系则追加到 `CLAUDE.md`。）模板对所有项目一样，不需要改。
 
-**然后改里面的 `<核心路径清单>` 为本项目真实路径。**
+有计划/设计文档目录的项目，在 `.review.conf` 加一行如 `REVIEW_PLAN_PATHS="docs/plans/*"`，
+否则 `.md` 计划会被当成纯文本跳过。
 
 ### B3 — 项目简报（手动）
 
 用 `templates/brief-prompt.md` 里的提示词让写手生成 `docs/reviewer-brief.md`，
-生成后你亲自过一遍「不变量」那节，然后提交。
+生成后你亲自过一遍「核心路径」和「不变量」两节，然后提交。评审方判断一次提交要不要审，靠的就是这两节。
 
 不写的话评审方每轮从零爬全仓库，成本可能超过实施本身。
 
@@ -57,7 +58,8 @@ cat ~/src/bar/templates/agents-section.md >> AGENTS.md
 cd <repo>
 . .review.conf
 cat > "$REVIEW_DIR/request.md" <<EOF
-artifact:      $(git rev-parse --short HEAD) 这个提交的改动
+artifact:      $(git diff --name-only HEAD~1 HEAD | tr '\n' ' ')
+kind:          code
 base sha:      $(git rev-parse HEAD~1)
 target sha:    $(git rev-parse HEAD)
 round:         1/3

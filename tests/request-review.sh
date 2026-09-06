@@ -127,6 +127,83 @@ run_review() {
 
 SENT="${REVIEW_DIR}/.r1.sent"
 PANE_CACHE="${REVIEW_DIR}/.pane"
+SELF_CLOSED="${REPO}/docs/reviews/self-closed.md"
+TRIAGE_OUT="${REVIEW_DIR}/triage.md"
+
+commit_file() {   # <path> <message>
+  mkdir -p "$(dirname "${REPO}/$1")"; printf '%s\n' "$2" > "${REPO}/$1"
+  git -C "${REPO}" add "$1"; git -C "${REPO}" commit -qm "$2"
+}
+
+# ---- Routing: without a request for HEAD the script triages the commit itself. ----
+
+# A text-only commit is skipped mechanically, without asking the reviewer.
+rm -f "${REVIEW_DIR}/request.md"
+commit_file notes.md 'notes only'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'text-only status'
+grep -q '^SKIP:' "${TMP}/stdout" || fail 'text-only stdout lacks SKIP'
+assert_eq "$(call_count '^agent ')" 0 'text-only agent call count'
+grep -q "$(git -C "${REPO}" rev-parse --short HEAD)" "${SELF_CLOSED}" || fail 'text-only not logged in self-closed.md'
+echo 'PASS text-only commit is skipped without the reviewer'
+
+# A code commit is triaged by the reviewer; the verdict is cached per HEAD.
+commit_file src/x.py 'code change'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'triage dispatch status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'triage prompt count'
+run_review live
+assert_eq "${RUN_STATUS}" 3 'triage continuation status'
+assert_eq "$(call_count '^agent prompt ')" 0 'triage continuation prompt count'
+printf 'SKIP\nsmall isolated change with a test\nTRIAGE-COMPLETE\n' > "${TRIAGE_OUT}"
+run_review live
+assert_eq "${RUN_STATUS}" 0 'triage SKIP status'
+grep -q '^SKIP: small isolated' "${TMP}/stdout" || fail 'triage SKIP stdout'
+grep -q "$(git -C "${REPO}" rev-parse --short HEAD) | triage" "${SELF_CLOSED}" || fail 'triage SKIP not logged'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'cached SKIP status'
+assert_eq "$(call_count '^agent ')" 0 'cached SKIP agent call count'
+echo 'PASS code commit is triaged and a SKIP verdict is cached'
+
+# A REVIEW verdict exits 6 until a request for HEAD exists, then reviews normally.
+commit_file src/y.py 'another code change'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'second triage dispatch status'
+printf 'REVIEW\ntouches a core path\nTRIAGE-COMPLETE\n' > "${TRIAGE_OUT}"
+run_review live
+assert_eq "${RUN_STATUS}" 6 'triage REVIEW status'
+grep -q '^REVIEW: touches a core path' "${TMP}/stdout" || fail 'triage REVIEW stdout'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'cached REVIEW status'
+assert_eq "$(call_count '^agent ')" 0 'cached REVIEW agent call count'
+write_request code "$(git -C "${REPO}" rev-parse HEAD~1)" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 3 'review after REVIEW verdict status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Review request')" 1 'review prompt count'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+echo 'PASS REVIEW verdict gates the review on a request for HEAD'
+
+# Plan paths are routed to review mechanically, even when text-only.
+printf 'REVIEW_PLAN_PATHS="docs/plans/*"\n' >> "${REPO}/.review.conf"
+commit_file docs/plans/q.md 'plan doc'
+rm -f "${REVIEW_DIR}/request.md"
+run_review new
+assert_eq "${RUN_STATUS}" 6 'plan path status'
+assert_eq "$(call_count '^agent ')" 0 'plan path agent call count'
+grep -q '^REVIEW:' "${TMP}/stdout" || fail 'plan path stdout'
+grep -v '^REVIEW_PLAN_PATHS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+echo 'PASS plan paths route to review without triage'
+
+# A request for HEAD is an explicit review: no triage happens.
+commit_file src/z.py 'third code change'
+write_request code "$(git -C "${REPO}" rev-parse HEAD~1)" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 3 'explicit request status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Review request')" 1 'explicit request review prompt'
+assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 0 'explicit request triage prompt'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+echo 'PASS request for HEAD skips triage'
+
 BASE=$(git -C "${REPO}" rev-parse HEAD)
 
 # Every unit-boundary rejection exits 2 before touching the reviewer or any state file.
