@@ -22,8 +22,19 @@ mk() {   # <name>：两个提交的仓库 + .review.conf + 交接目录
   printf 'a\nb = 1\n' > "$r/a.py"; git -C "$r" add .; git -C "$r" commit -qm change
   printf 'REVIEW_KIND=claude\nREVIEW_WT=%s\nREVIEW_DIR=%s\n' "$r" "${TMP}/$n/review" > "$r/.review.conf"
 }
-mk alpha; mk beta; mk gamma
+mk alpha; mk beta; mk gamma; mk delta
 now=$(date +%s)
+
+# 假 herdr：beta 的评审方 blocked，gamma 的在 working，其余 pane 不存在
+cat > "${TMP}/herdr" <<'MOCK'
+#!/usr/bin/env bash
+case "$1 $2 $3" in
+  'agent get beta-pane')  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n';;
+  'agent get gamma-pane') printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
+  *) printf '{"error":{"code":"agent_not_found"}}\n' >&2; exit 1;;
+esac
+MOCK
+chmod +x "${TMP}/herdr"
 
 # alpha：round 2 的 request 指向 HEAD，r1 里 F2 reject、F3(blocking) defer，无裁决 → 待人裁决
 H=$(git -C "${TMP}/alpha/repo" rev-parse HEAD); B=$(git -C "${TMP}/alpha/repo" rev-parse HEAD~1)
@@ -57,12 +68,21 @@ H=$(git -C "${TMP}/beta/repo" rev-parse HEAD); B=$(git -C "${TMP}/beta/repo" rev
 D="${TMP}/beta/review"
 printf 'artifact: a.py\nkind: code\nbase sha: %s\ntarget sha: %s\nround: 1/3\n' "$B" "$H" > "$D/request.md"
 cp "$D/request.md" "$D/.cycle-request.md"
-printf '%s\n%s\npane\n' "$((now - 240))" "$H" > "$D/.r1.sent"
+printf '%s\n%s\nbeta-pane\n' "$((now - 240))" "$H" > "$D/.r1.sent"
+
+# delta：round 1 已完成且写手已回应、无 accepted 改动 → 闭合未归档，页面上收成一行
+H=$(git -C "${TMP}/delta/repo" rev-parse HEAD); B=$(git -C "${TMP}/delta/repo" rev-parse HEAD~1)
+D="${TMP}/delta/review"
+printf 'artifact: a.py\nkind: code\nbase sha: %s\ntarget sha: %s\nround: 1/3\n' "$B" "$H" > "$D/request.md"
+cp "$D/request.md" "$D/.cycle-request.md"
+printf '%s\n%s\ndelta-pane\n' "$((now - 600))" "$H" > "$D/.r1.sent"
+printf 'F1 | nit\nclaim:    命名\nevidence: a.py:1\n\nREVIEW-COMPLETE\n' > "$D/r1-findings.md"
+printf 'F1 defer — 以后\n' > "$D/r1-responses.md"
 
 # gamma：没有 request，.triage.sent 指向 HEAD 且 triage.md 未完成 → triage 中；另有一份归档和自闭合记录
 H=$(git -C "${TMP}/gamma/repo" rev-parse HEAD)
 D="${TMP}/gamma/review"
-printf '%s\n%s\npane\n' "$((now - 60))" "$H" > "$D/.triage.sent"
+printf '%s\n%s\ngamma-pane\n' "$((now - 60))" "$H" > "$D/.triage.sent"
 mkdir -p "${TMP}/gamma/repo/docs/reviews"
 cat > "${TMP}/gamma/repo/docs/reviews/abc1234.md" <<'EOF'
 # Review cycle @ abc1234
@@ -97,12 +117,12 @@ EOF
 printf '2026-09-01 | abc1234 | round 1/3 | 95s\n' > "${TMP}/gamma/repo/docs/reviews/timing.md"
 printf '# 自行闭合记录\n\n2026-09-02 | def5678 | 纯文本 | 只改了 .md\n' > "${TMP}/gamma/repo/docs/reviews/self-closed.md"
 
-printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
-python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null
+printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
+HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null
 
 # 项目发现与去重命名（三个 checkout 都叫 repo，用上级目录区分）
-for n in alpha beta gamma; do has "data-p=\"$n/repo\"" "project $n listed"; done
-has '项目 · 3' 'project count'
+for n in alpha beta gamma delta; do has "data-p=\"$n/repo\"" "project $n listed"; done
+has '项目 · 4' 'project count'
 
 # 状态
 has '待人裁决' 'alpha state'
@@ -111,8 +131,14 @@ has 'triage 中' 'gamma state'
 has 'prompt 已送达，等评审方写 findings' 'beta cycle note'
 has '写手 reject 了 F2、defer 了 F3，等人裁决' 'alpha cycle note'
 
-# 横幅：两条等你，链接到 finding 行；alpha 排在最前
-has '等你 · 2' 'banner count'
+# 评审方状态：beta blocked → 等你 + STOP；gamma working → 备注
+has '评审中 · 评审方 blocked' 'beta blocked state'
+has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'banner stop item'
+has 'href="#p-beta/repo"' 'stop item links to project'
+has '评审方 working' 'gamma working note'
+
+# 横幅：两条裁决 + 一条 STOP；alpha 排在最前
+has '等你 · 3' 'banner count'
 has 'F2 nit · 写手 reject，待裁决' 'banner reject item'
 has 'F3 blocking · 写手 defer，待裁决' 'banner blocking-defer item'
 has 'id="f-alpha/repo-F2"' 'finding anchor'
@@ -126,17 +152,25 @@ has '等你裁决' 'pending decision cell'
 has 'docs/x.json:8' 'evidence rendered'
 has 'class="frow pend"' 'pending row tint'
 has '评审中，findings 尚未完成' 'unfinished round note'
+has '回应 ' 'round timing shown'
+
+# delta：闭合未归档 → 折叠成一行摘要
+has '<details class="prev"><summary>' 'closed cycle collapsed'
+has '1 轮</span><span>1 defer</span>' 'collapsed summary counts'
+lacks 'class="cycle stale"' 'old stale styling gone'
 
 # request 字段与 diff
 has 'class="chip">tests/test_a.py' 'artifact chips'
 has '1 file changed, 1 insertion(+)' 'diff stat'
-has '+b = 1' 'full diff'
+has '<span class="d-add">+b = 1</span>' 'diff add line coloured'
+has 'class="d-hunk">@@' 'diff hunk coloured'
 
 # 归档、Backlog、自闭合
 has '<code>abc1234</code>' 'archive row'
 has '1m35s' 'archive duration from timing.md'
 has '留到以后' 'backlog reason'
 has '历史归档中 defer 的 finding · 1' 'backlog count'
+has 'class="filter" type="search"' 'backlog filter box'
 has '<code>def5678</code>' 'self-closed row'
 has '只改了 .md' 'self-closed reason'
 

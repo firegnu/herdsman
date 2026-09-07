@@ -261,7 +261,9 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
   Backlog（历史归档里的 defer）、最近归档（可展开原文）、自闭合记录。
 
 它是**派生视图**：不存自己的状态，不接 agent，写手和评审方不知道它存在。状态判据与 `request-review` 相同
-（request 是否指向 HEAD、`.sent` / findings 哨兵 / responses / decision 文件是否存在）。`request-review`
+（request 是否指向 HEAD、`.sent` / findings 哨兵 / responses / decision 文件是否存在）。评审中或 triage 中时它还会
+问一下 herdr 评审方 pane 的状态：working 只作备注，blocked / idle 视为评审方停了没交付，进"等你"横幅。
+周期闭合但尚未归档时收成一行摘要（轮数、回应计数、耗时），点开才见 request 与 Round；下个周期派发时它进归档。`request-review`
 每次退出时调用 `review-board --quiet` 重新生成；手动 `review-board --open` 也行。它看得到节点，看不到节点之间
 agent 在做什么 —— 那部分只在 herdr 的 pane 里。
 
@@ -1271,6 +1273,7 @@ import time
 from datetime import datetime
 
 PROJ_GLOB = os.path.expanduser("~/Developer/personal_projs/*/.review.conf")
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 PROJ_LIST = os.path.expanduser("~/.review/projects")
 DEFAULT_OUT = os.path.expanduser("~/.review/board.html")
 STAT_FILES = {"precision.md", "self-closed.md", "timing.md", "skipped.md", "escapes.md"}
@@ -1305,6 +1308,25 @@ def git(repo, *args):
 
 def esc(s):
     return html.escape(s or "", quote=True)
+
+
+def dur(seconds):
+    if seconds is None or seconds < 0:
+        return ""
+    seconds = int(seconds)
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def reviewer_status(pane):
+    """问 herdr 评审方 pane 的 agent_status；herdr 不在、pane 不存在都返回 unknown。"""
+    if not pane:
+        return "unknown"
+    try:
+        out = subprocess.run([HERDR, "agent", "get", pane], capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r'"agent_status"\s*:\s*"([a-z]+)"', out)
+        return m.group(1) if m else "unknown"
+    except Exception:
+        return "unknown"
 
 
 def ago(ts):
@@ -1429,7 +1451,7 @@ def load_rounds(d):
             "n": n, "findings": parse_findings(ft), "done": sentinel_ok(ft),
             "responses": parse_lines(rt, RESP_RE) if rt is not None else None,
             "decisions": parse_lines(dt, DEC_RE) if dt is not None else None,
-            "sent": st,
+            "sent": st, "t_findings": mtime(f"{d}/r{n}-findings.md"), "t_responses": mtime(f"{d}/r{n}-responses.md"),
         })
     return rounds
 
@@ -1448,6 +1470,20 @@ def pending_decisions(rnd):
 
 
 # ============================================================ 项目状态
+def watch_reviewer(p, pane, expecting):
+    """评审中 / triage 中时问一下评审方在干什么。blocked 和 idle 都是它停了而没交付，等人去看 pane。"""
+    st = reviewer_status(pane)
+    p["reviewer"] = st
+    if st == "blocked":
+        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 blocked")
+        p["human"].append(("stop", "", "blocked", "", f"评审方停在审批或提问对话框，去看 pane {pane}"))
+    elif st in ("idle", "done"):
+        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 idle")
+        p["human"].append(("stop", "", "idle", "", f"评审方已空闲但 {expecting} 没交付，去看 pane {pane}"))
+    elif st == "working":
+        p["cycle_note"] += "；评审方 working"
+
+
 def project_state(repo, conf):
     d = conf["REVIEW_DIR"]
     head = git(repo, "rev-parse", "HEAD").strip()
@@ -1456,7 +1492,7 @@ def project_state(repo, conf):
     rounds = load_rounds(d)
     p = {"name": os.path.basename(repo), "repo": repo, "dir": d, "head": head, "req": req, "cycle_req": cyc_req,
          "rounds": rounds, "state": "空闲", "since": None, "waiting": "", "needs_me": False,
-         "human": [], "cycle_note": "", "closed": False}
+         "human": [], "cycle_note": "", "closed": False, "reviewer": ""}
     cur = req.get("_round", 1)
     explicit = bool(req) and (req.get("target sha") == head or (cur > 1 and not os.path.exists(f"{d}/r{cur}-responses.md")))
     prev = next((r for r in rounds if r["n"] == cur - 1), None)
@@ -1472,11 +1508,13 @@ def project_state(repo, conf):
                     p.update(state="待写手回应", waiting="等写手", since=mtime(f"{d}/r{cur}-findings.md"),
                              cycle_note="findings 已完成，等写手写 responses")
                 else:
-                    p.update(state="本轮已回应", closed=True, since=mtime(f"{d}/r{cur}-responses.md"),
-                             cycle_note="写手已回应；有 accepted 改动则写手开下一轮，否则周期到此结束")
+                    accepted = any(v[0] == "accept" for v in this["responses"].values())
+                    p.update(state="本轮已回应" if accepted else "已闭合", closed=True, since=mtime(f"{d}/r{cur}-responses.md"),
+                             cycle_note="写手已回应，有 accepted 改动，等写手改完开下一轮" if accepted else "写手已回应，无 accepted 改动，周期到此结束")
             else:
                 p.update(state="评审中", waiting="等评审方", since=this["sent"]["start"],
                          cycle_note="prompt 已送达，等评审方写 findings")
+                watch_reviewer(p, this["sent"].get("pane"), f"r{cur}-findings.md")
         elif pend:
             p.update(state="待人裁决", waiting="等你", needs_me=True, since=mtime(f"{d}/r{cur - 1}-responses.md"),
                      human=[("decision", fid, verb, sev, reason) for fid, verb, sev, reason in pend],
@@ -1495,9 +1533,10 @@ def project_state(repo, conf):
                      triage_reason=tri[2].strip() if len(tri) > 2 else "")
         elif tsent and tsent["target"] == head and not sentinel_ok(tout, "TRIAGE-COMPLETE"):
             p.update(state="triage 中", waiting="等评审方", since=tsent["start"])
+            watch_reviewer(p, tsent.get("pane"), "triage.md")
         if rounds:
             p["closed"] = True
-            p["cycle_note"] = "已闭合，等下个周期派发时归档；下面的 Round 是它的最终结果"
+            p["cycle_note"] = "已闭合；下面的 Round 是它的最终结果"
     return p
 
 
@@ -1649,7 +1688,13 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .idle{padding:28px 0;color:#8a8883}
 .cycle{margin-top:18px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px}
 .cycle .top{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px}
-.stale{opacity:.62}.cycle.stale{background:#f9f8f5;border-style:dashed}
+.d-add{color:#1f6b33;background:#eaf5ec;display:block}.d-del{color:#9a2a22;background:#fbecea;display:block}
+.d-hunk{color:#5a4fa0;display:block}.d-file{font-weight:700;display:block}.d-hdr{color:#8a8883;display:block;margin-top:8px}.d-ctx{display:block;min-height:1.5em}
+details.prev{margin-top:18px;border:1px dashed #d6d4ce;background:#f9f8f5;padding:0 18px}
+details.prev>summary{padding:12px 0;display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+details.prev>summary .lab{font-size:12px;color:#8a8883}
+details.prev .cycle{border:0;background:transparent;padding:0 0 14px;margin-top:0}
+.filter{margin:0 0 8px;font:12.5px inherit;padding:4px 8px;border:1px solid #d6d4ce;border-radius:2px;width:320px;background:#fff}
 .cycle .top .lab{font-size:12px;color:#8a8883}
 .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 14px;font-size:12.5px}
 .kv .k{color:#8a8883;padding-top:1px}.kv .v{color:#3a3936}
@@ -1712,6 +1757,8 @@ JS = """
     window.scrollTo({top:el.getBoundingClientRect().top+window.scrollY-72});
     history.replaceState(null,'','#'+anchor);
   }
+  window.rbFilter=function(inp){var q=inp.value.trim().toLowerCase();
+    inp.nextElementSibling.querySelectorAll('.brow').forEach(function(r){r.style.display=(!q||r.textContent.toLowerCase().indexOf(q)>=0)?'':'none'})};
   window.rbGo=function(name,anchor){select(name);setTimeout(function(){hit(anchor)},30);return false};
   var names=[].map.call(document.querySelectorAll('.proj'),function(e){return e.dataset.p});
   var first=document.querySelector('.proj.needs');
@@ -1748,6 +1795,15 @@ def render_round(p, rnd):
         summary += f" · {len(pend_ids)} 条待裁决"
     if not rnd["done"]:
         summary += " · 评审未完成"
+    t0 = (rnd.get("sent") or {}).get("start")
+    tf, tr = rnd.get("t_findings"), rnd.get("t_responses")
+    timing = []
+    if t0 and tf and rnd["done"]:
+        timing.append(f"评审 {dur(tf - t0)}")
+    if tf and tr:
+        timing.append(f"回应 {dur(tr - tf)}")
+    if timing:
+        summary += " · " + " · ".join(timing)
     rows = []
     for fid in ids:
         v = f.get(fid, {})
@@ -1785,9 +1841,8 @@ def render_cycle(p):
     sent1 = (p["rounds"][0].get("sent") or {}) if p["rounds"] else {}
     target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
     base = (cr.get("base sha") or "")[:7]
-    stale = p["closed"] and not p["waiting"]
-    label = "上一周期" if stale else "当前周期"
-    top = (f'<span class="lab">{label}</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
+    stale = bool(p["rounds"]) and p["closed"] and not p["waiting"]
+    top = (f'<span class="lab">{"周期" if stale else "当前周期"}</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
            f'<span>{esc(cr.get("kind", ""))}</span><span>round {esc(req.get("round", cr.get("round", "")))}</span>'
            f'<span class="dim">{esc(p["cycle_note"])}</span>')
     kv = []
@@ -1807,31 +1862,62 @@ def render_cycle(p):
             full = full[:DIFF_MAX_LINES]
             trunc = f"\n\n… 已截断，完整 diff：git -C {p['repo']} diff {base}..{target}"
         last = stat.strip().splitlines()[-1].strip() if stat.strip() else "空"
+        body = []
+        for ln in full:
+            if ln.startswith("+++") or ln.startswith("---"):
+                body.append(f'<span class="d-file">{esc(ln)}</span>')
+            elif ln.startswith("diff --git"):
+                body.append(f'<span class="d-hdr">{esc(ln)}</span>')
+            elif ln.startswith("@@"):
+                body.append(f'<span class="d-hunk">{esc(ln)}</span>')
+            elif ln.startswith("+"):
+                body.append(f'<span class="d-add">{esc(ln)}</span>')
+            elif ln.startswith("-"):
+                body.append(f'<span class="d-del">{esc(ln)}</span>')
+            else:
+                body.append(f'<span class="d-ctx">{esc(ln)}</span>')
         kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
                   f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
-                  f'<pre class="block">{esc(stat)}\n{esc(chr(10).join(full) + trunc)}</pre></details></div>')
-    return f'<div class="cycle{" stale" if stale else ""}"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
+                  f'<pre class="block">{esc(stat)}\n{"".join(body)}{esc(trunc)}</pre></details></div>')
+    return f'<div class="cycle"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
 def render_panel(p, archives, self_closed):
     parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
     badge = f'<span class="me">{esc(p["state"])}</span>' if p["needs_me"] else f'<span class="status">{esc(p["state"])}</span>'
-    parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>'
+    rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
+    parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
     if p.get("triage_reason"):
         parts.append(f'<div class="idle" style="padding:14px 0">{esc(p["triage_reason"])}</div>')
-    if p["rounds"] or (p["req"] and p["state"] not in ("空闲",) and not p["state"].startswith("triage")):
+    stale = bool(p["rounds"]) and p["closed"] and not p["waiting"]
+    if stale:
+        # 闭合但还没归档：收成一行，点开才看 request 与 Round。下个周期派发时它进"最近归档"。
+        req, cr = p["req"], p["cycle_req"]
+        last = p["rounds"][-1]
+        resp = last.get("responses") or {}
+        counts = " / ".join(f"{sum(1 for v in resp.values() if v[0] == k)} {k}" for k in ("accept", "defer", "reject") if any(v[0] == k for v in resp.values())) or "无回应"
+        t0 = (p["rounds"][0].get("sent") or {}).get("start"); t1 = last.get("t_responses") or last.get("t_findings")
+        sent1 = p["rounds"][0].get("sent") or {}
+        target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
+        parts.append(f'<details class="prev"><summary><span class="tri">▶</span><span class="lab">上一周期</span>'
+                     f'<code style="font-weight:600">@ {esc(target)}</code><span>{esc(cr.get("kind", ""))}</span>'
+                     f'<span>{len(p["rounds"])} 轮</span><span>{esc(counts)}</span><span class="tab">{dur((t1 - t0) if t0 and t1 else None)}</span>'
+                     f'<span class="dim">已闭合，等下个周期派发时归档</span></summary>')
         parts.append(render_cycle(p))
-        stale = p["closed"] and not p["waiting"]
-        parts.append('<div class="stale">' if stale else '<div>')
         for rnd in p["rounds"]:
             parts.append(render_round(p, rnd))
-        parts.append('</div>')
+        parts.append('</details>')
+    elif p["rounds"] or (p["req"] and p["state"] not in ("空闲",) and not p["state"].startswith("triage")):
+        parts.append(render_cycle(p))
+        for rnd in p["rounds"]:
+            parts.append(render_round(p, rnd))
     elif not p.get("triage_reason"):
         parts.append('<div class="idle">无在途周期。最近一次周期见下方归档。</div>')
 
     items = [(a["sha"], a["when"], fid, sev, claim, reason) for a in archives for fid, sev, claim, reason in a["deferred"]]
-    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {len(items)}</span></h2><div class="list">')
+    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {len(items)}</span></h2>'
+                 f'<input class="filter" type="search" placeholder="过滤 Backlog…" oninput="rbFilter(this)"><div class="list">')
     for sha, when, fid, sev, claim, reason in items:
         parts.append(f'<div class="brow"><code>{esc(sha)}</code><span class="dim tab">{esc(when)}</span>'
                      f'<span><code style="font-weight:600">{fid}</code> <span class="dim">{esc(sev)}</span></span>'
@@ -1843,11 +1929,11 @@ def render_panel(p, archives, self_closed):
     parts.append('<div class="sec"><h2>最近归档</h2><div class="list"><div class="acols"><span></span><span>sha</span><span>日期</span>'
                  '<span>kind</span><span>轮数</span><span>blocking</span><span>总耗时</span><span>结束方式</span></div>')
     for a in archives[:ARCHIVES_SHOWN]:
-        dur = f"{a['secs'] // 60}m{a['secs'] % 60:02d}s" if a["secs"] else "—"
+        took = dur(a["secs"]) if a["secs"] else "—"
         bw = "700" if a["blocking"] else "400"
         parts.append(f'<details class="arch"><summary class="arow"><span class="tri">▶</span><code>{esc(a["sha"])}</code>'
                      f'<span class="dim tab">{esc(a["when"])}</span><span>{esc(a["kind"])}</span><span>{a["rounds"]} 轮</span>'
-                     f'<span style="font-weight:{bw}">{a["blocking"]}</span><span class="tab">{dur}</span><span>{esc(a["ending"])}</span></summary>'
+                     f'<span style="font-weight:{bw}">{a["blocking"]}</span><span class="tab">{took}</span><span>{esc(a["ending"])}</span></summary>'
                      f'<div class="body">{md(a["text"])}</div></details>')
     if not archives:
         parts.append('<div class="empty">无归档</div>')
@@ -1867,7 +1953,10 @@ def render_panel(p, archives, self_closed):
 def render(projects, archives, self_closed):
     waits = []
     for p in projects:
-        for _, fid, verb, sev, _ in p["human"]:
+        for kind, fid, verb, sev, reason in p["human"]:
+            if kind == "stop":
+                waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"p-{p['name']}"))
+                continue
             what = f"{fid} {sev} · 写手 {verb}，待裁决" if sev else f"{fid} · 写手 {verb}，待裁决"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
     if waits:
