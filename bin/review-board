@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""review-board —— 评审流程的只读看板。
+
+扫所有配了 .review.conf 的仓库，从交接目录（REVIEW_DIR）和归档（docs/reviews）生成一个
+静态 HTML，写到 ~/.review/board.html。不存任何自己的状态，不接 agent，刷新等于重跑。
+
+用法:
+  review-board            生成
+  review-board --open     生成后用浏览器打开
+  review-board --quiet    生成，不打印路径（request-review 退出时调用）
+  review-board --out P    写到 P
+  review-board --projects F   只看 F 里列出的仓库（一行一个），不做默认发现；测试用
+
+项目发现: ~/Developer/personal_projs/*/.review.conf；另可在 ~/.review/projects 里一行一个仓库路径。
+"""
+import glob
+import html
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+PROJ_GLOB = os.path.expanduser("~/Developer/personal_projs/*/.review.conf")
+PROJ_LIST = os.path.expanduser("~/.review/projects")
+DEFAULT_OUT = os.path.expanduser("~/.review/board.html")
+STAT_FILES = {"precision.md", "self-closed.md", "timing.md", "skipped.md", "escapes.md"}
+DIFF_MAX_LINES = 2000
+ARCHIVES_SHOWN = 10
+SELF_CLOSED_SHOWN = 12
+NOW = time.time()
+
+
+# ============================================================ 读文件 / git
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def git(repo, *args):
+    try:
+        return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return ""
+
+
+def esc(s):
+    return html.escape(s or "", quote=True)
+
+
+def ago(ts):
+    if not ts:
+        return ""
+    d = int(NOW - ts)
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}h{(d % 3600) // 60:02d}m"
+    return f"{d // 86400}d"
+
+
+def sentinel_ok(text, word="REVIEW-COMPLETE"):
+    if text is None:
+        return False
+    lines = [l for l in text.splitlines() if l.strip()]
+    return bool(lines) and lines[-1].strip() == word
+
+
+# ============================================================ 解析交接文件
+def parse_conf(path):
+    conf = {}
+    for line in (read(path) or "").splitlines():
+        m = re.match(r'\s*([A-Z_]+)=(.*)', line)
+        if m:
+            conf[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return conf
+
+
+def parse_request(text):
+    req = {}
+    for line in (text or "").splitlines():
+        m = re.match(r'^([a-z ]+?):\s*(.*)$', line)
+        if m:
+            req[m.group(1).strip()] = m.group(2).strip()
+    m = re.match(r'(\d+)\s*/\s*(\d+)', req.get("round", ""))
+    req["_round"] = int(m.group(1)) if m else 1
+    req["_cap"] = int(m.group(2)) if m else 0
+    return req
+
+
+FINDING_RE = re.compile(r'^[\s#*_-]*F(\d+)[\s*_]*[|:—-]+\s*(.*)$')
+RESP_RE = re.compile(r'^\s*F(\d+)\s+(accept|defer|reject)\b\s*[—-]*\s*(.*)$', re.I)
+DEC_RE = re.compile(r'^\s*F(\d+)\s+(uphold|overrule)\b\s*[—-]*\s*(.*)$', re.I)
+SEVS = ("blocking", "should", "nit")
+STATUSES = ("resolved", "not-resolved", "regressed", "upheld", "deferred", "disputed", "overruled")
+FIELDS = {"claim": "claim", "evidence": "evidence", "fix-hint": "hint", "status": "status", "verdict": "status"}
+
+
+def parse_findings(text):
+    """{id: {sev, status, claim, evidence, hint}}，按出现顺序。
+    头行 `F<n> | blocking`（第 2 轮起还有 `| resolved` 等），字段行 `claim: …`；
+    旧格式把字段值写在标签下一行且可能多行，空行结束。"""
+    out = {}
+    cur = field = None
+    for line in (text or "").splitlines():
+        m = FINDING_RE.match(line)
+        if m and not line.lstrip().startswith(("-", "*")):
+            fid = "F" + m.group(1)
+            cells = [c.strip().strip("*_ ") for c in re.split(r'\s*(?:[|]|→|->)\s*', m.group(2).replace("*", "")) if c.strip()]
+            sev = status = ""
+            for c in cells:
+                cl = c.lower()
+                if cl in SEVS:
+                    sev = cl
+                elif cl in STATUSES:
+                    status = cl
+                elif not sev and not status:
+                    status = c
+            cur = out.setdefault(fid, {"sev": sev, "status": status, "claim": "", "evidence": "", "hint": ""})
+            if sev:
+                cur["sev"] = sev
+            if status:
+                cur["status"] = status
+            field = None
+            continue
+        if not cur:
+            continue
+        m2 = re.match(r'^\s*(claim|evidence|fix-hint|status|verdict)\s*:\s*(.*)$', line, re.I)
+        if m2:
+            field = FIELDS[m2.group(1).lower()]
+            cur[field] = m2.group(2).strip()
+        elif re.match(r'^#{1,6}\s', line) or re.match(r'^\s*F\d+\s*[|:]', line):
+            cur = field = None
+        elif field and line.strip():
+            cur[field] = (cur[field] + " " + line.strip()).strip()
+        elif not line.strip():
+            field = None
+    return out
+
+
+def parse_lines(text, rx):
+    out = {}
+    for line in (text or "").splitlines():
+        m = rx.match(line)
+        if m:
+            out["F" + m.group(1)] = (m.group(2).lower(), m.group(3).strip())
+    return out
+
+
+def parse_sent(text):
+    ls = (text or "").splitlines()
+    try:
+        return {"start": int(ls[0]), "target": ls[1].strip(), "pane": ls[2].strip() if len(ls) > 2 else ""}
+    except (IndexError, ValueError):
+        return None
+
+
+def load_rounds(d):
+    rounds = []
+    for n in range(1, 6):
+        ft = read(f"{d}/r{n}-findings.md")
+        rt = read(f"{d}/r{n}-responses.md")
+        dt = read(f"{d}/r{n}-decision.md")
+        st = parse_sent(read(f"{d}/.r{n}.sent"))
+        if ft is None and rt is None and st is None:
+            continue
+        rounds.append({
+            "n": n, "findings": parse_findings(ft), "done": sentinel_ok(ft),
+            "responses": parse_lines(rt, RESP_RE) if rt is not None else None,
+            "decisions": parse_lines(dt, DEC_RE) if dt is not None else None,
+            "sent": st,
+        })
+    return rounds
+
+
+def pending_decisions(rnd):
+    """上一轮 reject 与 blocking defer 里尚无裁决的 → [(fid, verb, sev, reason)]。与 request-review 的判据一致。"""
+    out = []
+    if not rnd or rnd["responses"] is None:
+        return out
+    dec = rnd["decisions"] or {}
+    for fid, (verb, reason) in rnd["responses"].items():
+        sev = rnd["findings"].get(fid, {}).get("sev", "")
+        if (verb == "reject" or (verb == "defer" and sev == "blocking")) and fid not in dec:
+            out.append((fid, verb, sev, reason))
+    return out
+
+
+# ============================================================ 项目状态
+def project_state(repo, conf):
+    d = conf["REVIEW_DIR"]
+    head = git(repo, "rev-parse", "HEAD").strip()
+    req = parse_request(read(f"{d}/request.md"))
+    cyc_req = parse_request(read(f"{d}/.cycle-request.md")) if os.path.exists(f"{d}/.cycle-request.md") else req
+    rounds = load_rounds(d)
+    p = {"name": os.path.basename(repo), "repo": repo, "dir": d, "head": head, "req": req, "cycle_req": cyc_req,
+         "rounds": rounds, "state": "空闲", "since": None, "waiting": "", "needs_me": False,
+         "human": [], "cycle_note": "", "closed": False}
+    cur = req.get("_round", 1)
+    explicit = bool(req) and (req.get("target sha") == head or (cur > 1 and not os.path.exists(f"{d}/r{cur}-responses.md")))
+    prev = next((r for r in rounds if r["n"] == cur - 1), None)
+    this = next((r for r in rounds if r["n"] == cur), None)
+
+    latest = max([mtime(f"{d}/{f}") or 0 for f in os.listdir(d)] or [0]) if os.path.isdir(d) else 0
+    p["last_activity"] = latest
+    if explicit:
+        pend = pending_decisions(prev)
+        if this and this["sent"]:
+            if this["done"]:
+                if this["responses"] is None:
+                    p.update(state="待写手回应", waiting="等写手", since=mtime(f"{d}/r{cur}-findings.md"),
+                             cycle_note="findings 已完成，等写手写 responses")
+                else:
+                    p.update(state="本轮已回应", closed=True, since=mtime(f"{d}/r{cur}-responses.md"),
+                             cycle_note="写手已回应；有 accepted 改动则写手开下一轮，否则周期结束")
+            else:
+                p.update(state="评审中", waiting="等评审方", since=this["sent"]["start"],
+                         cycle_note="prompt 已送达，等评审方写 findings")
+        elif pend:
+            p.update(state="待人裁决", waiting="等你", needs_me=True, since=mtime(f"{d}/r{cur - 1}-responses.md"),
+                     human=[("decision", fid, verb, sev, reason) for fid, verb, sev, reason in pend],
+                     cycle_note="写手 " + "、".join(f"{v} 了 {f}" for f, v, _, _ in pend) + "，等人裁决")
+        else:
+            p.update(state="待派发", waiting="等写手", since=mtime(f"{d}/request.md"),
+                     cycle_note=f"request 已写（round {req.get('round', '')}），等写手运行 request-review")
+    else:
+        tri = (read(f"{d}/.triage") or "").splitlines()
+        tsent = parse_sent(read(f"{d}/.triage.sent"))
+        tout = read(f"{d}/triage.md")
+        if tri and tri[0].strip() == head:
+            verdict = tri[1].strip() if len(tri) > 1 else "?"
+            p.update(state=f"triage 已判 {verdict}", since=mtime(f"{d}/.triage"),
+                     waiting="等写手" if verdict == "REVIEW" else "",
+                     triage_reason=tri[2].strip() if len(tri) > 2 else "")
+        elif tsent and tsent["target"] == head and not sentinel_ok(tout, "TRIAGE-COMPLETE"):
+            p.update(state="triage 中", waiting="等评审方", since=tsent["start"])
+        if rounds:
+            p["closed"] = True
+            p["cycle_note"] = "已闭合，下个周期开始时归档"
+    return p
+
+
+# ============================================================ 归档
+def load_archives(repo):
+    adir = f"{repo}/docs/reviews"
+    timing = {}
+    for line in (read(f"{adir}/timing.md") or "").splitlines():
+        m = re.match(r'\S+ \| (\w+) \| round \d+/\d+ \| (\d+)s', line)
+        if m:
+            timing[m.group(1)] = timing.get(m.group(1), 0) + int(m.group(2))
+    out = []
+    for f in sorted(glob.glob(f"{adir}/*.md"), key=os.path.getmtime, reverse=True):
+        if os.path.basename(f) in STAT_FILES:
+            continue
+        text = read(f) or ""
+        m = re.match(r'# Review cycle @ (\S+)', text)
+        if not m:
+            continue
+        sha = m.group(1)
+        when = re.search(r'归档于 (\S+)', text)
+        secs = dict(re.findall(r'^## (r\d+-\w+\.md)\n(.*?)(?=^## r\d+-\w+\.md\n|\Z)', text, re.S | re.M))
+        reqm = re.search(r'^## Request\n(.*?)(?=^## )', text, re.S | re.M)
+        req = parse_request(reqm.group(1) if reqm else "")
+        rounds = []
+        for n in range(1, 6):
+            if f"r{n}-findings.md" in secs:
+                rounds.append({"n": n, "findings": parse_findings(secs[f"r{n}-findings.md"]),
+                               "responses": parse_lines(secs.get(f"r{n}-responses.md", ""), RESP_RE),
+                               "decisions": parse_lines(secs.get(f"r{n}-decision.md", ""), DEC_RE)})
+        r1 = rounds[0]["findings"] if rounds else {}
+        deferred, seen = [], set()
+        for r in rounds:
+            for fid, (verb, reason) in r["responses"].items():
+                if verb == "defer" and fid not in seen:
+                    seen.add(fid)
+                    deferred.append((fid, r1.get(fid, {}).get("sev", ""), r1.get(fid, {}).get("claim", ""), reason))
+        ending = "正常"
+        if any(r["decisions"] for r in rounds):
+            ending = "有裁决"
+        if rounds and any(v[0] == "reject" for v in rounds[-1]["responses"].values()) and not rounds[-1]["decisions"]:
+            ending = "reject 未裁决"
+        if req.get("_cap") and rounds and rounds[-1]["n"] >= req["_cap"]:
+            ending += "，到顶"
+        out.append({"sha": sha, "when": (when.group(1) if when else "")[:10], "kind": req.get("kind", ""),
+                    "rounds": len(rounds), "blocking": sum(1 for v in r1.values() if v["sev"] == "blocking"),
+                    "secs": timing.get(sha, 0), "deferred": deferred, "ending": ending,
+                    "artifact": req.get("artifact", ""), "text": text})
+    return out
+
+
+def load_self_closed(repo):
+    text = read(f"{repo}/docs/reviews/self-closed.md") or ""
+    rows = [l for l in text.splitlines() if re.match(r'^\d{4}-\d{2}-\d{2} \|', l)]
+    return [[c.strip() for c in l.split("|")] for l in reversed(rows[-SELF_CLOSED_SHOWN:])]
+
+
+# ============================================================ 最小 markdown（归档原文）
+def md(text):
+    out, para, table, in_code = [], [], [], False
+
+    def inline(s):
+        s = esc(s)
+        s = re.sub(r'`([^`]+)`', r'<code>\1</code>', s)
+        return re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', s)
+
+    def flush_para():
+        if para:
+            out.append("<p>" + inline(" ".join(para)) + "</p>")
+            para.clear()
+
+    def flush_table():
+        if table:
+            rows = [r for r in table if not re.match(r'^\s*\|?\s*:?-{2,}', r)]
+            out.append("<table>" + "".join(
+                "<tr>" + "".join(f"<td>{inline(c.strip())}</td>" for c in r.strip().strip("|").split("|")) + "</tr>"
+                for r in rows) + "</table>")
+            table.clear()
+
+    for line in text.splitlines():
+        if line.startswith("```"):
+            flush_para(); flush_table()
+            out.append("</pre>" if in_code else "<pre>")
+            in_code = not in_code
+            continue
+        if in_code:
+            out.append(esc(line))
+            continue
+        if line.lstrip().startswith("|"):
+            flush_para(); table.append(line)
+            continue
+        flush_table()
+        m = re.match(r'^(#{1,6})\s+(.*)', line)
+        if m:
+            flush_para()
+            lvl = min(len(m.group(1)) + 2, 6)
+            out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            continue
+        m = re.match(r'^\s*[-*]\s+(.*)', line)
+        if m:
+            flush_para(); out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        if not line.strip():
+            flush_para()
+            continue
+        para.append(line)
+    flush_para(); flush_table()
+    if in_code:
+        out.append("</pre>")
+    return "\n".join(out)
+
+
+# ============================================================ 渲染
+CSS = """
+html,body{margin:0;padding:0;background:#f4f3f0;color:#1c1c1a;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Helvetica Neue","Microsoft YaHei",sans-serif;font-size:13px;line-height:1.55;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}a:hover{text-decoration:underline}
+code,pre{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+code{font-size:11.5px}
+summary{cursor:pointer;list-style:none}summary::-webkit-details-marker{display:none}
+details[open]>summary .tri{transform:rotate(90deg)}
+.tri{display:inline-block;transition:transform .1s;color:#8a8883;font-size:10px}
+.hit{outline:2px solid #c8375a;outline-offset:2px}
+.mute{color:#8a8883}.dim{color:#5f5e5a}.ink{color:#3a3936}
+.wrap{min-height:100vh;display:flex;flex-direction:column;max-width:1600px;min-width:1200px;margin:0 auto}
+.banner{background:#fce8ed;border-bottom:2px solid #c8375a;padding:9px 24px;display:flex;gap:28px;align-items:baseline}
+.banner .t{font-weight:700;color:#7d1a34;font-size:14px;flex:none}
+.banner .items{display:flex;flex-wrap:wrap;gap:8px 24px}
+.banner a{display:flex;gap:10px;align-items:baseline;color:#7d1a34}
+.banner a b{font-weight:600}.banner a .age{color:#a54a62}.banner a .arr{color:#c8375a}
+.nowait{padding:7px 24px;color:#8a8883;border-bottom:1px solid #e3e1dc;font-size:12px}
+.grid{display:grid;grid-template-columns:232px minmax(0,1fr);flex:1;align-items:start}
+.side{border-right:1px solid #e3e1dc;position:sticky;top:0;align-self:start;padding:14px 0;max-height:100vh;overflow:auto}
+.side .cap{padding:0 16px 8px;font-size:11px;color:#8a8883;letter-spacing:.04em}
+.proj{padding:9px 16px 9px 14px;cursor:pointer;border-left:2px solid transparent}
+.proj:hover{background:#ecebe7}.proj.sel{background:#fff;border-left-color:#1c1c1a}
+.proj .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.proj .nm{font-weight:500;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proj.sel .nm{font-weight:700}
+.proj .age{font-size:11.5px;color:#8a8883;flex:none;font-variant-numeric:tabular-nums}
+.proj .st{display:flex;align-items:center;gap:6px;margin-top:2px}
+.proj .st .status{font-size:12px;color:#5f5e5a}.proj .st .who{font-size:11.5px;color:#a3a29d}
+.me{background:#c8375a;color:#fff;font-size:11px;font-weight:600;padding:0 6px;border-radius:2px;line-height:18px;display:inline-block}
+.main{padding:18px 28px 60px;min-width:0}
+.panel{display:none}.panel.sel{display:block}
+.head{display:flex;align-items:baseline;gap:14px;padding-bottom:12px;border-bottom:1px solid #e3e1dc}
+.head h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
+.head .me{font-size:12px;padding:1px 8px}.head .status{font-size:13px;color:#5f5e5a}
+.head .hd{margin-left:auto;color:#5f5e5a;font-size:12.5px}
+.idle{padding:28px 0;color:#8a8883}
+.cycle{margin-top:18px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px}
+.cycle .top{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px}
+.cycle .top .lab{font-size:12px;color:#8a8883}
+.kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 14px;font-size:12.5px}
+.kv .k{color:#8a8883;padding-top:1px}.kv .v{color:#3a3936}
+.chips{display:flex;flex-wrap:wrap;gap:4px 8px}
+.chip{font-size:11.5px;background:#f4f3f0;padding:1px 5px;border-radius:2px;color:#3a3936}
+.diff summary{display:flex;gap:8px;align-items:center;color:#3a3936}
+pre.block{margin:8px 0 0;padding:10px 12px;background:#f4f3f0;border:1px solid #e3e1dc;font-size:11.5px;line-height:1.5;overflow:auto;max-height:520px;white-space:pre}
+.round{margin-top:26px}
+.round .rh{display:flex;align-items:baseline;gap:12px;margin-bottom:8px}
+h2{margin:0;font-size:14px;font-weight:700}
+h2 .sub{font-weight:400;color:#8a8883;font-size:12px;margin-left:6px}
+.ftab{border-top:1px solid #1c1c1a;font-size:12.5px}
+.fcols{display:grid;grid-template-columns:44px 96px minmax(0,2.1fr) minmax(0,1.6fr) minmax(0,1.2fr)}
+.fcols>div{padding:6px 8px;font-size:11px;color:#8a8883}
+.frow{display:grid;grid-template-columns:44px 96px minmax(0,2.1fr) minmax(0,1.6fr) minmax(0,1.2fr);border-top:1px solid #e3e1dc;background:#fff}
+.frow.pend{background:#fff6f8}
+.frow>div{padding:10px 8px}.frow>div:first-child{padding-left:0;font-weight:700}.frow>div:last-child{padding-right:0}
+.sev{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;border:1px solid #c9c7c1;color:#5f5e5a;background:#fff}
+.sev.blocking{border-color:#1c1c1a;color:#1c1c1a;font-weight:700}
+.sev.should{border-color:#1c1c1a;color:#1c1c1a}
+.fstat{margin-top:4px;font-size:11.5px;color:#5f5e5a}
+.claim{text-wrap:pretty}.evid{display:block;margin-top:5px;font-size:11.5px;color:#5f5e5a;word-break:break-all}
+.verb{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;margin-right:6px}
+.verb.accept{color:#2f6b3a;background:#e6f2e8}.verb.defer{color:#6b5a1f;background:#f3ecd6}.verb.reject{color:#fff;background:#1c1c1a;font-weight:700}
+.dec{display:inline-block;font-size:11px;font-weight:600;color:#3a3936;border:1px solid #c9c7c1;padding:0 6px;line-height:18px;border-radius:2px;margin-right:6px}
+.pending{color:#7d1a34;font-weight:600;display:flex;align-items:center;gap:6px}
+.pending .dot{width:8px;height:8px;background:#c8375a;border-radius:50%;flex:none}
+.pending-hint{font-size:11.5px;color:#a54a62;margin-top:4px}
+.sec{margin-top:32px}
+.list{border-top:1px solid #1c1c1a;font-size:12.5px}
+.brow{display:grid;grid-template-columns:72px 92px 72px minmax(0,2fr) minmax(0,1.4fr);gap:0 12px;padding:9px 0;border-bottom:1px solid #e3e1dc}
+.acols,.arow{display:grid;grid-template-columns:20px 72px 92px 48px 48px 84px 72px minmax(0,1fr);gap:0 12px;align-items:baseline}
+.acols{padding:5px 0;font-size:11px;color:#8a8883}
+.arow{padding:8px 0}
+.arch{border-top:1px solid #e3e1dc}
+.arch .body{margin:0 0 10px 32px;padding:10px 14px;background:#fff;border:1px solid #e3e1dc;font-size:12.5px;overflow-x:auto}
+.arch .body h3,.arch .body h4,.arch .body h5,.arch .body h6{font-size:12.5px;margin:12px 0 4px}
+.arch .body h3{font-size:14px}
+.arch .body table{border-collapse:collapse;margin:6px 0}.arch .body td{border:1px solid #e3e1dc;padding:3px 8px;vertical-align:top}
+.arch .body li{margin:2px 0 2px 18px}.arch .body pre{background:#f4f3f0;padding:8px 10px;white-space:pre-wrap}
+.arch .body p{margin:6px 0}
+.srow{display:grid;grid-template-columns:92px 72px 120px minmax(0,1fr);gap:0 12px;padding:8px 0;border-bottom:1px solid #e3e1dc}
+.tab{font-variant-numeric:tabular-nums}
+.foot{padding:14px 24px;color:#8a8883;font-size:11.5px;border-top:1px solid #e3e1dc}
+.empty{color:#8a8883;padding:8px 0}
+"""
+
+JS = """
+(function(){
+  var KEY='rb.selected';
+  function select(name,push){
+    document.querySelectorAll('.proj').forEach(function(e){e.classList.toggle('sel',e.dataset.p===name)});
+    document.querySelectorAll('.panel').forEach(function(e){e.classList.toggle('sel',e.dataset.p===name)});
+    try{localStorage.setItem(KEY,name)}catch(e){}
+  }
+  function hit(anchor){
+    document.querySelectorAll('.hit').forEach(function(e){e.classList.remove('hit')});
+    var el=document.getElementById(anchor);if(!el)return;
+    el.classList.add('hit');
+    window.scrollTo({top:el.getBoundingClientRect().top+window.scrollY-72});
+    history.replaceState(null,'','#'+anchor);
+  }
+  window.rbGo=function(name,anchor){select(name);setTimeout(function(){hit(anchor)},30);return false};
+  var names=[].map.call(document.querySelectorAll('.proj'),function(e){return e.dataset.p});
+  var first=document.querySelector('.proj.needs');
+  var saved=null;try{saved=localStorage.getItem(KEY)}catch(e){}
+  var pick=(first&&first.dataset.p)||(names.indexOf(saved)>=0?saved:names[0]);
+  if(names.indexOf(saved)>=0&&!first)pick=saved;
+  if(location.hash.length>1){var t=document.getElementById(decodeURIComponent(location.hash.slice(1)));
+    var pn=t&&t.closest('.panel');if(pn){pick=pn.dataset.p;setTimeout(function(){hit(t.id)},30)}}
+  if(pick)select(pick);
+  document.querySelectorAll('.proj').forEach(function(e){e.addEventListener('click',function(){select(e.dataset.p)})});
+  // 自动刷新：整页重载前存滚动位置与展开项，重载后恢复（file:// 下无法局部拉取）
+  try{var st=JSON.parse(sessionStorage.rb||'{}');
+    (st.open||[]).forEach(function(i){var d=document.querySelectorAll('details')[i];if(d)d.open=true});
+    if(st.y)window.scrollTo(0,st.y)}catch(e){}
+  setInterval(function(){if(document.hidden)return;
+    try{sessionStorage.rb=JSON.stringify({y:window.scrollY,
+      open:[].map.call(document.querySelectorAll('details'),function(d,i){return d.open?i:-1}).filter(function(i){return i>=0})})}catch(e){}
+    location.reload()},30000);
+})();
+"""
+
+
+def sev_tag(sev):
+    return f'<span class="sev {esc(sev)}">{esc(sev)}</span>' if sev else ""
+
+
+def render_round(p, rnd):
+    f, r, dcs = rnd["findings"], rnd.get("responses") or {}, rnd.get("decisions") or {}
+    ids = list(f.keys()) + [k for k in r if k not in f]
+    pend_ids = {fid for _, fid, _, _, _ in p["human"]} if rnd["n"] == p["req"].get("_round", 1) - 1 else set()
+    nsev = {s: sum(1 for v in f.values() if v["sev"] == s) for s in SEVS}
+    summary = f"{len(ids)} 条 · " + " · ".join(f"{s} {nsev[s]}" for s in SEVS)
+    if pend_ids:
+        summary += f" · {len(pend_ids)} 条待裁决"
+    if not rnd["done"]:
+        summary += " · 评审未完成"
+    rows = []
+    for fid in ids:
+        v = f.get(fid, {})
+        resp, dec = r.get(fid), dcs.get(fid)
+        anchor = f"f-{p['name']}-{fid}"
+        pend = fid in pend_ids
+        sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{esc(v["status"])}</div>' if v.get("status") else "")
+        claim_cell = f'<div class="claim">{esc(v.get("claim", ""))}</div>' + (f'<code class="evid">{esc(v["evidence"])}</code>' if v.get("evidence") else "")
+        if resp:
+            resp_cell = f'<span class="verb {resp[0]}">{resp[0]}</span><span class="claim">{esc(resp[1])}</span>'
+        elif rnd["responses"] is None:
+            resp_cell = '<span class="mute">—</span>'
+        else:
+            resp_cell = '<span class="mute">未回应</span>'
+        if pend:
+            dec_cell = '<div class="pending"><span class="dot"></span>等你裁决</div><div class="pending-hint">uphold / overrule · 记入 r%d-decision.md</div>' % rnd["n"]
+        elif dec:
+            dec_cell = f'<span class="dec">{dec[0]}</span><span>{esc(dec[1])}</span>'
+        else:
+            dec_cell = '<span style="color:#c9c7c1">—</span>'
+        rows.append(f'<div class="frow{" pend" if pend else ""}" id="{esc(anchor)}"><div><code>{fid}</code></div>'
+                    f'<div>{sev_cell}</div><div>{claim_cell}</div><div>{resp_cell}</div><div>{dec_cell}</div></div>')
+    if not rows and not rnd["done"]:
+        return (f'<div class="round"><div class="rh"><h2>Round {rnd["n"]}</h2>'
+                f'<span class="mute" style="font-size:12px">评审中，findings 尚未完成</span></div></div>')
+    if not rows:
+        rows.append('<div class="empty">没有可解析的 finding 行</div>')
+    return (f'<div class="round"><div class="rh"><h2>Round {rnd["n"]}</h2><span class="mute" style="font-size:12px">{esc(summary)}</span></div>'
+            f'<div class="ftab"><div class="fcols"><div>编号</div><div>严重度 · 状态</div><div>评审方 claim · evidence</div>'
+            f'<div>写手回应</div><div>裁决</div></div>{"".join(rows)}</div></div>')
+
+
+def render_cycle(p):
+    req, cr = p["req"], p["cycle_req"]
+    sent1 = (p["rounds"][0].get("sent") or {}) if p["rounds"] else {}
+    target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
+    base = (cr.get("base sha") or "")[:7]
+    top = (f'<span class="lab">当前周期</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
+           f'<span>{esc(cr.get("kind", ""))}</span><span>round {esc(req.get("round", cr.get("round", "")))}</span>'
+           f'<span class="dim">{esc(p["cycle_note"])}</span>')
+    kv = []
+    art = cr.get("artifact", "")
+    if art:
+        kv.append('<div class="k">artifact</div><div class="chips">' + "".join(f'<code class="chip">{esc(a)}</code>' for a in art.split()) + "</div>")
+    for k in ("out of scope", "risk areas", "test paths"):
+        if cr.get(k):
+            kv.append(f'<div class="k">{k}</div><div class="v">{esc(cr[k])}</div>')
+    if cr.get("checks"):
+        kv.append(f'<div class="k">checks</div><div><code>{esc(cr["checks"])}</code></div>')
+    if base and target:
+        stat = git(p["repo"], "diff", "--stat", f"{base}..{target}")
+        full = git(p["repo"], "diff", f"{base}..{target}").splitlines()
+        trunc = ""
+        if len(full) > DIFF_MAX_LINES:
+            full = full[:DIFF_MAX_LINES]
+            trunc = f"\n\n… 已截断，完整 diff：git -C {p['repo']} diff {base}..{target}"
+        last = stat.strip().splitlines()[-1].strip() if stat.strip() else "空"
+        kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
+                  f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
+                  f'<pre class="block">{esc(stat)}\n{esc(chr(10).join(full) + trunc)}</pre></details></div>')
+    return f'<div class="cycle"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
+
+
+def render_panel(p, archives, self_closed):
+    parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
+    badge = f'<span class="me">{esc(p["state"])}</span>' if p["needs_me"] else f'<span class="status">{esc(p["state"])}</span>'
+    parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>'
+                 f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
+    if p.get("triage_reason"):
+        parts.append(f'<div class="idle" style="padding:14px 0">{esc(p["triage_reason"])}</div>')
+    if p["rounds"] or (p["req"] and p["state"] not in ("空闲",) and not p["state"].startswith("triage")):
+        parts.append(render_cycle(p))
+        for rnd in p["rounds"]:
+            parts.append(render_round(p, rnd))
+    elif not p.get("triage_reason"):
+        parts.append('<div class="idle">无在途周期。最近一次周期见下方归档。</div>')
+
+    items = [(a["sha"], a["when"], fid, sev, claim, reason) for a in archives for fid, sev, claim, reason in a["deferred"]]
+    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {len(items)}</span></h2><div class="list">')
+    for sha, when, fid, sev, claim, reason in items:
+        parts.append(f'<div class="brow"><code>{esc(sha)}</code><span class="dim tab">{esc(when)}</span>'
+                     f'<span><code style="font-weight:600">{fid}</code> <span class="dim">{esc(sev)}</span></span>'
+                     f'<span class="claim">{esc(claim)}</span><span class="dim claim"><span class="mute">写手理由 · </span>{esc(reason)}</span></div>')
+    if not items:
+        parts.append('<div class="empty">没有 defer 记录</div>')
+    parts.append("</div></div>")
+
+    parts.append('<div class="sec"><h2>最近归档</h2><div class="list"><div class="acols"><span></span><span>sha</span><span>日期</span>'
+                 '<span>kind</span><span>轮数</span><span>blocking</span><span>总耗时</span><span>结束方式</span></div>')
+    for a in archives[:ARCHIVES_SHOWN]:
+        dur = f"{a['secs'] // 60}m{a['secs'] % 60:02d}s" if a["secs"] else "—"
+        bw = "700" if a["blocking"] else "400"
+        parts.append(f'<details class="arch"><summary class="arow"><span class="tri">▶</span><code>{esc(a["sha"])}</code>'
+                     f'<span class="dim tab">{esc(a["when"])}</span><span>{esc(a["kind"])}</span><span>{a["rounds"]} 轮</span>'
+                     f'<span style="font-weight:{bw}">{a["blocking"]}</span><span class="tab">{dur}</span><span>{esc(a["ending"])}</span></summary>'
+                     f'<div class="body">{md(a["text"])}</div></details>')
+    if not archives:
+        parts.append('<div class="empty">无归档</div>')
+    parts.append("</div></div>")
+
+    parts.append('<div class="sec"><h2>自闭合<span class="sub">脚本判定不需评审的提交</span></h2><div class="list">')
+    for cells in self_closed:
+        cells = (cells + ["", "", "", ""])[:4]
+        parts.append(f'<div class="srow"><span class="dim tab">{esc(cells[0])}</span><code>{esc(cells[1])}</code>'
+                     f'<span>{esc(cells[2])}</span><span class="ink">{esc(cells[3])}</span></div>')
+    if not self_closed:
+        parts.append('<div class="empty">无记录</div>')
+    parts.append("</div></div></div>")
+    return "".join(parts)
+
+
+def render(projects, archives, self_closed):
+    waits = []
+    for p in projects:
+        for _, fid, verb, sev, _ in p["human"]:
+            what = f"{fid} {sev} · 写手 {verb}，待裁决" if sev else f"{fid} · 写手 {verb}，待裁决"
+            waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
+    if waits:
+        banner = (f'<div class="banner"><div class="t">等你 · {len(waits)}</div><div class="items">' + "".join(
+            f'<a href="#{esc(a)}" onclick="return rbGo(\'{esc(n)}\',\'{esc(a)}\')"><b>{esc(n)}</b><span>{esc(w)}</span>'
+            f'<span class="age">{esc(t)}</span><span class="arr">→</span></a>' for n, w, t, a in waits) + "</div></div>")
+    else:
+        banner = '<div class="nowait">没有等你的</div>'
+    side = [f'<div class="cap">项目 · {len(projects)}</div>']
+    for p in projects:
+        status = f'<span class="me">{esc(p["state"])}</span>' if p["needs_me"] else f'<span class="status">{esc(p["state"])}</span>'
+        side.append(f'<div class="proj{" needs" if p["needs_me"] else ""}" data-p="{esc(p["name"])}"><div class="row"><span class="nm">{esc(p["name"])}</span>'
+                    f'<span class="age">{ago(p["since"])}</span></div><div class="st">{status}<span class="who">{esc(p["waiting"])}</span></div></div>')
+    panels = "".join(render_panel(p, archives[p["name"]], self_closed[p["name"]]) for p in projects)
+    gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>Review board</title><style>{CSS}</style></head><body>'
+            f'<div class="wrap">{banner}<div class="grid"><div class="side">{"".join(side)}</div><div class="main">{panels}</div></div>'
+            f'<div class="foot">生成于 {gen} · 只读，30s 自动刷新 · 来源：各项目 .review.conf 指向的交接目录与 docs/reviews</div></div>'
+            f'<script>{JS}</script></body></html>')
+
+
+# ============================================================ main
+def discover(list_path):
+    repos = [] if list_path else [os.path.dirname(c) for c in glob.glob(PROJ_GLOB)]
+    for line in (read(list_path or PROJ_LIST) or "").splitlines():
+        line = os.path.expanduser(line.strip())
+        if line and not line.startswith("#") and os.path.isfile(f"{line}/.review.conf"):
+            repos.append(line)
+    seen, out = set(), []
+    for r in sorted(set(repos)):
+        real = os.path.realpath(r)
+        if real not in seen:
+            seen.add(real); out.append(r)
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    out_path = args[args.index("--out") + 1] if "--out" in args else DEFAULT_OUT
+    list_path = args[args.index("--projects") + 1] if "--projects" in args else None
+    projects, archives, self_closed = [], {}, {}
+    for repo in discover(list_path):
+        conf = parse_conf(f"{repo}/.review.conf")
+        if "REVIEW_DIR" not in conf:
+            continue
+        p = project_state(repo, conf)
+        projects.append(p)
+        archives[repo] = load_archives(repo)
+        self_closed[repo] = load_self_closed(repo)
+    # 同名仓库（不同目录下的同名 checkout）用上一级目录区分，name 是页面里的唯一键
+    names = [p["name"] for p in projects]
+    for p in projects:
+        if names.count(p["name"]) > 1:
+            p["name"] = os.path.basename(os.path.dirname(p["repo"])) + "/" + p["name"]
+    archives = {p["name"]: archives[p["repo"]] for p in projects}
+    self_closed = {p["name"]: self_closed[p["repo"]] for p in projects}
+    projects.sort(key=lambda p: (not p["needs_me"], -(p["since"] or p["last_activity"] or 0), p["name"]))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(render(projects, archives, self_closed))
+    if "--quiet" not in args:
+        print(out_path)
+    if "--open" in args:
+        subprocess.run(["open", out_path])
+
+
+if __name__ == "__main__":
+    main()

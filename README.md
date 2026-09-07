@@ -36,6 +36,7 @@ herdsman-init <短名>
 
 - [herdr](https://herdr.dev) ≥ 0.8.2
 - `jq`
+- `python3`（仅 review-board，标准库）
 - `git` ≥ 2.5（worktree）
 - bash ≥ 4
 - 两个 CLI agent：一个当写手（Codex 系），一个当评审方（Claude Code 系）
@@ -47,6 +48,7 @@ bin/
   request-review      写手调用的主脚本；注入、等待、哨兵判定、归档、度量
   review-archive      手动归档工具（自动归档已内建在 request-review）
   herdsman-init       项目初始化
+  review-board        只读看板：把交接目录和归档渲染成 ~/.review/board.html，request-review 退出时自动刷新
 config/
   rubric.md           评审契约，全局共用，安装到 ~/.config/review/
 templates/

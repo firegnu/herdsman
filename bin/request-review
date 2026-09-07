@@ -33,8 +33,13 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_START_TIMEOUT:=60000}"
 : "${REVIEW_POLL:=10}"          # 等哨兵时的轮询间隔（秒）；测试用，一般不改
 : "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
+: "${REVIEW_BOARD:=review-board}"   # 退出时重新生成看板的命令；置空则不生成（测试用）
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
+
+# 每次退出（不论退出码）都刷新看板：状态只在脚本退出时变化。看板是只读的派生视图，缺席不影响流程。
+# shellcheck disable=SC2064
+trap "[ -n '${REVIEW_BOARD}' ] && command -v '${REVIEW_BOARD}' >/dev/null && '${REVIEW_BOARD}' --quiet 2>/dev/null; true" EXIT
 
 DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
 REQ="${DIR}/request.md"

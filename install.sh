@@ -13,9 +13,11 @@ mkdir -p "${BIN}" "${CFG}"
 install -m 0755 "${SRC}/bin/request-review" "${BIN}/request-review"
 install -m 0755 "${SRC}/bin/review-archive" "${BIN}/review-archive"
 install -m 0755 "${SRC}/bin/herdsman-init" "${BIN}/herdsman-init"
+install -m 0755 "${SRC}/bin/review-board" "${BIN}/review-board"
 echo "  ✓ ${BIN}/request-review"
 echo "  ✓ ${BIN}/review-archive"
 echo "  ✓ ${BIN}/herdsman-init"
+echo "  ✓ ${BIN}/review-board"
 
 if [ -f "${CFG}/rubric.md" ]; then
   if cmp -s "${SRC}/config/rubric.md" "${CFG}/rubric.md"; then
@@ -35,7 +37,7 @@ echo "  ✓ ${CFG}/agents-section.md"
 
 echo
 missing=0
-for c in jq herdr git; do
+for c in jq herdr git python3; do
   command -v "$c" >/dev/null || { echo "  ✗ 缺少 ${c}"; missing=1; }
 done
 case ":${PATH}:" in

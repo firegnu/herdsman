@@ -28,6 +28,7 @@ REVIEW_WT=${REVIEW_WT}
 REVIEW_DIR=${REVIEW_DIR}
 REVIEW_WAIT=0
 REVIEW_START_TIMEOUT=4000
+REVIEW_BOARD=
 EOF
 # write_request <kind> <base> <round>; artifact/target are fixed to the fixture and HEAD.
 write_request() {
