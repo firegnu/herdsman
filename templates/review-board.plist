@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 每 30 秒重新生成评审看板。周期最后一轮写手写完 responses 后没有人再跑 request-review，
+       没有这个定时任务，那次回应要等下次运行才出现在页面上。install.sh 把 __HOME__ 换成家目录并加载。 -->
+  <key>Label</key><string>dev.herdsman.review-board</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/review-board</string>
+    <string>--quiet</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key><integer>30</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>__HOME__/.review/board.err</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

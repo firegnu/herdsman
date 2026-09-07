@@ -55,6 +55,7 @@ templates/
   agents-section.md   常驻指令，追加到项目的 AGENTS.md / CLAUDE.md
   brief-prompt.md     生成项目简报的提示词
   request.md          请求文件示例
+  review-board.plist  看板定时生成的 launchd 任务，install.sh 装
   pre-push.sample     可选的确定性触发 hook
 docs/
   QUICKSTART.md       纯步骤

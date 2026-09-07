@@ -227,6 +227,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 ✋ ~/.local/bin/request-review          # 全局，所有项目共用
 ✋ ~/.local/bin/review-archive          # 全局
 ✋ ~/.local/bin/review-board            # 全局；看板生成器，request-review 每次退出时调用
+✋ ~/Library/LaunchAgents/dev.herdsman.review-board.plist   # 每 30 秒生成一次看板，install.sh 装
 ✋ ~/.config/review/rubric.md           # 全局
 ⚙ ~/.review/board.html                 # 只读看板，review-board 生成，浏览器常开
 ⚙ ~/.review/<短名>/                     # 交接目录，脚本 mkdir -p
@@ -264,7 +265,9 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 （request 是否指向 HEAD、`.sent` / findings 哨兵 / responses / decision 文件是否存在）。评审中或 triage 中时它还会
 问一下 herdr 评审方 pane 的状态：working 只作备注，blocked / idle 视为评审方停了没交付，进"等你"横幅。
 周期闭合但尚未归档时收成一行摘要（轮数、回应计数、耗时），点开才见 request 与 Round；下个周期派发时它进归档。`request-review`
-每次退出时调用 `review-board --quiet` 重新生成；手动 `review-board --open` 也行。它看得到节点，看不到节点之间
+每次退出时调用 `review-board --quiet` 重新生成；`install.sh` 还装一个 launchd 任务
+（`~/Library/LaunchAgents/dev.herdsman.review-board.plist`）每 30 秒生成一次，覆盖周期最后一轮写手回应后
+没有人再跑脚本的空档；手动 `review-board --open` 也行。它看得到节点，看不到节点之间
 agent 在做什么 —— 那部分只在 herdr 的 pane 里。
 
 项目发现：`~/Developer/personal_projs/*/.review.conf`；仓库在别处时写进 `~/.review/projects`，一行一个路径。
@@ -1416,6 +1419,10 @@ def parse_findings(text):
             cur = field = None
         elif field and line.strip():
             cur[field] = (cur[field] + " " + line.strip()).strip()
+        elif line.strip() and not cur["claim"] and field is None:
+            # 第 2 轮起评审方常写 `F1 — resolved` 后直接跟自由文本（作者接受：… 核实：…），没有标签；当 claim 收
+            field = "claim"
+            cur["claim"] = line.strip()
         elif not line.strip():
             field = None
     return out
@@ -1822,8 +1829,11 @@ def render_round(p, rnd):
         anchor = f"f-{p['name']}-{fid}"
         pend = fid in pend_ids
         sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{esc(v["status"])}</div>' if v.get("status") else "")
-        claim_cell = f'<div class="claim">{esc(v.get("claim", ""))}</div>' + (
-            f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
+        if v.get("claim"):
+            claim_cell = f'<div class="claim">{esc(v["claim"])}</div>' + (
+                f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
+        else:  # 第 2 轮常只有 evidence（核实叙述），没有 claim：直接当正文
+            claim_cell = f'<div class="claim">{esc(v.get("evidence", ""))}</div>'
         if resp:
             resp_cell = f'<span class="verb {resp[0]}">{resp[0]}</span><span class="claim">{esc(resp[1])}</span>'
         elif rnd["responses"] is None:

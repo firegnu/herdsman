@@ -35,6 +35,19 @@ fi
 install -m 0644 "${SRC}/templates/agents-section.md" "${CFG}/agents-section.md"
 echo "  ✓ ${CFG}/agents-section.md"
 
+# 看板定时生成（macOS launchd，每 30 秒）；非 macOS 跳过
+if [ "$(uname)" = Darwin ]; then
+  AGENTS="${HOME}/Library/LaunchAgents"; PLIST="${AGENTS}/dev.herdsman.review-board.plist"
+  mkdir -p "${AGENTS}" "${HOME}/.review"
+  sed "s|__HOME__|${HOME}|g" "${SRC}/templates/review-board.plist" > "${PLIST}"
+  launchctl bootout "gui/$(id -u)/dev.herdsman.review-board" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$(id -u)" "${PLIST}" 2>/dev/null; then
+    echo "  ✓ ${PLIST}（每 30 秒生成 ~/.review/board.html）"
+  else
+    echo "  ✗ launchctl bootstrap 失败：${PLIST}"
+  fi
+fi
+
 echo
 missing=0
 for c in jq herdr git python3; do

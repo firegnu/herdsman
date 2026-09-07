@@ -166,6 +166,10 @@ def parse_findings(text):
             cur = field = None
         elif field and line.strip():
             cur[field] = (cur[field] + " " + line.strip()).strip()
+        elif line.strip() and not cur["claim"] and field is None:
+            # 第 2 轮起评审方常写 `F1 — resolved` 后直接跟自由文本（作者接受：… 核实：…），没有标签；当 claim 收
+            field = "claim"
+            cur["claim"] = line.strip()
         elif not line.strip():
             field = None
     return out
@@ -572,8 +576,11 @@ def render_round(p, rnd):
         anchor = f"f-{p['name']}-{fid}"
         pend = fid in pend_ids
         sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{esc(v["status"])}</div>' if v.get("status") else "")
-        claim_cell = f'<div class="claim">{esc(v.get("claim", ""))}</div>' + (
-            f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
+        if v.get("claim"):
+            claim_cell = f'<div class="claim">{esc(v["claim"])}</div>' + (
+                f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
+        else:  # 第 2 轮常只有 evidence（核实叙述），没有 claim：直接当正文
+            claim_cell = f'<div class="claim">{esc(v.get("evidence", ""))}</div>'
         if resp:
             resp_cell = f'<span class="verb {resp[0]}">{resp[0]}</span><span class="claim">{esc(resp[1])}</span>'
         elif rnd["responses"] is None:
