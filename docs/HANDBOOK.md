@@ -1278,7 +1278,7 @@ PROJ_LIST = os.path.expanduser("~/.review/projects")
 DEFAULT_OUT = os.path.expanduser("~/.review/board.html")
 STAT_FILES = {"precision.md", "self-closed.md", "timing.md", "skipped.md", "escapes.md"}
 DIFF_MAX_LINES = 2000
-ARCHIVES_SHOWN = 10
+ARCHIVES_SHOWN = 5
 SELF_CLOSED_SHOWN = 12
 NOW = time.time()
 
@@ -1694,6 +1694,10 @@ details.prev{margin-top:18px;border:1px dashed #d6d4ce;background:#f9f8f5;paddin
 details.prev>summary{padding:12px 0;display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
 details.prev>summary .lab{font-size:12px;color:#8a8883}
 details.prev .cycle{border:0;background:transparent;padding:0 0 14px;margin-top:0}
+details.desc>summary,details.ev>summary{color:#8a8883;font-size:11.5px;display:flex;gap:6px;align-items:center}
+details.ev{margin-top:3px}details.ev>summary::before{content:"▸ ";font-size:10px}details[open].ev>summary::before{content:"▾ "}
+details.bgrp{margin-top:10px}details.bgrp>summary.bhead{cursor:pointer}
+details.sc>summary{cursor:pointer}details.sc>summary h2{display:inline}
 .filter{margin:0 0 8px;font:12.5px inherit;padding:4px 8px;border:1px solid #d6d4ce;border-radius:2px;width:320px;background:#fff}
 .cycle .top .lab{font-size:12px;color:#8a8883}
 .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 14px;font-size:12.5px}
@@ -1763,9 +1767,9 @@ JS = """
     history.replaceState(null,'','#'+anchor);
   }
   window.rbFilter=function(inp){var q=inp.value.trim().toLowerCase();
-    inp.nextElementSibling.querySelectorAll('.bgrp').forEach(function(g){var any=false;
+    inp.nextElementSibling.querySelectorAll('.bgrp').forEach(function(g,i){var any=false;
       g.querySelectorAll('.bitem').forEach(function(r){var hit=!q||r.textContent.toLowerCase().indexOf(q)>=0;r.style.display=hit?'':'none';any=any||hit});
-      g.style.display=any?'':'none'})};
+      g.style.display=any?'':'none';if(q)g.open=any;else g.open=(i===0)})};
   window.rbGo=function(name,anchor){select(name);setTimeout(function(){hit(anchor)},30);return false};
   var names=[].map.call(document.querySelectorAll('.proj'),function(e){return e.dataset.p});
   var first=document.querySelector('.proj.needs');
@@ -1797,7 +1801,7 @@ def render_round(p, rnd):
     ids = list(f.keys()) + [k for k in r if k not in f]
     pend_ids = {fid for _, fid, _, _, _ in p["human"]} if rnd["n"] == p["req"].get("_round", 1) - 1 else set()
     nsev = {s: sum(1 for v in f.values() if v["sev"] == s) for s in SEVS}
-    summary = f"{len(ids)} 条 · " + " · ".join(f"{s} {nsev[s]}" for s in SEVS)
+    summary = f"{len(ids)} 条" + "".join(f" · {nsev[s]} {s}" for s in SEVS if nsev[s])
     if pend_ids:
         summary += f" · {len(pend_ids)} 条待裁决"
     if not rnd["done"]:
@@ -1818,7 +1822,8 @@ def render_round(p, rnd):
         anchor = f"f-{p['name']}-{fid}"
         pend = fid in pend_ids
         sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{esc(v["status"])}</div>' if v.get("status") else "")
-        claim_cell = f'<div class="claim">{esc(v.get("claim", ""))}</div>' + (f'<code class="evid">{esc(v["evidence"])}</code>' if v.get("evidence") else "")
+        claim_cell = f'<div class="claim">{esc(v.get("claim", ""))}</div>' + (
+            f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
         if resp:
             resp_cell = f'<span class="verb {resp[0]}">{resp[0]}</span><span class="claim">{esc(resp[1])}</span>'
         elif rnd["responses"] is None:
@@ -1839,7 +1844,7 @@ def render_round(p, rnd):
     if not rows:
         rows.append('<div class="empty">没有可解析的 finding 行</div>')
     return (f'<div class="round"><div class="rh"><h2>Round {rnd["n"]}</h2><span class="mute" style="font-size:12px">{esc(summary)}</span></div>'
-            f'<div class="ftab"><div class="fcols"><div>编号</div><div>严重度 · 状态</div><div>评审方 claim · evidence</div>'
+            f'<div class="ftab"><div class="fcols"><div>编号</div><div>严重度 · 状态</div><div>评审方 claim</div>'
             f'<div>写手回应</div><div>裁决</div></div>{"".join(rows)}</div></div>')
 
 
@@ -1856,11 +1861,15 @@ def render_cycle(p):
     art = cr.get("artifact", "")
     if art:
         kv.append('<div class="k">artifact</div><div class="chips">' + "".join(f'<code class="chip">{esc(a)}</code>' for a in art.split()) + "</div>")
-    for k in ("out of scope", "risk areas", "test paths"):
-        if cr.get(k):
-            kv.append(f'<div class="k">{k}</div><div class="v">{esc(cr[k])}</div>')
     if cr.get("checks"):
         kv.append(f'<div class="k">checks</div><div><code>{esc(cr["checks"])}</code></div>')
+    # 写手的自述（不是事实）默认折起，需要对照时再看
+    self_desc = [(k, cr[k]) for k in ("out of scope", "risk areas", "test paths") if cr.get(k)]
+    if self_desc:
+        kv.append('<div class="k">写手自述</div><div><details class="desc"><summary><span class="tri">▶</span>'
+                  + esc(" · ".join(k for k, _ in self_desc)) + '</summary><div class="kv" style="margin-top:6px">'
+                  + "".join(f'<div class="k">{k}</div><div class="v">{esc(v)}</div>' for k, v in self_desc)
+                  + '</div></details></div>')
     if base and target:
         stat = git(p["repo"], "diff", "--stat", f"{base}..{target}")
         full = git(p["repo"], "diff", f"{base}..{target}").splitlines()
@@ -1926,16 +1935,17 @@ def render_panel(p, archives, self_closed):
     total = sum(len(a["deferred"]) for a in groups)
     parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {total} 条 · {len(groups)} 个周期</span></h2>'
                  f'<input class="filter" type="search" placeholder="过滤 Backlog…" oninput="rbFilter(this)"><div class="list">')
-    for a in groups:
-        parts.append(f'<div class="bgrp"><div class="bhead" title="{esc(a["artifact"])}"><code>{esc(a["sha"])}</code>'
+    for i, a in enumerate(groups):
+        parts.append(f'<details class="bgrp"{" open" if i == 0 else ""}><summary class="bhead" title="{esc(a["artifact"])}">'
+                     f'<span class="tri">▶</span><code>{esc(a["sha"])}</code>'
                      f'<span class="dim tab">{esc(a["when"])}</span><span>{esc(a["kind"])}</span>'
-                     f'<span class="dim">{len(a["deferred"])} 条没改</span></div>')
+                     f'<span class="dim">{len(a["deferred"])} 条</span></summary>')
         for fid, sev, claim, reason in a["deferred"]:
             said = esc(claim) if claim else '<span class="mute">评审方用了别的编号，见归档原文</span>'
             parts.append(f'<div class="bitem"><div class="bid"><code>{fid}</code>{sev_tag(sev)}</div>'
                          f'<div class="bl"><span class="who">评审方</span><span class="claim">{said}</span></div>'
                          f'<div class="bl dim"><span class="who">写手</span><span class="claim">{esc(reason)}</span></div></div>')
-        parts.append('</div>')
+        parts.append('</details>')
     if not groups:
         parts.append('<div class="empty">没有 defer 记录</div>')
     parts.append("</div></div>")
@@ -1953,14 +1963,16 @@ def render_panel(p, archives, self_closed):
         parts.append('<div class="empty">无归档</div>')
     parts.append("</div></div>")
 
-    parts.append('<div class="sec"><h2>自闭合<span class="sub">脚本判定不需评审的提交</span></h2><div class="list">')
-    for cells in self_closed:
-        cells = (cells + ["", "", "", ""])[:4]
-        parts.append(f'<div class="srow"><span class="dim tab">{esc(cells[0])}</span><code>{esc(cells[1])}</code>'
-                     f'<span>{esc(cells[2])}</span><span class="ink">{esc(cells[3])}</span></div>')
-    if not self_closed:
-        parts.append('<div class="empty">无记录</div>')
-    parts.append("</div></div></div>")
+    rows = [(cells + ["", "", "", ""])[:4] for cells in self_closed]
+    kinds = {}
+    for c in rows:
+        kinds[c[2] or "?"] = kinds.get(c[2] or "?", 0) + 1
+    gist = "、".join(f"{n} 条{esc(k)}" for k, n in kinds.items()) if rows else "无记录"
+    parts.append(f'<div class="sec"><details class="sc"><summary><h2>自闭合<span class="sub">最近 {len(rows)} 条：{gist}</span></h2></summary><div class="list">')
+    for c in rows:
+        parts.append(f'<div class="srow"><span class="dim tab">{esc(c[0])}</span><code>{esc(c[1])}</code>'
+                     f'<span>{esc(c[2])}</span><span class="ink">{esc(c[3])}</span></div>')
+    parts.append("</div></details></div></div>")
     return "".join(parts)
 
 
@@ -1971,7 +1983,7 @@ def render(projects, archives, self_closed):
             if kind == "stop":
                 waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"p-{p['name']}"))
                 continue
-            what = f"{fid} {sev} · 写手 {verb}，待裁决" if sev else f"{fid} · 写手 {verb}，待裁决"
+            what = f"{fid} {sev} · 写手 {verb}" if sev else f"{fid} · 写手 {verb}"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
     if waits:
         banner = (f'<div class="banner"><div class="t">等你 · {len(waits)}</div><div class="items">' + "".join(
