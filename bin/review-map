@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""review-map —— 从证据生成风险图草案。只读，不改仓库。
+
+三个来源：
+  1. docs/reviews/*.md 归档：每条 finding 的严重度归到 evidence 里的路径；每个周期的 artifact 列表算"被审过几次"
+  2. Python import 扇入：一个目录被多少别的文件依赖
+  3. 有没有测试：tests/ 里有没有 import 这个目录的文件
+没有归档时只输出 2、3，新项目也能跑。
+
+用法: review-map [REPO] [--out FILE]     默认 REPO 为 cwd，草案打到 stdout
+"""
+import glob
+import os
+import re
+import sys
+from collections import defaultdict
+
+STAT_FILES = {"precision.md", "self-closed.md", "timing.md", "skipped.md", "escapes.md"}
+IGNORE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "scratchpad", "tmp", "artifacts", "sample_data"}
+PATH_RE = re.compile(r'(?<![\w/.])((?:[\w][\w.-]*/)*[\w][\w.-]*\.(?:py|md|json|yaml|yml|toml|txt|sh|js|ts))(?::\d+)?')
+RULE_FILES = {"AGENTS.md", "CLAUDE.md", "docs/reviewer-brief.md"}
+SEV_RE = re.compile(r'^[\s#*_-]*F(\d+)[\s*_]*[|:—-]+\s*(.*)$')
+
+
+def read(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- repo index
+def repo_files(repo):
+    out = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.endswith(".egg-info") and not d.startswith(".")]
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), repo)
+            out.append(rel)
+    return out
+
+
+def group_of(path):
+    """路径 → 风险图里的一行（目录粒度）。src 按包目录，其余按两级目录。"""
+    parts = path.split("/")
+    if len(parts) == 1 or path in RULE_FILES:
+        return path
+    if parts[0] == "src" and len(parts) >= 3:
+        return "/".join(parts[:3]) + "/**" if len(parts) > 3 else "/".join(parts[:2]) + "/*"
+    if len(parts) == 2 or "." in parts[1]:
+        return parts[0] + "/**"
+    return "/".join(parts[:2]) + "/**"
+
+
+# ---------------------------------------------------------------- archives
+def parse_findings(text):
+    """{id: (sev, evidence_text)}；第 2 轮起没有严重度的行不计。"""
+    out, cur, field = {}, None, None
+    for line in text.splitlines():
+        m = SEV_RE.match(line)
+        if m and not line.lstrip().startswith(("-", "*")):
+            cells = [c.strip().strip("*_ ").lower() for c in re.split(r'\s*(?:[|]|→|->)\s*', m.group(2).replace("*", ""))]
+            sev = next((c for c in cells if c in ("blocking", "should", "nit")), "")
+            status = next((c for c in cells if c in ("regressed", "not-resolved")), "")
+            cur = out.setdefault("F" + m.group(1), {"sev": sev, "status": status, "text": ""})
+            if sev: cur["sev"] = sev
+            if status: cur["status"] = status
+            field = None
+            continue
+        if cur is None:
+            continue
+        if re.match(r'^#{1,6}\s', line):
+            cur = None; continue
+        m2 = re.match(r'^\s*(claim|evidence|fix-hint)\s*:\s*(.*)$', line, re.I)
+        if m2:
+            field = m2.group(1).lower(); cur["text"] += " " + m2.group(2)
+        elif field and line.strip():
+            cur["text"] += " " + line.strip()
+        elif not line.strip():
+            field = None
+    return out
+
+
+def load_archives(repo, index):
+    """返回 per-group 统计 {group: {"cycles": n, "blocking": n, "should": n, "nit": n, "regressed": n}} 与周期数。
+    cycles = 该 group 在多少个周期里出现过（artifact 列表或 finding 的 evidence）。"""
+    stats = defaultdict(lambda: defaultdict(int))
+    index_set = set(index)
+    unplaced, counted = [0], [0]
+    by_base = defaultdict(list)
+    for f in index:
+        by_base[os.path.basename(f)].append(f)
+    ncycles = 0
+    for f in sorted(glob.glob(f"{repo}/docs/reviews/*.md")):
+        if os.path.basename(f) in STAT_FILES:
+            continue
+        text = read(f)
+        if not text.startswith("# Review cycle @"):
+            continue
+        ncycles += 1
+        reqm = re.search(r'^## Request\n(.*?)(?=^## )', text, re.S | re.M)
+        artifact = []
+        if reqm:
+            am = re.search(r'^artifact:\s*(.*)$', reqm.group(1), re.M)
+            if am:
+                artifact = [a.strip("`,;") for a in am.group(1).split()]
+                artifact = [a for a in artifact if a in index_set or ("*" in a and "/" in a)]
+        # 通配的 artifact（tests/test_x*.py）展开到索引里的真实文件
+        art_files = []
+        for a in artifact:
+            if "*" in a:
+                art_files += [p for p in index if re.fullmatch(a.replace(".", r"\.").replace("*", ".*"), p)]
+            else:
+                art_files.append(a)
+        touched = {group_of(p) for p in art_files}
+        art_base = defaultdict(list)
+        for p in art_files:
+            art_base[os.path.basename(p)].append(p)
+
+        def resolve(token):
+            token = token.strip("`'\"")
+            if "/" in token:
+                return [token] if token in index_set else []
+            base = token
+            if base in art_base:
+                return art_base[base]
+            if base in by_base and len(by_base[base]) == 1:
+                return by_base[base]
+            return []
+
+        for hdr, body in re.findall(r'^## (r\d+-findings\.md)\n(.*?)(?=^## r\d+-\w+\.md\n|\Z)', text, re.S | re.M):
+            for fid, v in parse_findings(body).items():
+                sev = v["sev"]
+                if not sev and v["status"] != "regressed":
+                    continue
+                paths = set()
+                for tok in PATH_RE.findall(v["text"]):
+                    for p in resolve(tok):
+                        paths.add(p)
+                if not paths:   # 没写路径的 finding 说的是"这次送审的东西"，归到 artifact 涉及的所有目录（往严）
+                    paths = set(art_files); unplaced[0] += 1
+                counted[0] += 1
+                for g in {group_of(p) for p in paths}:
+                    touched.add(g)
+                    if sev:
+                        stats[g][sev] += 1
+                    if v["status"] == "regressed":
+                        stats[g]["regressed"] += 1
+        for g in touched:
+            stats[g]["cycles"] += 1
+    return stats, ncycles, (unplaced[0], counted[0])
+
+
+# ---------------------------------------------------------------- static signals
+def fan_in(repo, index):
+    """Python：每个文件被多少个别的文件 import；聚合到 group。"""
+    mods = {}
+    for p in index:
+        if not p.endswith(".py"):
+            continue
+        parts = p[:-3].split("/")
+        if parts[0] == "src":
+            parts = parts[1:]
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        mods[".".join(parts)] = p
+    importers = defaultdict(set)
+    for p in index:
+        if not p.endswith(".py"):
+            continue
+        for m in re.finditer(r'^[ \t]*(?:from[ \t]+([\w.]+)[ \t]+import[ \t]+([^\n]+)|import[ \t]+([\w.]+))', read(f"{repo}/{p}"), re.M):
+            base, syms, plain = m.group(1), m.group(2), m.group(3)
+            # from X import a, b → 先试 X.a / X.b（子模块），再退到 X 本身及其父包
+            cands = [f"{base}.{sy.strip().split()[0]}" for sy in (syms or "").replace("(", "").replace(")", "").split(",") if sy.strip()] if base else []
+            cands.append(base or plain)
+            for name in cands:
+                while name:
+                    if name in mods and mods[name] != p:
+                        importers[mods[name]].add(p); break
+                    name = name.rpartition(".")[0]
+    g = defaultdict(set)
+    for target, srcs in importers.items():
+        for s in srcs:
+            if group_of(s) != group_of(target):
+                g[group_of(target)].add(s)
+    return {k: len(v) for k, v in g.items()}, importers
+
+
+def tested(repo, index, importers):
+    """group → 是否有 tests/ 里的文件 import 它。"""
+    out = defaultdict(bool)
+    for target, srcs in importers.items():
+        if any(s.startswith("tests/") for s in srcs):
+            out[group_of(target)] = True
+    return out
+
+
+# ---------------------------------------------------------------- decide
+def decide(group, st, fin, has_test, fin_hi):
+    """返回 (level, reason, needs_human)。往严的方向自动，往松的方向要人点头。"""
+    if group.startswith("docs/reviews/"):
+        return "skip", "评审归档本身", False
+    if group.startswith("docs/plans/"):
+        return "plan", "计划文档，必审", False
+    if group in ("AGENTS.md", "CLAUDE.md", "docs/reviewer-brief.md"):
+        return "plan", "规则文件，必审", False
+    if group.endswith(".md") or group.startswith("docs/"):
+        if st["blocking"]:
+            return "review", f"文档但出过 {st['blocking']} 条阻断", False
+        return "light", "记录类文档，只看与代码是否矛盾", False
+    if group.startswith("tests/"):
+        return "review", "测试", False
+    why = []
+    if st["blocking"] or st["regressed"]:
+        why.append(f"{st['cycles']} 个周期里 {st['blocking']} 条阻断" + (f"、{st['regressed']} 次回退" if st["regressed"] else ""))
+        if fin: why.append(f"被 {fin} 个文件依赖")
+        return "deep", "；".join(why), False
+    if fin >= fin_hi and fin_hi > 0:
+        return "deep", f"被 {fin} 个文件依赖（扇入前 1/3）" + ("" if has_test else "；无测试"), False
+    if not has_test:
+        return "review", f"无测试，评审是唯一防线" + (f"；{st['cycles']} 个周期无阻断" if st["cycles"] else ""), False
+    if st["cycles"] >= 6 and st["should"] == 0:
+        return "light", f"{st['cycles']} 个周期只出细节；有测试；被 {fin} 个文件依赖", True
+    if st["cycles"]:
+        return "review", f"{st['cycles']} 个周期，{st['should']} 条应改 {st['nit']} 条细节，无阻断；有测试", False
+    return "review", "未审过；有测试", False
+
+
+def main():
+    args = sys.argv[1:]
+    out_path = args[args.index("--out") + 1] if "--out" in args else None
+    repo = next((a for a in args if not a.startswith("--") and a != out_path), os.getcwd())
+    repo = os.path.abspath(repo)
+    index = repo_files(repo)
+    stats, ncycles, (unplaced, counted) = load_archives(repo, index)
+    fin, importers = fan_in(repo, index)
+    has_test = tested(repo, index, importers)
+
+    groups = stats
+    for p in index:
+        if p.endswith(".py") or p.startswith("docs/") or p in RULE_FILES or ("/" not in p and p.endswith(".md")):
+            groups.setdefault(group_of(p), defaultdict(int))
+    fins = sorted(v for v in fin.values() if v)
+    fin_hi = fins[len(fins) * 2 // 3] if fins else 0
+
+    rows = []
+    for g in sorted(groups):
+        if g.split("/")[0] in IGNORE_DIRS:
+            continue
+        level, why, human = decide(g, groups[g], fin.get(g, 0), has_test.get(g, False), fin_hi)
+        rows.append((g, level, why, human, groups[g]))
+
+    order = {"deep": 0, "plan": 1, "review": 2, "light": 3, "skip": 4}
+    rows.sort(key=lambda r: (order[r[1]], r[0]))
+    lines = [f"# .review-map 草案 —— 由 review-map 生成，{ncycles} 个归档周期，{counted} 条带严重度的 finding"
+             + (f"（其中 {unplaced} 条 evidence 没写路径，按该周期的 artifact 目录归因）" if counted else "") + f"，{len(index)} 个文件",
+             "# 等级：deep 跑测试三轮 / review 正常评审 / light 一轮只找阻断 / plan 计划评审 / skip 直接过",
+             "# 往严自动、往松要人点头；标 [待点头] 的是脚本建议降级但未生效的行", ""]
+    width = max(len(r[0]) for r in rows) + 2
+    for g, level, why, human, st in rows:
+        tag = "  [待点头]" if human else ""
+        lines.append(f"{g.ljust(width)}{('review' if human else level).ljust(8)}# {why}{tag}")
+    text = "\n".join(lines) + "\n"
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(out_path)
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
