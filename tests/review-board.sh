@@ -163,6 +163,7 @@ lacks 'class="cycle stale"' 'old stale styling gone'
 
 # request 字段与 diff
 has 'class="chip">tests/test_a.py' 'artifact chips'
+has '<div class="title">change</div>' 'commit subject as cycle title'
 has '1 file changed, 1 insertion(+)' 'diff stat'
 has '写手自述</div><div><details class="desc">' 'writer self-description folded'
 has '3 条 · 1 blocking · 1 should · 1 nit' 'round summary without zeros'

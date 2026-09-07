@@ -258,7 +258,8 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 - **顶部横幅**：跨项目列出等你的事 —— 待裁决的 reject / blocking defer，点一条落到那行 finding。没有时一行灰字。
 - **左栏**：所有配了 `.review.conf` 的项目，各带状态与停留时长；状态标签按"谁在等"配色：红 = 等你，
   蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等；等你的排最前。
-- **右栏**：选中项目的当前周期（写手交的 artifact / out of scope / risk areas / checks、diff stat 与折叠的完整 diff）、
+- **右栏**：选中项目的当前周期（标题是 target 提交的 commit 标题，plan 再带文档标题；然后是写手交的
+  artifact / checks、折叠的自述、diff stat 与折叠的完整 diff）、
   每轮一张 finding 表（编号、严重度与第 2 轮起的状态、评审方 claim 与 evidence、写手回应、裁决）、
   Backlog（历史归档里的 defer）、最近归档（可展开原文）、自闭合记录。
 
@@ -1700,7 +1701,12 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head .hd{margin-left:auto;color:#5f5e5a;font-size:12.5px}
 .idle{padding:28px 0;color:#8a8883}
 .cycle{margin-top:18px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px}
-.cycle .top{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px}
+.cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
+.cycle .subtitle{font-size:13px;color:#3a3936;margin-bottom:2px}
+.cycle .body-msg{white-space:pre-wrap;color:#3a3936;font-size:12.5px;margin:4px 0 6px;max-width:900px}
+.cycle .commits{font-size:12px;color:#5f5e5a;margin:2px 0 8px}.cycle .commits div{margin:1px 0}
+.title-sm{font-weight:700;color:#1c1c1a}
+.cycle .top{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin:6px 0 12px}
 .d-add{color:#1f6b33;background:#eaf5ec;display:block}.d-del{color:#9a2a22;background:#fbecea;display:block}
 .d-hunk{color:#5a4fa0;display:block}.d-file{font-weight:700;display:block}.d-hdr{color:#8a8883;display:block;margin-top:8px}.d-ctx{display:block;min-height:1.5em}
 details.prev{margin-top:18px;border:1px dashed #d6d4ce;background:#f9f8f5;padding:0 18px}
@@ -1805,6 +1811,34 @@ JS = """
 """
 
 
+def cycle_subject(p):
+    """这次送审做的是什么：target 提交的标题与正文、base..target 的提交列表、plan 的文档标题。
+    这些是写手本来就写的，不是 request 里的自述。"""
+    req, cr = p["req"], p["cycle_req"]
+    sent1 = (p["rounds"][0].get("sent") or {}) if p["rounds"] else {}
+    target = cr.get("target sha") or req.get("target sha") or sent1.get("target") or ""
+    base = cr.get("base sha") or ""
+    out = {"subject": "", "body": "", "commits": [], "plan_title": ""}
+    if not target:
+        return out
+    msg = git(p["repo"], "log", "-1", "--format=%s%n%b", target)
+    lines = msg.splitlines()
+    out["subject"] = lines[0].strip() if lines else ""
+    out["body"] = "\n".join(l for l in lines[1:] if not re.match(r'^(Co-Authored-By|Claude-Session|Signed-off-by):', l)).strip()
+    if base:
+        out["commits"] = [l for l in git(p["repo"], "log", "--format=%h %s", f"{base}..{target}").splitlines() if l.strip()]
+    if cr.get("kind") == "plan":
+        for path in cr.get("artifact", "").split():
+            if path.endswith((".md", ".markdown")):
+                for l in git(p["repo"], "show", f"{target}:{path}").splitlines()[:30]:
+                    m = re.match(r'^#\s+(.*)', l)
+                    if m:
+                        out["plan_title"] = m.group(1).strip(); break
+            if out["plan_title"]:
+                break
+    return out
+
+
 def state_badge(p):
     """状态标签按"谁在等"配色：红 = 等你，蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等。"""
     cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr"}.get(p["waiting"], "none")
@@ -1879,6 +1913,16 @@ def render_cycle(p):
     top = (f'<span class="lab">{"周期" if stale else "当前周期"}</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
            f'<span>{esc(cr.get("kind", ""))}</span><span>round {esc(req.get("round", cr.get("round", "")))}</span>'
            f'<span class="dim">{esc(p["cycle_note"])}</span>')
+    sub = cycle_subject(p)
+    title = ""
+    if sub["subject"]:
+        title = f'<div class="title">{esc(sub["subject"])}</div>'
+        if sub["plan_title"]:
+            title += f'<div class="subtitle">计划：{esc(sub["plan_title"])}</div>'
+        if sub["body"]:
+            title += f'<div class="body-msg">{esc(sub["body"])}</div>'
+        if len(sub["commits"]) > 1:
+            title += '<div class="commits">' + "".join(f'<div><code>{esc(c[:7])}</code> {esc(c[8:])}</div>' for c in sub["commits"]) + "</div>"
     kv = []
     art = cr.get("artifact", "")
     if art:
@@ -1917,7 +1961,7 @@ def render_cycle(p):
         kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
                   f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
                   f'<pre class="block">{esc(stat)}\n{"".join(body)}{esc(trunc)}</pre></details></div>')
-    return f'<div class="cycle"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
+    return f'<div class="cycle">{title}<div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
 def render_panel(p, archives, self_closed):
@@ -1938,8 +1982,10 @@ def render_panel(p, archives, self_closed):
         t0 = (p["rounds"][0].get("sent") or {}).get("start"); t1 = last.get("t_responses") or last.get("t_findings")
         sent1 = p["rounds"][0].get("sent") or {}
         target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
+        subj = cycle_subject(p)["subject"]
         parts.append(f'<details class="prev"><summary><span class="tri">▶</span><span class="lab">上一周期</span>'
-                     f'<code style="font-weight:600">@ {esc(target)}</code><span>{esc(cr.get("kind", ""))}</span>'
+                     + (f'<span class="title-sm">{esc(subj)}</span>' if subj else "")
+                     + f'<code style="font-weight:600">@ {esc(target)}</code><span>{esc(cr.get("kind", ""))}</span>'
                      f'<span>{len(p["rounds"])} 轮</span><span>{esc(counts)}</span><span class="tab">{dur((t1 - t0) if t0 and t1 else None)}</span>'
                      f'<span class="dim">已闭合，等下个周期派发时归档</span></summary>')
         parts.append(render_cycle(p))
