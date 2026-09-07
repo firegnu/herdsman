@@ -129,7 +129,7 @@ has '待人裁决' 'alpha state'
 has '评审中' 'beta state'
 has 'triage 中' 'gamma state'
 has 'prompt 已送达，等评审方写 findings' 'beta cycle note'
-has '写手 reject 了 F2、defer 了 F3，等人裁决' 'alpha cycle note'
+has '写手拒绝了 F2、暂缓了 F3，等人裁决' 'alpha cycle note'
 
 # 评审方状态：beta blocked → 等你 + STOP；gamma working → 备注
 has '<span class="badge me">评审中 · 评审方 blocked</span>' 'beta blocked state red'
@@ -141,13 +141,13 @@ has '评审方 working' 'gamma working note'
 
 # 横幅：两条裁决 + 一条 STOP；alpha 排在最前
 has '等你 · 3' 'banner count'
-has 'F2 nit · 写手 reject' 'banner reject item'
-has 'F3 blocking · 写手 defer' 'banner blocking-defer item'
+has 'F2 细节 · 写手拒绝' 'banner reject item'
+has 'F3 阻断 · 写手暂缓' 'banner blocking-defer item'
 has 'id="f-alpha/repo-F2"' 'finding anchor'
 [ "$(grep -o 'class="proj[^"]*" data-p="[^"]*"' "${OUT}" | head -1)" = 'class="proj needs" data-p="alpha/repo"' ] || fail 'alpha not first in sidebar'
 
 # finding 表：三种回应、待裁决标记、evidence
-has 'class="verb accept"' 'accept verb'
+has '<span class="verb accept" title="accept">接受</span>' 'accept verb translated with tooltip'
 has 'class="verb reject"' 'reject verb'
 has 'class="verb defer"' 'defer verb'
 has '等你裁决' 'pending decision cell'
@@ -158,7 +158,7 @@ has '回应 ' 'round timing shown'
 
 # delta：闭合未归档 → 折叠成一行摘要
 has '<details class="prev"><summary>' 'closed cycle collapsed'
-has '1 轮</span><span>1 defer</span>' 'collapsed summary counts'
+has '1 轮</span><span>1 暂缓</span>' 'collapsed summary counts'
 lacks 'class="cycle stale"' 'old stale styling gone'
 
 # request 字段与 diff
@@ -166,7 +166,7 @@ has 'class="chip">tests/test_a.py' 'artifact chips'
 has '<div class="title">change</div>' 'commit subject as cycle title'
 has '1 file changed, 1 insertion(+)' 'diff stat'
 has '写手自述</div><div><details class="desc">' 'writer self-description folded'
-has '3 条 · 1 blocking · 1 should · 1 nit' 'round summary without zeros'
+has '3 条 · 1 阻断 · 1 应改 · 1 细节' 'round summary without zeros'
 has '<span class="d-add">+b = 1</span>' 'diff add line coloured'
 has 'class="d-hunk">@@' 'diff hunk coloured'
 
@@ -175,7 +175,7 @@ has '<code>abc1234</code>' 'archive row'
 has '1m35s' 'archive duration from timing.md'
 has '留到以后' 'backlog reason'
 has '<span class="who">写手</span>' 'backlog stacked layout'
-has '历史归档中 defer 的 finding · 1 条 · 1 个周期' 'backlog count'
+has '暂缓清单<span class="sub">评审方指出、写手承认但没改的 · 1 条 · 1 个周期' 'backlog count'
 has '<details class="bgrp" open><summary class="bhead" title="a.py">' 'newest backlog group open'
 has 'class="filter" type="search"' 'backlog filter box'
 has '<code>def5678</code>' 'self-closed row'

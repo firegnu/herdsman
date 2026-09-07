@@ -261,7 +261,9 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 - **右栏**：选中项目的当前周期（标题是 target 提交的 commit 标题，plan 再带文档标题；然后是写手交的
   artifact / checks、折叠的自述、diff stat 与折叠的完整 diff）、
   每轮一张 finding 表（编号、严重度与第 2 轮起的状态、评审方 claim 与 evidence、写手回应、裁决）、
-  Backlog（历史归档里的 defer）、最近归档（可展开原文）、自闭合记录。
+  暂缓清单（历史归档里的 defer）、最近归档（可展开原文）、自闭合记录。页面把协议词翻成中文
+  （accept 接受 / defer 暂缓 / reject 拒绝，blocking 阻断 / should 应改 / nit 细节，resolved 已修复 等），
+  悬停显示英文原词；文件与协议里仍是英文。
 
 它是**派生视图**：不存自己的状态，不接 agent，写手和评审方不知道它存在。状态判据与 `request-review` 相同
 （request 是否指向 HEAD、`.sent` / findings 哨兵 / responses / decision 文件是否存在）。评审中或 triage 中时它还会
@@ -1527,7 +1529,7 @@ def project_state(repo, conf):
         elif pend:
             p.update(state="待人裁决", waiting="等你", needs_me=True, since=mtime(f"{d}/r{cur - 1}-responses.md"),
                      human=[("decision", fid, verb, sev, reason) for fid, verb, sev, reason in pend],
-                     cycle_note="写手 " + "、".join(f"{v} 了 {f}" for f, v, _, _ in pend) + "，等人裁决")
+                     cycle_note="写手" + "、".join(f"{ZH.get(v, v)}了 {f}" for f, v, _, _ in pend) + "，等人裁决")
         else:
             p.update(state="待派发", waiting="等写手", since=mtime(f"{d}/request.md"),
                      cycle_note=f"request 已写（round {req.get('round', '')}），等写手运行 request-review")
@@ -1845,8 +1847,23 @@ def state_badge(p):
     return f'<span class="badge {cls}">{esc(p["state"])}</span>'
 
 
+# 页面用词：文件与协议里仍是英文（脚本靠它们解析），页面翻成中文，悬停显示原词。
+ZH = {"accept": "接受", "defer": "暂缓", "reject": "拒绝",
+      "blocking": "阻断", "should": "应改", "nit": "细节",
+      "resolved": "已修复", "not-resolved": "未修复", "regressed": "有回退",
+      "upheld": "维持原判", "overruled": "已改判", "deferred": "已暂缓", "disputed": "有争议",
+      "uphold": "维持原判", "overrule": "改判"}
+
+
+def zh(word, cls=""):
+    w = (word or "").lower()
+    if w not in ZH:
+        return esc(word)
+    return f'<span class="{cls}" title="{esc(w)}">{ZH[w]}</span>' if cls else f'<span title="{esc(w)}">{ZH[w]}</span>'
+
+
 def sev_tag(sev):
-    return f'<span class="sev {esc(sev)}">{esc(sev)}</span>' if sev else ""
+    return f'<span class="sev {esc(sev)}" title="{esc(sev)}">{ZH.get(sev, esc(sev))}</span>' if sev else ""
 
 
 def render_round(p, rnd):
@@ -1854,7 +1871,7 @@ def render_round(p, rnd):
     ids = list(f.keys()) + [k for k in r if k not in f]
     pend_ids = {fid for _, fid, _, _, _ in p["human"]} if rnd["n"] == p["req"].get("_round", 1) - 1 else set()
     nsev = {s: sum(1 for v in f.values() if v["sev"] == s) for s in SEVS}
-    summary = f"{len(ids)} 条" + "".join(f" · {nsev[s]} {s}" for s in SEVS if nsev[s])
+    summary = f"{len(ids)} 条" + "".join(f" · {nsev[s]} {ZH[s]}" for s in SEVS if nsev[s])
     if pend_ids:
         summary += f" · {len(pend_ids)} 条待裁决"
     if not rnd["done"]:
@@ -1874,22 +1891,22 @@ def render_round(p, rnd):
         resp, dec = r.get(fid), dcs.get(fid)
         anchor = f"f-{p['name']}-{fid}"
         pend = fid in pend_ids
-        sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{esc(v["status"])}</div>' if v.get("status") else "")
+        sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{zh(v["status"])}</div>' if v.get("status") else "")
         if v.get("claim"):
             claim_cell = f'<div class="claim">{esc(v["claim"])}</div>' + (
                 f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
         else:  # 第 2 轮常只有 evidence（核实叙述），没有 claim：直接当正文
             claim_cell = f'<div class="claim">{esc(v.get("evidence", ""))}</div>'
         if resp:
-            resp_cell = f'<span class="verb {resp[0]}">{resp[0]}</span><span class="claim">{esc(resp[1])}</span>'
+            resp_cell = zh(resp[0], f"verb {resp[0]}") + f'<span class="claim">{esc(resp[1])}</span>'
         elif rnd["responses"] is None:
             resp_cell = '<span class="mute">—</span>'
         else:
             resp_cell = '<span class="mute">未回应</span>'
         if pend:
-            dec_cell = '<div class="pending"><span class="dot"></span>等你裁决</div><div class="pending-hint">uphold / overrule · 记入 r%d-decision.md</div>' % rnd["n"]
+            dec_cell = '<div class="pending"><span class="dot"></span>等你裁决</div><div class="pending-hint">维持原判 uphold / 改判 overrule · 记入 r%d-decision.md</div>' % rnd["n"]
         elif dec:
-            dec_cell = f'<span class="dec">{dec[0]}</span><span>{esc(dec[1])}</span>'
+            dec_cell = zh(dec[0], "dec") + f'<span>{esc(dec[1])}</span>'
         else:
             dec_cell = '<span style="color:#c9c7c1">—</span>'
         rows.append(f'<div class="frow{" pend" if pend else ""}" id="{esc(anchor)}"><div><code>{fid}</code></div>'
@@ -1978,7 +1995,7 @@ def render_panel(p, archives, self_closed):
         req, cr = p["req"], p["cycle_req"]
         last = p["rounds"][-1]
         resp = last.get("responses") or {}
-        counts = " / ".join(f"{sum(1 for v in resp.values() if v[0] == k)} {k}" for k in ("accept", "defer", "reject") if any(v[0] == k for v in resp.values())) or "无回应"
+        counts = " / ".join(f"{sum(1 for v in resp.values() if v[0] == k)} {ZH[k]}" for k in ("accept", "defer", "reject") if any(v[0] == k for v in resp.values())) or "无回应"
         t0 = (p["rounds"][0].get("sent") or {}).get("start"); t1 = last.get("t_responses") or last.get("t_findings")
         sent1 = p["rounds"][0].get("sent") or {}
         target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
@@ -2001,8 +2018,8 @@ def render_panel(p, archives, self_closed):
 
     groups = [a for a in archives if a["deferred"]]
     total = sum(len(a["deferred"]) for a in groups)
-    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {total} 条 · {len(groups)} 个周期</span></h2>'
-                 f'<input class="filter" type="search" placeholder="过滤 Backlog…" oninput="rbFilter(this)"><div class="list">')
+    parts.append(f'<div class="sec"><h2>暂缓清单<span class="sub">评审方指出、写手承认但没改的 · {total} 条 · {len(groups)} 个周期</span></h2>'
+                 f'<input class="filter" type="search" placeholder="过滤暂缓清单…" oninput="rbFilter(this)"><div class="list">')
     for i, a in enumerate(groups):
         parts.append(f'<details class="bgrp"{" open" if i == 0 else ""}><summary class="bhead" title="{esc(a["artifact"])}">'
                      f'<span class="tri">▶</span><code>{esc(a["sha"])}</code>'
@@ -2015,11 +2032,11 @@ def render_panel(p, archives, self_closed):
                          f'<div class="bl dim"><span class="who">写手</span><span class="claim">{esc(reason)}</span></div></div>')
         parts.append('</details>')
     if not groups:
-        parts.append('<div class="empty">没有 defer 记录</div>')
+        parts.append('<div class="empty">没有暂缓的 finding</div>')
     parts.append("</div></div>")
 
     parts.append('<div class="sec"><h2>最近归档</h2><div class="list"><div class="acols"><span></span><span>sha</span><span>日期</span>'
-                 '<span>kind</span><span>轮数</span><span>blocking</span><span>总耗时</span><span>结束方式</span></div>')
+                 '<span>kind</span><span>轮数</span><span title="blocking">阻断</span><span>总耗时</span><span>结束方式</span></div>')
     for a in archives[:ARCHIVES_SHOWN]:
         took = dur(a["secs"]) if a["secs"] else "—"
         bw = "700" if a["blocking"] else "400"
@@ -2051,7 +2068,7 @@ def render(projects, archives, self_closed):
             if kind == "stop":
                 waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"p-{p['name']}"))
                 continue
-            what = f"{fid} {sev} · 写手 {verb}" if sev else f"{fid} · 写手 {verb}"
+            what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
     if waits:
         banner = (f'<div class="banner"><div class="t">等你 · {len(waits)}</div><div class="items">' + "".join(
