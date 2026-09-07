@@ -1725,7 +1725,10 @@ h2 .sub{font-weight:400;color:#8a8883;font-size:12px;margin-left:6px}
 .pending-hint{font-size:11.5px;color:#a54a62;margin-top:4px}
 .sec{margin-top:32px}
 .list{border-top:1px solid #1c1c1a;font-size:12.5px}
-.brow{display:grid;grid-template-columns:72px 92px 72px minmax(0,2fr) minmax(0,1.4fr);gap:0 12px;padding:9px 0;border-bottom:1px solid #e3e1dc}
+.bgrp{border-bottom:1px solid #e3e1dc;padding:6px 0 2px}
+.bhead{display:flex;gap:14px;align-items:baseline;padding:4px 0 6px;min-width:0}
+.bhead .ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;font-size:12px}
+.brow{display:grid;grid-template-columns:76px minmax(0,2fr) minmax(0,1.4fr);gap:0 12px;padding:6px 0 6px 18px;border-top:1px solid #f0efeb}
 .acols,.arow{display:grid;grid-template-columns:20px 72px 92px 48px 48px 84px 72px minmax(0,1fr);gap:0 12px;align-items:baseline}
 .acols{padding:5px 0;font-size:11px;color:#8a8883}
 .arow{padding:8px 0}
@@ -1758,7 +1761,9 @@ JS = """
     history.replaceState(null,'','#'+anchor);
   }
   window.rbFilter=function(inp){var q=inp.value.trim().toLowerCase();
-    inp.nextElementSibling.querySelectorAll('.brow').forEach(function(r){r.style.display=(!q||r.textContent.toLowerCase().indexOf(q)>=0)?'':'none'})};
+    inp.nextElementSibling.querySelectorAll('.bgrp').forEach(function(g){var any=false;
+      g.querySelectorAll('.brow').forEach(function(r){var hit=!q||r.textContent.toLowerCase().indexOf(q)>=0;r.style.display=hit?'':'none';any=any||hit});
+      g.style.display=any?'':'none'})};
   window.rbGo=function(name,anchor){select(name);setTimeout(function(){hit(anchor)},30);return false};
   var names=[].map.call(document.querySelectorAll('.proj'),function(e){return e.dataset.p});
   var first=document.querySelector('.proj.needs');
@@ -1915,14 +1920,19 @@ def render_panel(p, archives, self_closed):
     elif not p.get("triage_reason"):
         parts.append('<div class="idle">无在途周期。最近一次周期见下方归档。</div>')
 
-    items = [(a["sha"], a["when"], fid, sev, claim, reason) for a in archives for fid, sev, claim, reason in a["deferred"]]
-    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {len(items)}</span></h2>'
+    groups = [a for a in archives if a["deferred"]]
+    total = sum(len(a["deferred"]) for a in groups)
+    parts.append(f'<div class="sec"><h2>Backlog<span class="sub">历史归档中 defer 的 finding · {total} 条 · {len(groups)} 个周期</span></h2>'
                  f'<input class="filter" type="search" placeholder="过滤 Backlog…" oninput="rbFilter(this)"><div class="list">')
-    for sha, when, fid, sev, claim, reason in items:
-        parts.append(f'<div class="brow"><code>{esc(sha)}</code><span class="dim tab">{esc(when)}</span>'
-                     f'<span><code style="font-weight:600">{fid}</code> <span class="dim">{esc(sev)}</span></span>'
-                     f'<span class="claim">{esc(claim)}</span><span class="dim claim"><span class="mute">写手理由 · </span>{esc(reason)}</span></div>')
-    if not items:
+    for a in groups:
+        parts.append(f'<div class="bgrp"><div class="bhead"><code>{esc(a["sha"])}</code><span class="dim tab">{esc(a["when"])}</span>'
+                     f'<span>{esc(a["kind"])}</span><span class="dim">{len(a["deferred"])} defer</span>'
+                     f'<span class="mute ell">{esc(a["artifact"])}</span></div>')
+        for fid, sev, claim, reason in a["deferred"]:
+            parts.append(f'<div class="brow"><span><code style="font-weight:600">{fid}</code> <span class="dim">{esc(sev)}</span></span>'
+                         f'<span class="claim">{esc(claim)}</span><span class="dim claim"><span class="mute">写手理由 · </span>{esc(reason)}</span></div>')
+        parts.append('</div>')
+    if not groups:
         parts.append('<div class="empty">没有 defer 记录</div>')
     parts.append("</div></div>")
 
