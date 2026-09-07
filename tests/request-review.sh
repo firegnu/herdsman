@@ -320,6 +320,27 @@ assert_eq "$(call_count '^agent prompt reviewer-pane ')" 1 'stalled-working prom
 cp "${TMP}/sent-keep" "${SENT}"
 echo 'PASS stalled report with a working reviewer counts as delivered'
 
+# While waiting, a reviewer that has gone idle without writing the sentinel has ended its
+# turn without delivering: stop for the human instead of waiting out REVIEW_WAIT. One idle
+# poll is tolerated; a working reviewer keeps the wait alive until the timeout.
+cp "${REPO}/.review.conf" "${TMP}/conf-keep"
+printf 'REVIEW_WAIT=20\nREVIEW_POLL=1\n' >> "${REPO}/.review.conf"
+rm -f "${SENT}"
+run_review new
+assert_eq "${RUN_STATUS}" 4 'idle reviewer status'
+grep -q 'STOP: 评审方已空闲' "${TMP}/stdout" || fail 'idle reviewer stdout lacks the idle STOP'
+[ -f "${SENT}" ] || fail 'idle reviewer lost the sent marker'
+run_review new
+assert_eq "${RUN_STATUS}" 4 'idle reviewer continuation status'
+assert_eq "$(call_count '^agent prompt ')" 0 'idle reviewer continuation prompt count'
+printf 'REVIEW_WAIT=3\n' >> "${REPO}/.review.conf"
+rm -f "${SENT}"
+run_review stalled-working
+assert_eq "${RUN_STATUS}" 3 'working reviewer status'
+cp "${TMP}/conf-keep" "${REPO}/.review.conf"
+cp "${TMP}/sent-keep" "${SENT}"
+echo 'PASS idle reviewer without sentinel stops for the human'
+
 # A sent round resumes the saved reviewer and never discovers, creates, or prompts again.
 printf 'partial findings\n' > "${REVIEW_DIR}/r1-findings.md"
 run_review live
@@ -417,6 +438,28 @@ run_review new
 assert_eq "${RUN_STATUS}" 3 'deferred blocking with decision status'
 rm -f "${REVIEW_DIR}"/r*-decision.md
 echo 'PASS human decision file unblocks reject and blocking defer'
+
+# A response line the parser cannot read (`- F1 reject`, `**F1** reject`, `F1: reject`) would
+# hide a reject and let the round proceed, so any such line stops with exit 2; so does an id
+# answered twice. Skipping an already-resolved id is allowed.
+rm -f "${REVIEW_DIR}"/.r*.sent
+printf 'F1 | blocking\nclaim: x\nF2 | nit\nclaim: y\nF3 | nit\nclaim: z\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"
+for bad in '- F2 reject — by design' '**F2** reject — by design' 'F2: reject — by design' '## F2 accept'; do
+  printf 'F1 accept — fixed\n%s\nF3 accept — ok\n' "${bad}" > "${REVIEW_DIR}/r1-responses.md"
+  run_review new
+  assert_eq "${RUN_STATUS}" 2 "drifted response status (${bad})"
+  grep -qF -e "${bad}" "${TMP}/stdout" || fail "drifted response: stdout does not quote the line (${bad})"
+  assert_eq "$(call_count '^agent prompt ')" 0 "drifted response prompt count (${bad})"
+done
+printf 'F1 accept — fixed\nF2 accept — ok\nF2 defer — twice\nF3 accept — ok\n' > "${REVIEW_DIR}/r1-responses.md"
+run_review new
+assert_eq "${RUN_STATUS}" 2 'duplicate response status'
+grep -q '重复编号：F2' "${TMP}/stdout" || fail 'duplicate response: stdout does not list F2'
+printf 'F1 accept — fixed\nF3 accept — 同 F2 的 reject 理由不适用\n' > "${REVIEW_DIR}/r1-responses.md"
+run_review new
+assert_eq "${RUN_STATUS}" 3 'well-formed partial response status'
+assert_eq "$(call_count '^agent prompt ')" 1 'well-formed partial response prompt count'
+echo 'PASS malformed or duplicated response lines stop before the next round'
 
 # Archiving never overwrites an existing file: a hand-written or committed
 # archive under the same sha gets a suffixed sibling instead.

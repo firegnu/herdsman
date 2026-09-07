@@ -67,7 +67,8 @@ F1 accept — 一句理由
 F2 defer — 一句理由
 F3 reject — 一句理由
 
-脚本靠 `^F<n> accept|defer|reject` 解析，格式漂移会导致 reject / defer 检测失效。
+脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
+并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
 
 ### 你不得做的事
 - 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。

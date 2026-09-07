@@ -252,7 +252,7 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 ### 5.1 `~/.local/bin/request-review`
 
 ```bash
-#!/usr/bin/env bash#!/usr/bin/env bash
+#!/usr/bin/env bash
 # 有界对抗评审 —— 由实施方(写手 agent)调用，无参数。
 #
 # 路由：交接目录里没有针对 HEAD 的 request.md 时，先判定这次提交要不要评审 ——
@@ -265,9 +265,9 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 # 退出码：
 #   0 = 评审完成，stdout 为 findings 文件路径；或 triage 判定跳过，stdout 为 SKIP: <理由>
 #   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
-#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装）
+#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装 / 上轮 responses 格式不合规范）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
-#   4 = 需要人介入（reviewer blocked / 无法拉起 / 注入失败 / worktree 里有多个 agent）
+#   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = triage 判定需要评审，stdout 为 REVIEW: <理由>；写 request.md 后再次运行
 set -uo pipefail
@@ -285,6 +285,7 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_KIND:=claude}"
 : "${REVIEW_WAIT:=600}"
 : "${REVIEW_START_TIMEOUT:=60000}"
+: "${REVIEW_POLL:=10}"          # 等哨兵时的轮询间隔（秒）；测试用，一般不改
 : "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
@@ -595,18 +596,28 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
 }
 
 # 等哨兵；期间评审方 blocked 则退出 4，超时退出 3。
+# 评审方回到 idle 而哨兵还没出现，说明它这个回合已经结束却没交付（忘写结尾行、只回了
+# 一句话、或根本没开始）：等满 REVIEW_WAIT 只会让写手反复续等。连续两次看到 idle 即退出 4。
 wait_sentinel() {        # $1=file  $2=word  $3=pane_id
-  local deadline st
+  local deadline st idle=0
   sentinel_ok "$1" "$2" && return 0
   deadline=$(( $(date +%s) + REVIEW_WAIT ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
-    sleep 10
+    sleep "${REVIEW_POLL}"
     sentinel_ok "$1" "$2" && return 0
     st=$(transport_state "$3")
-    if [ "${st}" = "blocked" ]; then
-      echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
-      exit 4
-    fi
+    case "${st}" in
+      blocked)
+        echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
+        exit 4;;
+      idle|done)
+        idle=$((idle + 1))
+        if [ "${idle}" -ge 2 ]; then
+          echo "STOP: 评审方已空闲，但 $1 没有以 $2 结尾。它这轮没有交付，请你亲自查看 pane $3。"
+          exit 4
+        fi;;
+      *) idle=0;;
+    esac
   done
   echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行 request-review 继续等待，不会重发 prompt。"
   exit 3
@@ -796,6 +807,21 @@ fi
 prev=$((cur - 1)); PREV_RESP="${DIR}/r${prev}-responses.md"; PREV_DEC="${DIR}/r${prev}-decision.md"
 if [ "${prev}" -ge 1 ] && [ -f "${PREV_RESP}" ]; then
   PREV_OUT="${DIR}/r${prev}-findings.md"; pending=""; undecided=""
+  # 先验格式：下面的 reject/defer 检测只认行首顶格的 `F<n> accept|defer|reject`。写手把行写成
+  # `- F1 reject`、`**F1** reject`、`F1: reject` 时会被当成没有 reject 静默放行，所以凡是
+  # 看起来像回应却不合规范的行，以及同一编号出现两次，都在这里拦下。不要求逐条对应 findings：
+  # 第 2 轮起写手只回应仍未关闭的编号是既有做法。
+  drift=$(grep -iE '^[[:space:]]*[#*_>-]*[[:space:]]*\**F[0-9]+\**[[:space:]:|—-]*(accept|defer|reject)' "${PREV_RESP}" \
+            | grep -viE '^[[:space:]]*F[0-9]+[[:space:]]+(accept|defer|reject)([[:space:]]|$)')
+  dup=$(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+(accept|defer|reject)([[:space:]]|$)' "${PREV_RESP}" \
+          | grep -ioE 'F[0-9]+' | tr a-z A-Z | sort | uniq -d | tr '\n' ' ')
+  if [ -n "${drift}${dup}" ]; then
+    echo "ERROR: ${PREV_RESP} 有不合规范的回应行，reject/defer 检测无法识别，不进入下一轮："
+    [ -n "${drift}" ] && printf '%s\n' "${drift}" | sed 's/^/       /'
+    [ -n "${dup}" ] && echo "       重复编号：${dup% }"
+    echo "       每条一行、行首顶格、编号只出现一次，不加列表符号或粗体：F<n> accept|defer|reject — 理由"
+    exit 2
+  fi
   for id in $(grep -ioE '^[[:space:]]*F[0-9]+[[:space:]]+reject' "${PREV_RESP}" | grep -ioE 'F[0-9]+'); do
     pending="${pending} ${id}(reject)"
   done
@@ -1135,7 +1161,8 @@ F1 accept — 一句理由
 F2 defer — 一句理由
 F3 reject — 一句理由
 
-脚本靠 `^F<n> accept|defer|reject` 解析，格式漂移会导致 reject / defer 检测失效。
+脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
+并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
 
 ### 你不得做的事
 - 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
@@ -1183,6 +1210,8 @@ F2 reject — 该行为在 request 中声明为 out-of-scope
 F3 accept — 已补测试 test_token_refresh_race
 F4 defer — 命名问题成立，但本轮不改，留 Backlog
 ```
+
+每条一行、行首顶格、编号只出现一次。脚本只认这个格式：写成 `- F1 reject` 或 `**F1** reject` 的行会在下一次调用时 exit 2 并被逐行列出，写手改正后再运行；不拦的话那条 reject 会被当成不存在直接进下一轮。第 2 轮起只回应仍未关闭的编号是允许的。
 
 `defer` 只允许用于 should / nit：承认 finding 成立，本轮不改，随本周期归档进 Backlog，不触发新一轮。blocking 写 defer 会在下一次调用时 exit 5 交给你 —— 跟 reject 的拦截点一样。你裁决后写手把结论记入同目录 `r<n>-decision.md`（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`），再运行就在本周期继续下一轮：findings、responses 不动，不消耗轮次；评审方会在 prompt 里拿到裁决文件路径，upheld 的不再提，overruled 的按 accept 验证。这个选项存在的原因：没有它，写手会把所有 should / nit 全 accept 全改，于是零 blocking 的周期也要买一整轮验证。
 
@@ -1392,6 +1421,8 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | `ERROR: 缺 kind` / `kind 只能是 code 或 plan` | request.md 没声明评审单元种类 | 补 `kind:` 行；混合产物先拆 commit |
 | `ERROR: base sha ... 不是 HEAD 的祖先` | base 填成了别的分支或未来的提交 | base 写本次改动之前紧邻的提交 |
 | `ERROR: kind: code 的 request 混入了计划文档` | 代码和计划文档同一个 commit | 拆成两个 commit，各自一个周期；状态记录单独提交不送审 |
+| `ERROR: … 有不合规范的回应行` | 写手把 responses 写成 `- F1 reject` / `**F1** reject` / `F1: reject`，或同一编号两行 | 写手改成行首顶格的 `F<n> accept|defer|reject — 理由` 再运行；不拦的话 reject 会被当成没有 |
+| `STOP: 评审方已空闲，但 … 没有以 REVIEW-COMPLETE 结尾` | 评审方结束了回合却没交付：忘写结尾行、只回了一句话、或没真正开始 | 亲自看那个 pane；补上结尾行或让它继续，再运行即续等，不会重发 |
 | `STOP: 有待人工裁决的 finding` | 写手 reject 了 finding，或把 blocking 标成 defer | 你裁决，写手记入 `r<n>-decision.md`（`F<n> uphold|overrule — 理由`）后再运行，本周期继续 |
 | `exit 6` / `REVIEW: …` | triage 判定要审 | 写手写 request.md 再运行，正常 |
 | `STOP: triage 文件第一行不是 REVIEW 或 SKIP` | 评审方没按格式写 | 看 triage.md，手动改成 REVIEW/SKIP 后重跑，或删掉重发 |
@@ -1461,6 +1492,7 @@ rubric 里那条「增量超 50 个提交就报 finding」是个自动提醒 —
 | 多行 prompt 注入 | 六行模板完整送达，作为单条消息处理 |
 | 文件哨兵 | 末行 `REVIEW-COMPLETE` 无尾随空行；判据仍用「最后一个非空行」以容错 |
 | prompt 派送与审阅等待 | `--wait --until working --until blocked`，评审方状态变化才算送达；报 stalled/timeout 时核实状态，仍 idle 才重发一次，再失败不写 `.sent`。完成状态只由 findings 文件哨兵轮询 |
+| 审阅等待中的 idle | 派送后每 `REVIEW_POLL`（默认 10s）轮询一次；哨兵未到而评审方连续两次 idle/done，判定它这轮没交付，exit 4 指向 pane，而不是等满 `REVIEW_WAIT` 让写手反复续等。`.sent` 保留，再次运行续等不重发 |
 | 启动空窗 | herdr 在 claude 进程出现后约 4s 报 `interactive_ready`，但 Claude 自身初始化可能还没完成，此时 `agent prompt` 返回成功而输入被吞（09-06 复现，与就绪判定差不到 1s）。所以就绪判定只是省时，送达以状态变化为准 |
 | agent 退出后名字清除 | 确认，返回 `agent_not_found` |
 | `pane wait-output` 作完成信号 | **不可用** —— 它会立即检查已有输出，注入的 prompt 就在屏幕上，哨兵词会瞬间假匹配 |
