@@ -225,7 +225,7 @@ def project_state(repo, conf):
                              cycle_note="findings 已完成，等写手写 responses")
                 else:
                     p.update(state="本轮已回应", closed=True, since=mtime(f"{d}/r{cur}-responses.md"),
-                             cycle_note="写手已回应；有 accepted 改动则写手开下一轮，否则周期结束")
+                             cycle_note="写手已回应；有 accepted 改动则写手开下一轮，否则周期到此结束")
             else:
                 p.update(state="评审中", waiting="等评审方", since=this["sent"]["start"],
                          cycle_note="prompt 已送达，等评审方写 findings")
@@ -249,7 +249,7 @@ def project_state(repo, conf):
             p.update(state="triage 中", waiting="等评审方", since=tsent["start"])
         if rounds:
             p["closed"] = True
-            p["cycle_note"] = "已闭合，下个周期开始时归档"
+            p["cycle_note"] = "已闭合，等下个周期派发时归档；下面的 Round 是它的最终结果"
     return p
 
 
@@ -401,6 +401,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .idle{padding:28px 0;color:#8a8883}
 .cycle{margin-top:18px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px}
 .cycle .top{display:flex;gap:18px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px}
+.stale{opacity:.62}.cycle.stale{background:#f9f8f5;border-style:dashed}
 .cycle .top .lab{font-size:12px;color:#8a8883}
 .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 14px;font-size:12.5px}
 .kv .k{color:#8a8883;padding-top:1px}.kv .v{color:#3a3936}
@@ -536,7 +537,9 @@ def render_cycle(p):
     sent1 = (p["rounds"][0].get("sent") or {}) if p["rounds"] else {}
     target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
     base = (cr.get("base sha") or "")[:7]
-    top = (f'<span class="lab">当前周期</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
+    stale = p["closed"] and not p["waiting"]
+    label = "上一周期" if stale else "当前周期"
+    top = (f'<span class="lab">{label}</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
            f'<span>{esc(cr.get("kind", ""))}</span><span>round {esc(req.get("round", cr.get("round", "")))}</span>'
            f'<span class="dim">{esc(p["cycle_note"])}</span>')
     kv = []
@@ -559,7 +562,7 @@ def render_cycle(p):
         kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
                   f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
                   f'<pre class="block">{esc(stat)}\n{esc(chr(10).join(full) + trunc)}</pre></details></div>')
-    return f'<div class="cycle"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
+    return f'<div class="cycle{" stale" if stale else ""}"><div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
 def render_panel(p, archives, self_closed):
@@ -571,8 +574,11 @@ def render_panel(p, archives, self_closed):
         parts.append(f'<div class="idle" style="padding:14px 0">{esc(p["triage_reason"])}</div>')
     if p["rounds"] or (p["req"] and p["state"] not in ("空闲",) and not p["state"].startswith("triage")):
         parts.append(render_cycle(p))
+        stale = p["closed"] and not p["waiting"]
+        parts.append('<div class="stale">' if stale else '<div>')
         for rnd in p["rounds"]:
             parts.append(render_round(p, rnd))
+        parts.append('</div>')
     elif not p.get("triage_reason"):
         parts.append('<div class="idle">无在途周期。最近一次周期见下方归档。</div>')
 
