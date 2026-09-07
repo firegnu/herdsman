@@ -132,7 +132,9 @@ has 'prompt 已送达，等评审方写 findings' 'beta cycle note'
 has '写手 reject 了 F2、defer 了 F3，等人裁决' 'alpha cycle note'
 
 # 评审方状态：beta blocked → 等你 + STOP；gamma working → 备注
-has '评审中 · 评审方 blocked' 'beta blocked state'
+has '<span class="badge me">评审中 · 评审方 blocked</span>' 'beta blocked state red'
+has '<span class="badge rv">triage 中</span>' 'gamma waiting on reviewer blue'
+has '<span class="badge none">已闭合</span>' 'delta closed grey'
 has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'banner stop item'
 has 'href="#p-beta/repo"' 'stop item links to project'
 has '评审方 working' 'gamma working note'

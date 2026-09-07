@@ -433,11 +433,16 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .proj .st{display:flex;align-items:center;gap:6px;margin-top:2px}
 .proj .st .status{font-size:12px;color:#5f5e5a}.proj .st .who{font-size:11.5px;color:#a3a29d}
 .me{background:#c8375a;color:#fff;font-size:11px;font-weight:600;padding:0 6px;border-radius:2px;line-height:18px;display:inline-block}
+.badge{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:2px;line-height:18px}
+.badge.me{background:#c8375a;color:#fff}
+.badge.rv{background:#dfeaf7;color:#1d4f8c}
+.badge.wr{background:#f6e7c4;color:#6b4d0f}
+.badge.none{background:#ecebe7;color:#5f5e5a;font-weight:500}
 .main{padding:18px 28px 60px;min-width:0}
 .panel{display:none}.panel.sel{display:block}
 .head{display:flex;align-items:baseline;gap:14px;padding-bottom:12px;border-bottom:1px solid #e3e1dc}
 .head h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
-.head .me{font-size:12px;padding:1px 8px}.head .status{font-size:13px;color:#5f5e5a}
+.head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#5f5e5a;font-size:12.5px}
 .idle{padding:28px 0;color:#8a8883}
 .cycle{margin-top:18px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px}
@@ -544,6 +549,12 @@ JS = """
     location.reload()},30000);
 })();
 """
+
+
+def state_badge(p):
+    """状态标签按"谁在等"配色：红 = 等你，蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等。"""
+    cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr"}.get(p["waiting"], "none")
+    return f'<span class="badge {cls}">{esc(p["state"])}</span>'
 
 
 def sev_tag(sev):
@@ -657,7 +668,7 @@ def render_cycle(p):
 
 def render_panel(p, archives, self_closed):
     parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
-    badge = f'<span class="me">{esc(p["state"])}</span>' if p["needs_me"] else f'<span class="status">{esc(p["state"])}</span>'
+    badge = state_badge(p)
     rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
     parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
@@ -750,7 +761,7 @@ def render(projects, archives, self_closed):
         banner = '<div class="nowait">没有等你的</div>'
     side = [f'<div class="cap">项目 · {len(projects)}</div>']
     for p in projects:
-        status = f'<span class="me">{esc(p["state"])}</span>' if p["needs_me"] else f'<span class="status">{esc(p["state"])}</span>'
+        status = state_badge(p)
         side.append(f'<div class="proj{" needs" if p["needs_me"] else ""}" data-p="{esc(p["name"])}"><div class="row"><span class="nm">{esc(p["name"])}</span>'
                     f'<span class="age">{ago(p["since"])}</span></div><div class="st">{status}<span class="who">{esc(p["waiting"])}</span></div></div>')
     panels = "".join(render_panel(p, archives[p["name"]], self_closed[p["name"]]) for p in projects)
