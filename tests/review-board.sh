@@ -123,6 +123,10 @@ HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --
 # 项目发现与去重命名（三个 checkout 都叫 repo，用上级目录区分）
 for n in alpha beta gamma delta; do has "data-p=\"$n/repo\"" "project $n listed"; done
 has '项目 · 4' 'project count'
+has '<div class="mast"><span class="brand">Review board</span>' 'masthead'
+has '<b>写手</b> codex ·' 'writer agent line'
+has '<b>评审方</b> claude ·' 'reviewer agent line'
+has 'class="cycle s-me"' 'cycle card bar coloured by state'
 
 # 状态
 has '待人裁决' 'alpha state'
