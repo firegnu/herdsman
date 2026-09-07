@@ -57,6 +57,11 @@ fi
 touch .gitignore
 grep -qxF '.review.conf' .gitignore || { echo '.review.conf' >> .gitignore; echo "  ✓ .review.conf 加入 .gitignore"; }
 
+# ---- 2b. 登记给看板：仓库不在 ~/Developer/personal_projs 下也能被 review-board 扫到 ----
+mkdir -p "${HOME}/.review"
+grep -qxF "${REPO}" "${HOME}/.review/projects" 2>/dev/null \
+  || { echo "${REPO}" >> "${HOME}/.review/projects"; echo "  ✓ 登记到 ~/.review/projects（看板项目清单）"; }
+
 # ---- 3. 度量文件 ----
 mkdir -p docs/reviews
 if [ -f docs/reviews/escapes.md ]; then

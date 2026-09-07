@@ -288,7 +288,8 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 没有人再跑脚本的空档；手动 `review-board --open` 也行。它看得到节点，看不到节点之间
 agent 在做什么 —— 那部分只在 herdr 的 pane 里。
 
-项目发现：`~/Developer/personal_projs/*/.review.conf`；仓库在别处时写进 `~/.review/projects`，一行一个路径。
+项目发现：`~/Developer/personal_projs/*/.review.conf`，加上 `~/.review/projects` 里登记的路径（`herdsman-init`
+自动登记，所以仓库放在哪都会被扫到；一行一个路径，可手动增删）。
 `.review.conf` 里 `REVIEW_BOARD=` 置空可关掉退出时的自动生成。
 
 ### 风险图：审不审、审多深，由文件说，不由评审方当场猜
