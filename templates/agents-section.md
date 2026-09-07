@@ -2,11 +2,14 @@
 ## Applies to the implementing agent only
 
 ### 评审路由（你不做判断，脚本和评审方做）
-每次提交后运行 request-review。没有针对 HEAD 的 request.md 时，它先判定这次提交
-要不要评审：只改 .md/.rst/.txt 的直接跳过；触及 REVIEW_PLAN_PATHS 的直接要求评审；其余
-交给评审方 triage（只读 diff 和 reviewer-brief，不跑测试，约一分钟）。按退出码办：
+每次提交后运行 request-review。没有针对 HEAD 的 request.md 时，它判定**上次评审以来的全部改动**
+要不要评审、审多深：只改 .md/.rst/.txt 的直接跳过；触及 REVIEW_PLAN_PATHS 或规则文件
+（AGENTS.md、CLAUDE.md、docs/reviewer-brief.md）的直接要求评审（kind: plan）；其余按仓库里的
+风险图 `.review-map` 取等级，图上没有的路径才交给评审方 triage（只读 diff 和 reviewer-brief，
+不跑测试，约一分钟）。SKIP 不是终审：那段改动留在下一次的范围里。按退出码办：
 - 0 且输出 `SKIP: …` → 结束，已记入 docs/reviews/self-closed.md
-- 6 且输出 `REVIEW: …` → 写 request.md（target sha 为 HEAD）后再次运行，进入评审周期
+- 6 且输出 `REVIEW: …` → 输出还有 `kind:`、`level:`、`base sha:` 三行，**照抄**进 request.md
+  （target sha 为 HEAD），再次运行进入评审周期。base 是上次评审的 target，不是紧邻的前一个提交
 - 3 → 再次运行继续等待
 
 人明确要求评审时，直接写 request.md 运行，不经 triage。你可以随时主动请求评审；
@@ -22,8 +25,9 @@
 状态记录——进度摘要、plan 状态、README 指针、Decision Board、reviewer brief 标记
 之类——单独 commit，不得与 code 或 plan 同一 commit；纯文本的会被脚本直接跳过。
 一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
-`base sha` 必须是本次评审改动之前紧邻的提交；request-review 会校验它是 HEAD 的祖先，
-配置了 REVIEW_PLAN_PATHS 的项目还会校验 round 1 的 diff 与 kind 一致，不符则 exit 2。
+`base sha` 用 request-review 输出里给的那个（上次评审的 target）；脚本会校验它是 HEAD 的祖先，
+还会逐个提交校验 base..HEAD 里每个提交都只碰一种产物、target 提交的种类等于 kind，不符则 exit 2。
+范围里另一种产物的提交是已在自己周期里审过的上下文，允许存在。
 
 ### 评审周期（triage 判 REVIEW 或人要求评审之后）
 1. 提交产物（工作区必须干净）
@@ -44,13 +48,17 @@
        r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
        uphold = 你的 reject/defer 成立，overrule = finding 成立、你须改），再次运行
        即在本周期继续下一轮，不重置、不消耗轮次。裁决只能来自人；没有人的话不得写此文件。
+   7 → 评审方简报过期。按输出提示，用 ~/.config/review/brief-prompt.md 的提示词重写
+       docs/reviewer-brief.md（第一行 verified at 写当前 HEAD），**单独提交**，再次运行；
+       该提交会作为 kind: plan 送审，评审方核对简报与代码是否相符。不要把简报和代码混在一个提交里。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
 
 ### request.md 格式
 ```
 artifact:      <被评审的路径或路径集合，不写清单式描述>
 kind:          <code 或 plan>
-base sha:      <本次评审改动之前紧邻的提交>
+level:         <deep、review 或 light；照抄 request-review 的输出>
+base sha:      <照抄 request-review 的输出：上次评审的 target>
 target sha:    <本次提交>
 round:         1/3
 out of scope:  <本次明确不做的>
@@ -76,7 +84,8 @@ F3 reject — 一句理由
 - 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane
 - 不要替评审方回答审批或提问对话框
 - 不要关闭不是自己创建的 pane，不要运行 herdr server stop
-- 不要修改 rubric、.review.conf、或本文件中的评审规则
+- 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
+  追加升级行，随下次提交带上即可；不要 checkout 或 stash 掉脚本写进 docs/reviews 或 .review-map 的内容
 - 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
   手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
 

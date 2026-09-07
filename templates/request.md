@@ -1,5 +1,6 @@
 artifact:      docs/plan-auth.md
 kind:          plan
+level:         review
 base sha:      1a2b3c4
 target sha:    3f9a1c2
 round:         1/3

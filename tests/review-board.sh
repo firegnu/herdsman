@@ -78,6 +78,9 @@ cp "$D/request.md" "$D/.cycle-request.md"
 printf '%s\n%s\ndelta-pane\n' "$((now - 600))" "$H" > "$D/.r1.sent"
 printf 'F1 | nit\nclaim:    命名\nevidence: a.py:1\n\nREVIEW-COMPLETE\n' > "$D/r1-findings.md"
 printf 'F1 defer — 以后\n' > "$D/r1-responses.md"
+# delta 有简报，核实于 HEAD~1，上限 50 → 之后 1 个提交
+mkdir -p "${TMP}/delta/repo/docs"
+printf '<!-- verified at: %s -->\n# brief\n' "$(git -C "${TMP}/delta/repo" rev-parse HEAD~1)" > "${TMP}/delta/repo/docs/reviewer-brief.md"
 # delta 还有一次更早的 code 评审（target = HEAD~1）：HEAD 之后没路由 → 累积 1 个、1 个未经路由
 mkdir -p "${TMP}/delta/repo/docs/reviews"
 printf '2026-09-01 | %s | round 1/3 | 60s\n' "$(git -C "${TMP}/delta/repo" rev-parse --short HEAD~1)" > "${TMP}/delta/repo/docs/reviews/timing.md"
@@ -168,6 +171,9 @@ has '<details class="prev"><summary>' 'closed cycle collapsed'
 has '1 轮</span><span>1 暂缓</span>' 'collapsed summary counts'
 has '以来 <b>1</b> 个提交 · 0 个 SKIP · <b>1 个未经路由</b>' 'accumulation counter'
 has '尚无已完成的代码评审' 'no-review accumulation note'
+has '没有 .review-map，代码路径全部由评审方 triage' 'no-map note'
+has '简报核实于 <code>' 'brief status line'
+has '之后 1 个提交，上限 50' 'brief commit count'
 lacks 'class="cycle stale"' 'old stale styling gone'
 
 # request 字段与 diff

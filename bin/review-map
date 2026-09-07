@@ -8,6 +8,8 @@
 没有归档时只输出 2、3，新项目也能跑。
 
 用法: review-map [REPO] [--out FILE]     默认 REPO 为 cwd，草案打到 stdout
+      review-map [REPO] --suggest        对照仓库里现有的 .review-map：列出证据建议降级的行（要人点头）
+                                         和图上没有的路径（建议加进去）；没有图时输出空
 """
 import glob
 import os
@@ -227,9 +229,23 @@ def decide(group, st, fin, has_test, fin_hi):
     return "review", "未审过；有测试", False
 
 
+def read_map(repo):
+    """现有 .review-map → {pattern: level}"""
+    out = {}
+    for line in read(f"{repo}/.review-map").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
 def main():
     args = sys.argv[1:]
     out_path = args[args.index("--out") + 1] if "--out" in args else None
+    suggest = "--suggest" in args
     repo = next((a for a in args if not a.startswith("--") and a != out_path), os.getcwd())
     repo = os.path.abspath(repo)
     index = repo_files(repo)
@@ -253,6 +269,19 @@ def main():
 
     order = {"deep": 0, "plan": 1, "review": 2, "light": 3, "skip": 4}
     rows.sort(key=lambda r: (order[r[1]], r[0]))
+    if suggest:
+        current = read_map(repo)
+        if not current:
+            return
+        rank = {"skip": 1, "light": 2, "review": 3, "deep": 4, "plan": 3}
+        for g, level, why, human, st in rows:
+            cur = current.get(g)
+            if cur is None:
+                if level in ("deep", "review", "plan"):
+                    print(f"add\t{g}\t{level}\t{why}")
+            elif rank.get(level, 0) < rank.get(cur, 0):
+                print(f"lower\t{g}\t{cur}→{level}\t{why}")
+        return
     lines = [f"# .review-map 草案 —— 由 review-map 生成，{ncycles} 个归档周期，{counted} 条带严重度的 finding"
              + (f"（其中 {unplaced} 条 evidence 没写路径，按该周期的 artifact 目录归因）" if counted else "") + f"，{len(index)} 个文件",
              "# 等级：deep 跑测试三轮 / review 正常评审 / light 一轮只找阻断 / plan 计划评审 / skip 直接过",

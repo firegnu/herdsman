@@ -520,3 +520,189 @@ run_review new
 assert_eq "${RUN_STATUS}" 3 'closed round-2 cycle then code commit status'
 assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'closed round-2 cycle triage prompt count'
 echo 'PASS closed round-2 cycle does not block triage of later commits'
+
+# ---- Brief gate: the reviewer reads the brief every round, so a stale brief stops dispatch. ----
+rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}/.triage" "${REVIEW_DIR}/.triage.sent" "${REVIEW_DIR}/triage.md"
+printf 'REVIEW_BRIEF_MAX_COMMITS=2\n' >> "${REPO}/.review.conf"
+mkdir -p "${REPO}/docs"
+V=$(git -C "${REPO}" rev-parse HEAD)
+printf '<!-- verified at: %s -->\n# brief\n' "${V}" > "${REPO}/docs/reviewer-brief.md"
+git -C "${REPO}" add docs/reviewer-brief.md; git -C "${REPO}" commit -qm 'brief'
+# The commit that writes the brief is let through and routed as a plan review (rule path).
+run_review new
+assert_eq "${RUN_STATUS}" 6 'brief commit status'
+grep -q '规则文档' "${TMP}/stdout" || fail 'brief commit is not routed as plan/rule'
+assert_eq "$(call_count '^agent ')" 0 'brief commit agent calls'
+# Three commits past verified-at with a cap of 2: routing and an explicit round-1 request both stop with 7.
+commit_file src/b1.py 'c1'; commit_file src/b2.py 'c2'
+run_review new
+assert_eq "${RUN_STATUS}" 7 'stale brief routing status'
+grep -q '简报过期' "${TMP}/stdout" || fail 'stale brief stdout'
+grep -q 'brief-prompt.md' "${TMP}/stdout" || fail 'stale brief stdout lacks the rewrite hint'
+assert_eq "$(call_count '^agent ')" 0 'stale brief agent calls'
+write_request code "$(git -C "${REPO}" rev-parse HEAD~1)" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 7 'stale brief explicit round-1 status'
+[ ! -f "${SENT}" ] || fail 'stale brief dispatched anyway'
+rm -f "${REVIEW_DIR}/request.md"
+# Rewriting the brief at HEAD lifts the gate; the next code commit is triaged normally.
+printf '<!-- verified at: %s -->\n# brief v2\n' "$(git -C "${REPO}" rev-parse HEAD)" > "${REPO}/docs/reviewer-brief.md"
+git -C "${REPO}" commit -qam 'brief rewrite'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'brief rewrite status'
+commit_file src/b3.py 'c3'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'fresh brief routing status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'fresh brief triage prompt'
+# A kind: code request that bundles the brief with code is refused as mixed.
+rm -f "${REVIEW_DIR}"/.triage*
+printf '<!-- verified at: %s -->\n# brief v3\n' "$(git -C "${REPO}" rev-parse HEAD)" > "${REPO}/docs/reviewer-brief.md"
+commit_file src/b4.py 'code with brief'
+git -C "${REPO}" add docs/reviewer-brief.md; git -C "${REPO}" commit -q --amend --no-edit
+write_request code "$(git -C "${REPO}" rev-parse HEAD~1)" 1/3
+run_review none
+assert_rejected 'brief mixed into code' 'docs/reviewer-brief.md'
+rm -f "${REVIEW_DIR}/request.md"
+# A verified-at that is not in HEAD's history is stale too.
+printf '<!-- verified at: 0123456789abcdef0123456789abcdef01234567 -->\n' > "${REPO}/docs/reviewer-brief.md"
+git -C "${REPO}" commit -qam 'brief bad base'
+commit_file src/b5.py 'c5'
+run_review new
+assert_eq "${RUN_STATUS}" 7 'non-ancestor brief status'
+grep -q '不在 HEAD 的历史里' "${TMP}/stdout" || fail 'non-ancestor brief stdout'
+# A brief whose baseline predates a change to a deep path is stale even under the commit cap.
+grep -v '^REVIEW_BRIEF_MAX_COMMITS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+printf 'src/deep/**  deep  # core\n' > "${REPO}/.review-map"
+printf '<!-- verified at: %s -->\n' "$(git -C "${REPO}" rev-parse HEAD)" > "${REPO}/docs/reviewer-brief.md"
+git -C "${REPO}" add .review-map docs/reviewer-brief.md; git -C "${REPO}" commit -qm 'brief fresh + map'
+commit_file src/deep/core.py 'core touched'
+run_review new
+assert_eq "${RUN_STATUS}" 7 'deep-path brief status'
+grep -q '改过风险图上的 deep 路径' "${TMP}/stdout" || fail 'deep-path brief stdout'
+git -C "${REPO}" rm -q .review-map; git -C "${REPO}" commit -qm 'drop map'
+printf 'REVIEW_BRIEF_MAX_COMMITS=2\n' >> "${REPO}/.review.conf"
+# REVIEW_BRIEF= disables the gate.
+printf 'REVIEW_BRIEF=\n' >> "${REPO}/.review.conf"
+run_review new
+assert_eq "${RUN_STATUS}" 3 'brief gate disabled status'
+echo 'PASS stale reviewer brief stops dispatch until it is rewritten'
+
+# ---- Risk map and accumulated ranges ----
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md" "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/r*-findings.md "${REVIEW_DIR}"/r*-responses.md
+grep -v '^REVIEW_PLAN_PATHS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+printf 'REVIEW_PLAN_PATHS="docs/plans/*"\n' >> "${REPO}/.review.conf"
+cat > "${REPO}/.review-map" <<'MAP'
+# pattern   level   # reason
+src/core/**   deep    # core
+src/util/**   light   # helpers
+docs/**       skip    # notes
+MAP
+git -C "${REPO}" add .review-map; git -C "${REPO}" commit -qm 'risk map'
+# 把"上次代码评审"钉在这里，后面的范围从这个提交起算
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" > "${REPO}/docs/reviews/timing.md"
+# A mapped deep path is routed without the reviewer, with kind / level / base printed for the writer.
+commit_file src/core/a.py 'core change'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'mapped deep status'
+assert_eq "$(call_count '^agent ')" 0 'mapped deep agent calls'
+grep -q '^REVIEW: .*最高等级 deep' "${TMP}/stdout" || fail 'mapped deep stdout'
+grep -q '^kind: code' "${TMP}/stdout" || fail 'mapped deep kind line'
+grep -q '^level: deep' "${TMP}/stdout" || fail 'mapped deep level line'
+grep -q "^base sha: $(git -C "${REPO}" rev-parse HEAD~1)" "${TMP}/stdout" || fail 'mapped deep base line'
+run_review new
+grep -q '^level: deep' "${TMP}/stdout" || fail 'cached verdict lost the level'
+# Once that review is on record, a mapped skip-only change is closed by the map.
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+printf '{}\n' > "${REPO}/docs/n.json"; git -C "${REPO}" add docs/n.json; git -C "${REPO}" commit -qm 'notes json'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'mapped skip status'
+grep -q '^SKIP: .*全为 skip' "${TMP}/stdout" || fail 'mapped skip stdout'
+# An unmapped path goes to the reviewer with the range and the unmapped list; its level and map hint are honoured.
+commit_file src/new/z.py 'unmapped change'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'unmapped triage status'
+assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'unmapped triage prompt'
+grep -q '^Range: ' "${MOCK_LOG}" || fail 'triage prompt lacks Range'
+grep -q '^Unmapped paths.*src/new/z.py' "${MOCK_LOG}" || fail 'triage prompt lacks unmapped list'
+printf 'REVIEW deep\ntouches an unmapped module\nmap: src/new/** deep\nTRIAGE-COMPLETE\n' > "${TRIAGE_OUT}"
+run_review live
+assert_eq "${RUN_STATUS}" 6 'unmapped verdict status'
+grep -q '^level: deep' "${TMP}/stdout" || fail 'reviewer level not honoured'
+grep -q '建议加进风险图：src/new/\*\* deep' "${TMP}/stderr" || fail 'map hint not surfaced'
+echo 'PASS risk map routes mapped paths and asks the reviewer only for unmapped ones'
+
+# With a completed code review on record, routing looks at the whole range since its target.
+A=$(git -C "${REPO}" rev-parse HEAD)
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+commit_file src/new/b.py 'b'
+run_review new
+printf 'SKIP\nsmall\nTRIAGE-COMPLETE\n' > "${TRIAGE_OUT}"
+run_review live
+assert_eq "${RUN_STATUS}" 0 'range skip status'
+# A text-only commit after a SKIP carries the verdict over without asking again.
+commit_file docs/note.md 'note'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'carry-over status'
+grep -q '^SKIP: .*沿用' "${TMP}/stdout" || fail 'carry-over stdout'
+assert_eq "$(call_count '^agent ')" 0 'carry-over agent calls'
+# The next code commit is triaged over the accumulated range: 3 commits since A.
+commit_file src/new/d.py 'd'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'range triage status'
+grep -q "^Range: ${A}\.\..* (3 commits" "${MOCK_LOG}" || fail 'range prompt lacks the accumulated range'
+assert_eq "$(grep -c '^  [0-9a-f]\{7\} ' "${MOCK_LOG}")" 3 'range prompt commit list'
+# Past the accumulation cap the script reviews without asking.
+printf 'REVIEW_ACCUM_COMMITS=2\n' >> "${REPO}/.review.conf"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+run_review new
+assert_eq "${RUN_STATUS}" 6 'accumulation cap status'
+grep -q '^REVIEW: .*累积 3 个提交.*超过上限' "${TMP}/stdout" || fail 'accumulation cap stdout'
+assert_eq "$(call_count '^agent ')" 0 'accumulation cap agent calls'
+grep -q "^base sha: ${A}" "${TMP}/stdout" || fail 'accumulation cap base is the last code review'
+grep -v '^REVIEW_ACCUM_COMMITS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+echo 'PASS routing accumulates commits since the last code review'
+
+# Plan paths accumulate from the last plan review, independently of code reviews.
+P=$(git -C "${REPO}" rev-parse HEAD)
+printf '2026-09-02 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+commit_file docs/plans/q.md 'plan edit'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'plan range status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'plan range kind'
+grep -q "^base sha: ${P}" "${TMP}/stdout" || fail 'plan range base is the last plan review'
+echo 'PASS plan paths accumulate from the last plan review'
+
+# Round 1 checks each commit in the range for purity and the target commit for kind.
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md" "${REVIEW_DIR}"/.r*.sent
+B=$(git -C "${REPO}" rev-parse HEAD)
+commit_file src/core/c2.py 'code after plan'
+write_request code "${P}" 1/3            # range P..HEAD = plan commit + code commit, each pure → ok
+run_review new
+assert_eq "${RUN_STATUS}" 3 'pure mixed-range status'
+grep -q '^Level: deep' "${MOCK_LOG}" || fail 'review prompt lacks the derived level'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+write_request plan "${P}" 1/2
+run_review none
+assert_rejected 'kind vs target' 'kind 跟着 target 提交走'
+write_request code "${P}" 1/3
+sed -i '' 's|^round:|level: huge\nround:|' "${REVIEW_DIR}/request.md"
+run_review none
+assert_rejected 'bad level' 'level 只能是'
+sed -i '' 's|^level: huge|level: light|' "${REVIEW_DIR}/request.md"
+run_review new
+assert_eq "${RUN_STATUS}" 3 'explicit level status'
+grep -q '^Level: light' "${MOCK_LOG}" || fail 'explicit level not passed to the reviewer'
+echo 'PASS round 1 checks per-commit purity and honours an explicit level'
+
+# When findings land, a blocking on a path below deep upgrades the map automatically and timing.md records the kind.
+printf 'F1 | blocking\nclaim:    boom\nevidence: src/util/u.py:3\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"
+mkdir -p "${REPO}/src/util"; printf 'x\n' > "${REPO}/src/util/u.py"
+run_review live
+assert_eq "${RUN_STATUS}" 0 'findings delivered status'
+grep -q '^src/util/u.py *deep *# 自动升级' "${REPO}/.review-map" || fail 'map not auto-upgraded'
+grep -q '升级 src/util/u.py → deep' "${TMP}/stderr" || fail 'upgrade note missing'
+tail -1 "${REPO}/docs/reviews/timing.md" | grep -q '| code$' || fail 'timing row lacks kind'
+rm -f "${REPO}/src/util/u.py"
+echo 'PASS a blocking finding upgrades its path in the map'

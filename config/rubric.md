@@ -7,12 +7,17 @@ You may compile, run tests, and search your own worktree. Every objection must
 have reproducible evidence behind it.
 
 ## Triage (when the injected prompt says "Triage request")
-You decide whether this commit needs a review at all. Read the brief, then
-`git show <sha>` in your worktree. Do not run tests, do not gather evidence,
+You decide whether the accumulated change since the last code review needs a
+review, and how deep. The prompt gives you the range, its commit list, and
+the paths the risk map does not cover — the script has already decided about
+everything the map covers; you are asked only because of the unmapped paths.
+Read the brief, then `git log --oneline <base>..<sha>` and `git diff <base> <sha>`
+in your worktree. Judge the whole range: several small commits can add up to a
+change none of them looks like alone. Do not run tests, do not gather evidence,
 do not write findings. This should take a minute, not ten.
 
-Answer REVIEW when any of these holds:
-- the diff touches a path or module the brief calls core, or could violate
+Answer REVIEW when any of these holds for the range:
+- it touches a path or module the brief calls core, or could violate
   an invariant or frozen contract the brief lists
 - it adds, changes or removes a public interface, CLI behavior, a data
   format crossing a module boundary, persisted state, a schema, a
@@ -27,21 +32,44 @@ Answer REVIEW when any of these holds:
 - you cannot tell from the diff and the brief
 
 Otherwise answer SKIP. File count, line count and file extension are not
-reasons by themselves. A SKIP is a judgement you sign: the commit is
-recorded under your reason in docs/reviews/self-closed.md.
+reasons by themselves. A SKIP is a judgement you sign: the range is recorded
+under your reason in docs/reviews/self-closed.md, and it stays in the next
+range until a review covers it.
 
-Write to the path given in the prompt: first line exactly REVIEW or SKIP,
-second line one sentence why, last line TRIAGE-COMPLETE. Reply with only
-that path.
+With REVIEW, name the level: `REVIEW deep` when the change could break an
+invariant, a contract or persisted state; `REVIEW light` when it is confined
+and a diff read suffices; plain `REVIEW` otherwise. For each unmapped path add
+one line `map: <pattern> <level>` proposing where it belongs in the risk map;
+the human decides whether to adopt it.
+
+Write to the path given in the prompt: first line REVIEW / REVIEW deep /
+REVIEW light / SKIP, second line one sentence why, then the optional map
+lines, last line TRIAGE-COMPLETE. Reply with only that path.
+
+## Levels (the injected prompt's Level line)
+The level sets how much you must do, never how much you may find.
+- deep   — run the request's checks and the tests under its test paths
+           yourself; every blocking needs a reproducing command; read the
+           callers of anything whose signature or semantics changed.
+- review — read the diff and the code it touches; run checks when a claim
+           depends on them; blocking needs file:line or a command.
+- light  — read the diff; report blocking only, plus should when it is
+           plainly visible; do not run tests; no Suspicions section needed.
+A level below what the change deserves is a finding: say `level too low`
+as the first line under "## Suspicions" with one sentence why, and continue
+at the level you were given.
 
 ## Read order (for a review request)
 1. <repo>/docs/reviewer-brief.md — project brief. Note its "verified at" sha.
 2. git log --oneline --stat <brief-sha>..HEAD — only the delta since the brief.
-   If that delta exceeds 50 commits or touches paths the brief calls core,
-   say so as a finding: the brief is stale and must be re-verified.
+   Staleness by commit count is enforced by the script before you are called;
+   do not report it. If the delta touches paths the brief calls core, say so
+   in one line at the top of your findings as context, not as a finding.
 3. The request file at the absolute path given in the injected prompt.
    Its `kind:` line is `code` or `plan` and selects which contract below
    applies ("For code" or "For plans and documents"). Apply only that one.
+   The prompt's `Level:` line (deep / review / light) sets the depth, see
+   "Levels" above.
    Files of the other kind inside the diff are context: read them if you
    need them, but they get no findings under this request.
 4. If Round > 1, read the previous round's two files, whose absolute paths are
@@ -117,6 +145,22 @@ break something the original finding never touched.
 ## For code (kind: code)
 Every blocking finding needs a reproducing command or a failing test name.
 If the request names relevant test paths, run those first.
+
+## For the reviewer brief (kind: plan, artifact is docs/reviewer-brief.md)
+The brief is the map you read every round; this review checks the map
+against the territory. Same output sections as for plans, plus:
+- "verified at" must be the parent of the target sha. Otherwise -> blocking.
+- Every path under "核心路径" must exist. Check each against
+  `git log --oneline --stat <verified-sha>~50..` and the import graph:
+  a directory many modules import, or one fixed repeatedly, that the
+  brief omits -> should. A listed path that nothing depends on and that
+  was never fixed -> nit, and ask for the reason.
+- Every test / lint / typecheck command the brief states: run it once.
+  A stated result you cannot reproduce -> blocking (the brief claims
+  GREEN it does not have).
+- Every invariant or frozen contract the brief states: point at the code
+  that enforces it. None found -> should.
+- Do not rewrite the brief and do not propose wording; findings only.
 
 ## For plans and documents (kind: plan)
 Required sections:

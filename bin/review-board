@@ -257,6 +257,8 @@ def project_state(repo, conf):
     latest = max([mtime(f"{d}/{f}") or 0 for f in os.listdir(d)] or [0]) if os.path.isdir(d) else 0
     p["last_activity"] = latest
     p["accum"] = since_last_review(repo, conf)
+    p["brief"] = brief_status(repo, conf)
+    p["map"] = map_suggestions(repo)
     if explicit:
         pend = pending_decisions(prev)
         if this and this["sent"]:
@@ -381,6 +383,43 @@ def since_last_review(repo, conf):
     return {"base": base, "n": len(commits), "skipped": skipped, "plan": plan, "unrouted": len(commits) - skipped - plan}
 
 
+def map_suggestions(repo):
+    """review-map --suggest 的输出：降级建议（要人点头）与图上没有的路径。没有 .review-map 或找不到命令 → []。"""
+    if not os.path.exists(f"{repo}/.review-map"):
+        return None
+    exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "review-map")
+    if not os.path.exists(exe):
+        exe = "review-map"
+    try:
+        out = subprocess.run([exe, repo, "--suggest"], capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            rows.append(parts)
+    return rows
+
+
+def brief_status(repo, conf):
+    """简报新旧：verified-at 之后几个提交，上限多少。返回 None 表示项目没有简报或关闭了检查。"""
+    rel = conf.get("REVIEW_BRIEF", "docs/reviewer-brief.md") if "REVIEW_BRIEF" in conf else "docs/reviewer-brief.md"
+    if not rel or not os.path.exists(f"{repo}/{rel}"):
+        return None
+    cap = int(conf.get("REVIEW_BRIEF_MAX_COMMITS") or 50)
+    first = (read(f"{repo}/{rel}") or "").splitlines()[:1]
+    m = re.search(r'verified at:\s*([0-9a-f]{7,40})', first[0]) if first else None
+    if not m:
+        return {"sha": "", "n": None, "cap": cap, "state": "缺 verified at"}
+    sha = m.group(1)
+    ok = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True).returncode == 0
+    if not ok:
+        return {"sha": sha, "n": None, "cap": cap, "state": "基线不在 HEAD 历史里"}
+    n = int((git(repo, "rev-list", "--count", f"{sha}..HEAD").strip() or "0"))
+    return {"sha": sha, "n": n, "cap": cap, "state": "过期" if n > cap else ("将过期" if n > cap * 0.8 else "")}
+
+
 def load_self_closed(repo):
     text = read(f"{repo}/docs/reviews/self-closed.md") or ""
     rows = [l for l in text.splitlines() if re.match(r'^\d{4}-\d{2}-\d{2} \|', l)]
@@ -489,7 +528,8 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#a3a19b;font-size:12.5px}
 .idle{padding:28px 0;color:#8b8985}
-.accum{font-size:12px;margin-top:8px}.accum.warn{color:#e5b866}.accum b{font-weight:700}
+.accum{font-size:12px;margin-top:8px}
+details.mapsug{margin-top:8px;font-size:12px}details.mapsug>summary{color:#e5b866;cursor:pointer}details.mapsug li{margin:3px 0 3px 16px}.accum.warn{color:#e5b866}.accum b{font-weight:700}
 .cycle{margin-top:20px;border:1px solid #2e2e2e;background:#1f1f1f;padding:14px 18px 14px 20px;border-left:4px solid #4a4a4a}
 .cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
 .cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
@@ -515,6 +555,8 @@ details.bgrp{margin-top:10px}details.bgrp>summary.bhead{cursor:pointer}
 details.sc>summary{cursor:pointer}details.sc>summary h2{display:inline}
 .filter{margin:0 0 8px;font:12.5px inherit;padding:4px 8px;border:1px solid #3a3a3a;border-radius:2px;width:320px;background:#1f1f1f}
 .cycle .top .lab{font-size:12px;color:#8b8985}
+.lvl{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;background:#262626;color:#a3a19b}
+.lvl.deep{background:#3b1f1d;color:#f28b82}.lvl.light{background:#262626;color:#a3a19b}.lvl.review{background:#1e3350;color:#8fb8ee}
 .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:6px 14px;font-size:12.5px}
 .kv .k{color:#8b8985;padding-top:1px}.kv .v{color:#4a4a4a}
 .chips{display:flex;flex-wrap:wrap;gap:4px 8px}
@@ -751,8 +793,10 @@ def render_cycle(p):
     target = (cr.get("target sha") or req.get("target sha") or sent1.get("target") or "")[:7]
     base = (cr.get("base sha") or "")[:7]
     stale = bool(p["rounds"]) and p["closed"] and not p["waiting"]
+    lvl = (req.get("level") or cr.get("level") or "").lower()
+    lvl_html = f'<span class="lvl {esc(lvl)}" title="level">{ {"deep": "深审", "review": "常规", "light": "轻审"}.get(lvl, esc(lvl)) }</span>' if lvl else ""
     top = (f'<span class="lab">{"周期" if stale else "当前周期"}</span><span><code style="font-weight:600">@ {esc(target)}</code></span>'
-           f'<span>{esc(cr.get("kind", ""))}</span><span>round {esc(req.get("round", cr.get("round", "")))}</span>'
+           f'<span>{esc(cr.get("kind", ""))}</span>{lvl_html}<span>round {esc(req.get("round", cr.get("round", "")))}</span>'
            f'<span class="dim">{esc(p["cycle_note"])}</span>')
     sub = cycle_subject(p)
     title = ""
@@ -812,6 +856,20 @@ def render_panel(p, archives, self_closed):
     rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
     parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
+    b = p.get("brief")
+    if b:
+        if b["n"] is None:
+            parts.append(f'<div class="accum warn">简报 {esc(b["state"])}，写手下次运行会被要求重写</div>')
+        else:
+            cls = "accum warn" if b["state"] else "accum mute"
+            tail = f' · <b>{esc(b["state"])}</b>' if b["state"] else ""
+            parts.append(f'<div class="{cls}">简报核实于 <code>{esc(b["sha"][:7])}</code>，之后 {b["n"]} 个提交，上限 {b["cap"]}{tail}</div>')
+    ms = p.get("map")
+    if ms is None:
+        parts.append('<div class="accum mute">没有 .review-map，代码路径全部由评审方 triage</div>')
+    elif ms:
+        items = "".join(f'<li><span class="mute">{"建议降级" if k == "lower" else "建议加入"}</span> <code>{esc(g)}</code> {esc(lv)} <span class="dim">· {esc(why)}</span></li>' for k, g, lv, why in ms)
+        parts.append(f'<details class="mapsug"><summary>风险图有 {len(ms)} 条建议，等你点头</summary><ul>{items}</ul></details>')
     acc = p.get("accum")
     if acc is None:
         parts.append('<div class="accum mute">尚无已完成的代码评审，无法计算累积</div>')

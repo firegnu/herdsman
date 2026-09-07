@@ -14,10 +14,12 @@ install -m 0755 "${SRC}/bin/request-review" "${BIN}/request-review"
 install -m 0755 "${SRC}/bin/review-archive" "${BIN}/review-archive"
 install -m 0755 "${SRC}/bin/herdsman-init" "${BIN}/herdsman-init"
 install -m 0755 "${SRC}/bin/review-board" "${BIN}/review-board"
+install -m 0755 "${SRC}/bin/review-map" "${BIN}/review-map"
 echo "  ✓ ${BIN}/request-review"
 echo "  ✓ ${BIN}/review-archive"
 echo "  ✓ ${BIN}/herdsman-init"
 echo "  ✓ ${BIN}/review-board"
+echo "  ✓ ${BIN}/review-map"
 
 if [ -f "${CFG}/rubric.md" ]; then
   if cmp -s "${SRC}/config/rubric.md" "${CFG}/rubric.md"; then
@@ -34,6 +36,8 @@ fi
 
 install -m 0644 "${SRC}/templates/agents-section.md" "${CFG}/agents-section.md"
 echo "  ✓ ${CFG}/agents-section.md"
+install -m 0644 "${SRC}/templates/brief-prompt.md" "${CFG}/brief-prompt.md"
+echo "  ✓ ${CFG}/brief-prompt.md"
 
 # 看板定时生成（macOS launchd，每 30 秒）；非 macOS 跳过
 if [ "$(uname)" = Darwin ]; then
