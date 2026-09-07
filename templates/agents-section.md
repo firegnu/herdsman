@@ -4,7 +4,7 @@
 ### 评审路由（你不做判断，脚本和评审方做）
 每次提交后运行 request-review。没有针对 HEAD 的 request.md 时，它判定**上次评审以来的全部改动**
 要不要评审、审多深：只改 .md/.rst/.txt 的直接跳过；触及 REVIEW_PLAN_PATHS 或规则文件
-（AGENTS.md、CLAUDE.md、docs/reviewer-brief.md）的直接要求评审（kind: plan）；其余按仓库里的
+（AGENTS.md、CLAUDE.md、docs/reviewer-brief.md、.review-map）的直接要求评审（kind: plan）；其余按仓库里的
 风险图 `.review-map` 取等级，图上没有的路径才交给评审方 triage（只读 diff 和 reviewer-brief，
 不跑测试，约一分钟）。SKIP 不是终审：那段改动留在下一次的范围里。按退出码办：
 - 0 且输出 `SKIP: …` → 结束，已记入 docs/reviews/self-closed.md
@@ -47,7 +47,7 @@
        r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
        uphold = 你的 reject/defer 成立，overrule = finding 成立、你须改），再次运行
        即在本周期继续下一轮，不重置、不消耗轮次。裁决只能来自人；没有人的话不得写此文件。
-   7 → 评审方简报过期。按输出提示，用 ~/.config/review/brief-prompt.md 的提示词重写
+   7 → 评审方简报缺失或过期。按输出提示，用 ~/.config/review/brief-prompt.md 的提示词生成或重写
        docs/reviewer-brief.md（第一行 verified at 写当前 HEAD），**单独提交**，再次运行；
        该提交会作为 kind: plan 送审，评审方核对简报与代码是否相符。不要把简报和代码混在一个提交里。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。

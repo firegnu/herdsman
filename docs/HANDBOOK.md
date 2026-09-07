@@ -66,9 +66,10 @@
         每个 commit 后跑 request-review，不自己判断要不要审
 
 ③' 脚本路由，看的是「上次评审以来」这一整段，不是最新一个提交：
-            简报过期（verified-at 之后 >50 提交）→ exit 7，写手先重写简报（单独提交，自动走 plan 评审）
-            自上次 plan 评审起碰了 REVIEW_PLAN_PATHS 或规则文件 → REVIEW（kind: plan），exit 6
-            自上次 code 评审起只改 .md/.rst/.txt → SKIP，记 self-closed.md，exit 0
+            简报缺失或过期（verified-at 之后 >50 提交 / 改过 deep 路径）→ exit 7，写手先写/重写简报（单独提交，自动走 plan 评审）
+            自上次 plan 评审起碰了 REVIEW_PLAN_PATHS 或规则文件（AGENTS.md / CLAUDE.md / brief / .review-map）→ REVIEW（kind: plan），exit 6
+            范围 = 这段里未被人 SKIP_REVIEW 的提交各自改的文件
+            自上次 code 评审起只改 .md/.rst/.txt（且图上没把它们标为 deep/review）→ SKIP，记 self-closed.md，exit 0
             风险图 .review-map 能定的直接定：全 skip → SKIP；有等级 → REVIEW 带 level，exit 6
             上次 SKIP 之后只新增纯文本提交 → 沿用 SKIP
             累积超上限（20 提交 / 2000 行）→ REVIEW，exit 6
@@ -163,7 +164,8 @@ herdsman-init <短名>
 1. 把 `~/.config/review/agents-section.md`（第 5.4 节）追加到 `<repo>/AGENTS.md`（Codex 系）或 `CLAUDE.md`（Claude Code）。模板对所有项目一样，不需要改。
 2. 用第 6 部分的提示词让写手生成 `docs/reviewer-brief.md`，生成后你亲自过一遍「核心路径」和「不变量」两节——**triage 的项目知识全部来自这两节**。
 
-**这一步不要跳过。** 简报是空的话，评审方每轮从零爬全仓库，triage 也只能一律说 REVIEW。
+**这一步现在由脚本强制。** 没有简报时写手第一次跑 `request-review` 就 exit 7 要求生成，生成的简报走一次 plan 评审
+由评审方核对。你也可以按上面的提示词提前让写手生成。简报是空的话，评审方每轮从零爬全仓库，triage 也只能一律说 REVIEW。
 
 有计划/设计文档目录的项目，在 `.review.conf` 加 `REVIEW_PLAN_PATHS`，否则 `.md` 计划会被当成纯文本跳过。
 
@@ -292,7 +294,9 @@ agent 在做什么 —— 那部分只在 herdr 的 pane 里。
 ### 风险图：审不审、审多深，由文件说，不由评审方当场猜
 
 `<repo>/.review-map` 一行一个路径模式：`模式  等级  # 理由`。等级 deep（跑测试、三轮、阻断必带复现命令）、
-review（常规）、light（一轮、只找阻断、不跑测试）、plan、skip。最长匹配的模式生效。
+review（常规）、light（一轮、只找阻断、不跑测试）、plan（等同 .review.conf 的计划/规则路径，改了走 plan 评审）、skip。
+模式里 `**` 可跨目录、`*` 不跨；命中多条时最长的生效。纯文本（.md/.rst/.txt）默认是状态记录不送审，
+除非图上把那个文件标为 deep 或 review（出过阻断的 README 之类）；light/skip 对纯文本等于不审。
 
 - **初版由证据生成**：`review-map <repo>` 读归档里每条 finding 的 evidence 路径与严重度、import 扇入、
   有没有测试，输出带理由的草案。没有归档的新项目只有扇入和测试两个信号，所以几乎全是 review —— 没有理由放松就不放松。
@@ -302,7 +306,8 @@ review（常规）、light（一轮、只找阻断、不跑测试）、plan、sk
 - **路由怎么用它**：自上次 code 评审起改动的所有文件在图上取最高等级。任一文件不在图上才叫评审方 triage，
   它判等级并建议 `map:` 行。累积范围按种类各算起点（timing.md 的最新一行 code / plan），SKIP 只是推后，
   上限（`REVIEW_ACCUM_COMMITS` / `REVIEW_ACCUM_LINES`）到了直接审。
-- 写手不碰这个文件（规则文件，和 AGENTS.md 同级）。`.review.conf` 里 `REVIEW_MAP=` 置空可关掉，关掉后所有代码路径都交评审方 triage。
+- 写手不碰这个文件（它在 `REVIEW_RULE_PATHS` 里，改了走 plan 评审，和 AGENTS.md 同级）。人用 `SKIP_REVIEW=1`
+  放过的提交不进任何累积范围 —— 人的跳过是终审，不是推后。`.review.conf` 里 `REVIEW_MAP=` 置空可关掉，关掉后所有代码路径都交评审方 triage。
 
 ---
 
@@ -329,7 +334,7 @@ review（常规）、light（一轮、只找阻断、不跑测试）、plan、sk
 #   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
-#   7 = reviewer brief 过期，先重写 brief（单独提交，它会作为 kind: plan 送审），再运行
+#   7 = reviewer brief 缺失或过期，先写/重写 brief（单独提交，它会作为 kind: plan 送审），再运行
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -347,8 +352,8 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_START_TIMEOUT:=60000}"
 : "${REVIEW_POLL:=10}"          # 等哨兵时的轮询间隔（秒）；测试用，一般不改
 : "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
-: "${REVIEW_RULE_PATHS=AGENTS.md CLAUDE.md docs/reviewer-brief.md}"   # 规则文件：按计划文档路由与校验；置空关闭
-: "${REVIEW_BRIEF=docs/reviewer-brief.md}"        # 评审方简报；置空或文件不存在则不做过期检查
+: "${REVIEW_RULE_PATHS=AGENTS.md CLAUDE.md docs/reviewer-brief.md .review-map}"   # 规则文件：按计划文档路由与校验；置空关闭
+: "${REVIEW_BRIEF=docs/reviewer-brief.md}"        # 评审方简报；缺失或过期都 exit 7；置空关闭这道门
 : "${REVIEW_BRIEF_MAX_COMMITS:=50}"                # 简报 verified-at 之后累计超过这么多提交视为过期
 : "${REVIEW_MAP=.review-map}"                      # 风险图（仓库内，规则文件）；置空或不存在则所有代码路径交评审方 triage
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
@@ -695,29 +700,43 @@ wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   exit 3
 }
 
-# 路径是否属于计划/规则文档（REVIEW_PLAN_PATHS + REVIEW_RULE_PATHS）。模式按 shell case 匹配，* 可跨 /。
+# 路径是否属于计划/规则文档：.review.conf 的 REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS（shell case 匹配，* 可跨 /），
+# 或风险图上等级为 plan 的行。
 path_is_plan() {         # $1=path
   local pat; set -f
   for pat in ${REVIEW_PLAN_PATHS} ${REVIEW_RULE_PATHS}; do
     # shellcheck disable=SC2254
     case "$1" in ${pat}) set +f; return 0;; esac
   done
-  set +f; return 1
+  set +f
+  [ "$(map_level "$1")" = plan ]
 }
 
-# ---- 风险图：`模式  等级  # 理由`，等级 deep/review/light/plan/skip。最长匹配的模式生效。----
+# ---- 风险图：`模式  等级  # 理由`，等级 deep/review/light/plan/skip。----
+# 模式：`**` 可跨目录，`*` 不跨（src/jbgen/* 只是顶层文件，新子包不会被它盖住）。命中多条时最长的模式生效。
 map_file() { [ -n "${REVIEW_MAP}" ] && [ -f "${REPO}/${REVIEW_MAP}" ] && printf '%s' "${REPO}/${REVIEW_MAP}"; }
 
+map_pat_re() {           # $1=模式 → 正则（纯 bash，避开 sed 方言）
+  local p="$1" out="" c i
+  for ((i = 0; i < ${#p}; i++)); do
+    c="${p:i:1}"
+    case "${c}" in
+      '*') if [ "${p:i+1:1}" = '*' ]; then out+='.*'; i=$((i + 1)); else out+='[^/]*'; fi;;
+      '.'|'^'|'$'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|'\\') out+="\\${c}";;
+      *) out+="${c}";;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
 map_level() {            # $1=path → 等级；没匹配到输出 unknown；没有图输出 nomap
-  local f pat lvl best="" best_len=0
+  local f pat lvl re best="" best_len=0
   f=$(map_file) || { echo nomap; return; }
-  set -f
   while read -r pat lvl _; do
     case "${pat}" in ''|'#'*) continue;; esac
-    # shellcheck disable=SC2254
-    case "$1" in ${pat}) [ "${#pat}" -gt "${best_len}" ] && { best="${lvl}"; best_len=${#pat}; };; esac
+    re=$(map_pat_re "${pat}")
+    [[ "$1" =~ ^${re}$ ]] && [ "${#pat}" -gt "${best_len}" ] && { best="${lvl}"; best_len=${#pat}; }
   done < "${f}"
-  set +f
   echo "${best:-unknown}"
 }
 
@@ -786,17 +805,32 @@ last_target() {          # $1=code|plan → 完整 sha，或空
   done < <(awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' "${ARCHIVE_DIR}/timing.md")
 }
 
+# 范围内的改动文件 = 范围内每个提交各自改的文件之并集，但跳过人用 SKIP_REVIEW 放过的提交（记在 skipped.md）：
+# 人的跳过是终审，不是推后，那些文件不该再把范围推给评审方。
 range_files() {          # $1=base(可空) $2=head → 改动文件列表
-  if [ -n "$1" ]; then git diff --name-only "$1" "$2"; else git diff-tree --root --no-commit-id --name-only -r "$2"; fi
+  local c skipped
+  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ')
+  for c in $(git rev-list ${1:+"$1.."}"$2"); do
+    case " ${skipped} " in *" $(git rev-parse --short "${c}") "*) continue;; esac
+    if git rev-parse -q --verify "${c}^" >/dev/null 2>&1; then git diff --name-only "${c}^" "${c}"; else git diff-tree --root --no-commit-id --name-only -r "${c}"; fi
+  done | sort -u
 }
 
-# ---- 简报过期门：评审方每轮都读 brief，brief 过期评审就建立在错的地图上。----
-# verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、或基线不在 HEAD 历史里，就停下让写手先重写。
-# 这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
+# ---- 简报门：评审方每轮都读 brief，没有 brief 它只能从零爬仓库，brief 过期评审就建立在错的地图上。----
+# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、改过风险图 deep 路径、或基线不在 HEAD 历史里，
+# 都停下让写手先写/重写。这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
+# 新仓库接入靠的就是这道门：herdsman-init 之后写手第一次跑就被要求写简报。
 brief_gate() {
   local v n f deep_hit
-  [ -n "${REVIEW_BRIEF}" ] && [ -f "${REPO}/${REVIEW_BRIEF}" ] || return 0
+  [ -n "${REVIEW_BRIEF}" ] || return 0
   git diff-tree --no-commit-id --name-only -r HEAD | grep -qx "${REVIEW_BRIEF}" && return 0
+  if [ ! -f "${REPO}/${REVIEW_BRIEF}" ]; then
+    echo "STOP: 还没有 ${REVIEW_BRIEF}，评审方没有项目简报无法有效评审或 triage。"
+    echo "      先生成简报：用 ${HOME}/.config/review/brief-prompt.md 的提示词生成 ${REVIEW_BRIEF}，"
+    echo "      第一行 verified at 写当前 HEAD；单独提交（不混其他文件）后再运行 request-review，"
+    echo "      它会作为 kind: plan 送审，评审方核对简报与代码是否相符。"
+    exit 7
+  fi
   v=$(sed -n '1s/.*verified at:[[:space:]]*\([0-9a-f]\{7,40\}\).*/\1/p' "${REPO}/${REVIEW_BRIEF}")
   if [ -z "${v}" ]; then
     echo "STOP: ${REVIEW_BRIEF} 第一行没有 \`<!-- verified at: <sha> -->\`，无法判断新旧。"
@@ -848,7 +882,7 @@ triage_print_review() {  # $1=理由 $2=kind $3=base $4=level
 }
 
 triage_head() {
-  local head files f plan_hits text_only verdict reason pane saved level
+  local head files f plan_hits verdict reason pane saved level
   local code_base plan_base ncommits nlines prev_sha prev_verdict prev_base new_text
   head=$(git rev-parse HEAD)
   git diff --quiet && git diff --cached --quiet \
@@ -875,14 +909,18 @@ triage_head() {
   done < <(range_files "${plan_base}" "${head}")
   [ -z "${plan_hits}" ] || triage_conclude "${head}" REVIEW 脚本 "触及计划/规则文档（自 ${plan_base:0:7} 起）：${plan_hits}" plan "${plan_base}" review
 
-  # 2. 代码范围：自上次 code 评审起
-  files=$(range_files "${code_base}" "${head}")
-  text_only=1
+  # 2. 代码范围：自上次 code 评审起。纯文本文件默认是状态记录、不参与判定，除非风险图明确把它标为 deep 或 review
+  #    （README 之类出过阻断的文档）；light / skip / 图上没有的文本一律不算。
+  files=""
   while IFS= read -r f; do
     [ -n "${f}" ] || continue
-    case "${f}" in *.md|*.markdown|*.rst|*.txt) ;; *) text_only=0;; esac
-  done <<< "${files}"
-  [ "${text_only}" -eq 0 ] || triage_conclude "${head}" SKIP 纯文本 "自 ${code_base:0:7} 起只改了 .md/.rst/.txt，视为状态记录"
+    case "${f}" in
+      *.md|*.markdown|*.rst|*.txt)
+        case "$(map_level "${f}")" in deep|review) files="${files}${f}"$'\n';; esac;;
+      *) files="${files}${f}"$'\n';;
+    esac
+  done < <(range_files "${code_base}" "${head}")
+  [ -n "${files}" ] || triage_conclude "${head}" SKIP 纯文本 "自 ${code_base:0:7} 起只改了 .md/.rst/.txt（风险图未要求审），视为状态记录"
 
   # 3. 风险图能定的直接定：全 skip → SKIP；有等级 → REVIEW 带等级；有没在图上的路径 → 往下问评审方
   level=$(printf '%s\n' "${files}" | files_level)
@@ -900,8 +938,11 @@ triage_head() {
       new_text=1
       while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        case "${f}" in *.md|*.markdown|*.rst|*.txt) ;; *) new_text=0;; esac
-      done < <(git diff --name-only "${prev_sha}" "${head}")
+        case "${f}" in
+          *.md|*.markdown|*.rst|*.txt) case "$(map_level "${f}")" in deep|review) new_text=0;; esac;;
+          *) new_text=0;;
+        esac
+      done < <(range_files "${prev_sha}" "${head}")
       [ "${new_text}" -eq 0 ] || triage_conclude "${head}" SKIP 沿用 "自 ${prev_sha:0:7} 起只新增纯文本提交，沿用上次 SKIP" code "${code_base}"
     fi
   fi
@@ -1395,7 +1436,7 @@ Required sections:
 ### 评审路由（你不做判断，脚本和评审方做）
 每次提交后运行 request-review。没有针对 HEAD 的 request.md 时，它判定**上次评审以来的全部改动**
 要不要评审、审多深：只改 .md/.rst/.txt 的直接跳过；触及 REVIEW_PLAN_PATHS 或规则文件
-（AGENTS.md、CLAUDE.md、docs/reviewer-brief.md）的直接要求评审（kind: plan）；其余按仓库里的
+（AGENTS.md、CLAUDE.md、docs/reviewer-brief.md、.review-map）的直接要求评审（kind: plan）；其余按仓库里的
 风险图 `.review-map` 取等级，图上没有的路径才交给评审方 triage（只读 diff 和 reviewer-brief，
 不跑测试，约一分钟）。SKIP 不是终审：那段改动留在下一次的范围里。按退出码办：
 - 0 且输出 `SKIP: …` → 结束，已记入 docs/reviews/self-closed.md
@@ -1438,7 +1479,7 @@ Required sections:
        r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
        uphold = 你的 reject/defer 成立，overrule = finding 成立、你须改），再次运行
        即在本周期继续下一轮，不重置、不消耗轮次。裁决只能来自人；没有人的话不得写此文件。
-   7 → 评审方简报过期。按输出提示，用 ~/.config/review/brief-prompt.md 的提示词重写
+   7 → 评审方简报缺失或过期。按输出提示，用 ~/.config/review/brief-prompt.md 的提示词生成或重写
        docs/reviewer-brief.md（第一行 verified at 写当前 HEAD），**单独提交**，再次运行；
        该提交会作为 kind: plan 送审，评审方核对简报与代码是否相符。不要把简报和代码混在一个提交里。
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
@@ -2650,7 +2691,8 @@ lint/typecheck 等确定性检查命令。若全量测试当前无法通过，�
 
 简报有自己的生命周期，不靠人记得：
 
-- **过期由脚本判**。`request-review` 在路由和第 1 轮派发前看简报第一行的 verified-at：之后累计超过
+- **缺失和过期都由脚本判**。没有简报的仓库第一次跑 `request-review` 就 exit 7 要求写一份 —— 新仓库接入靠的就是这道门。
+  有简报时看第一行的 verified-at：之后累计超过
   `REVIEW_BRIEF_MAX_COMMITS`（默认 50）个提交、或改过风险图上 deep 的路径、或该 sha 不在 HEAD 历史里，就 exit 7 停下，输出里写明
   怎么重写。写手用 `~/.config/review/brief-prompt.md` 的提示词重写、verified-at 写当前 HEAD、单独提交。
 - **重写由评审方核对**。简报是规则文件（`REVIEW_RULE_PATHS`），那个提交自动路由为 kind: plan 评审，rubric
@@ -2785,7 +2827,7 @@ lint/typecheck 等确定性检查命令。若全量测试当前无法通过，�
 | `REVIEW: …` 后跟 `level: deep` | 风险图判为深审 | 写手照抄进 request，评审方会跑测试、三轮；正常 |
 | `NOTE: 风险图升级 X → deep` | 本轮在 X 上报出阻断 | 脚本已把 X 追加进 .review-map，写手随下次提交带上；不用管 |
 | 看板"风险图有 N 条建议" | 证据说某路径可以降级，或有新目录不在图上 | 你看理由，同意就改 .review-map 那一行提交；不同意不理 |
-| `exit 7` / `STOP: … 简报过期` | brief 的 verified-at 之后超过 50 个提交，或基线不在 HEAD 历史里 | 写手按输出重写 brief 单独提交，自动走 plan 评审；正常 |
+| `exit 7` / `STOP: 还没有 … 简报` 或 `… 简报过期` | 没有 brief；或 verified-at 之后超过 50 个提交、改过 deep 路径、基线不在 HEAD 历史里 | 写手按输出写/重写 brief 单独提交，自动走 plan 评审；正常 |
 | `ERROR: kind: code 的 request 混入了计划/规则文档` | 代码和 AGENTS.md / CLAUDE.md / reviewer-brief.md 同一个 commit | 拆开，规则文件单独提交走 plan 评审 |
 | `STOP: triage 文件第一行不是 REVIEW 或 SKIP` | 评审方没按格式写 | 看 triage.md，手动改成 REVIEW/SKIP 后重跑，或删掉重发 |
 | 想跳过 triage 直接审 | — | 写 request.md（target sha = HEAD）再运行即可 |

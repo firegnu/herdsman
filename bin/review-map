@@ -143,10 +143,13 @@ def load_archives(repo, index):
                 if not paths:   # 没写路径的 finding 说的是"这次送审的东西"，归到 artifact 涉及的所有目录（往严）
                     paths = set(art_files); unplaced[0] += 1
                 counted[0] += 1
-                for g in {group_of(p) for p in paths}:
+                for pth in paths:
+                    g = group_of(pth)
                     touched.add(g)
                     if sev:
                         stats[g][sev] += 1
+                        if sev == "blocking":
+                            stats[g]["bx:" + os.path.splitext(pth)[1].lstrip(".")] += 1
                     if v["status"] == "regressed":
                         stats[g]["regressed"] += 1
         for g in touched:
@@ -207,10 +210,12 @@ def decide(group, st, fin, has_test, fin_hi):
         return "plan", "计划文档，必审", False
     if group in ("AGENTS.md", "CLAUDE.md", "docs/reviewer-brief.md"):
         return "plan", "规则文件，必审", False
-    if group.endswith(".md") or group.startswith("docs/"):
+    if group.endswith(".md"):
         if st["blocking"]:
-            return "review", f"文档但出过 {st['blocking']} 条阻断", False
-        return "light", "记录类文档，只看与代码是否矛盾", False
+            return "review", f"文档但出过 {st['blocking']} 条阻断；单独改它也会送审", False
+        return "light", "记录类文档；light 对纯文本等于不审", False
+    if group.startswith("docs/"):
+        return "light", "记录类文档；纯文本不审，其中的 JSON/YAML 走 light", False
     if group.startswith("tests/"):
         return "review", "测试", False
     why = []
@@ -266,6 +271,11 @@ def main():
             continue
         level, why, human = decide(g, groups[g], fin.get(g, 0), has_test.get(g, False), fin_hi)
         rows.append((g, level, why, human, groups[g]))
+        if g.startswith("docs/") and g.endswith("/**"):
+            for k, n in sorted(groups[g].items()):
+                ext = k[3:] if k.startswith("bx:") else ""
+                if ext and ext not in ("md", "markdown", "rst", "txt") and n:
+                    rows.append((g[:-2] + "**." + ext, "review", f"该目录的 .{ext} 出过 {n} 条阻断（多为绑定/实测记录与代码不符）", False, groups[g]))
 
     order = {"deep": 0, "plan": 1, "review": 2, "light": 3, "skip": 4}
     rows.sort(key=lambda r: (order[r[1]], r[0]))
@@ -285,6 +295,9 @@ def main():
     lines = [f"# .review-map 草案 —— 由 review-map 生成，{ncycles} 个归档周期，{counted} 条带严重度的 finding"
              + (f"（其中 {unplaced} 条 evidence 没写路径，按该周期的 artifact 目录归因）" if counted else "") + f"，{len(index)} 个文件",
              "# 等级：deep 跑测试三轮 / review 正常评审 / light 一轮只找阻断 / plan 计划评审 / skip 直接过",
+             "# 匹配：** 可跨目录，* 不跨（src/jbgen/* 只是顶层文件，新子包不在图上、交评审方 triage）；命中多条时最长的模式生效",
+             "# 纯文本（.md/.rst/.txt）默认是状态记录、不送审，除非图上把它标为 deep 或 review；light/skip 对纯文本都等于不审",
+             "# plan 行等同 .review.conf 的计划/规则路径：改了就走 plan 评审",
              "# 往严自动、往松要人点头；标 [待点头] 的是脚本建议降级但未生效的行", ""]
     width = max(len(r[0]) for r in rows) + 2
     for g, level, why, human, st in rows:

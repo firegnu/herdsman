@@ -29,6 +29,7 @@ REVIEW_DIR=${REVIEW_DIR}
 REVIEW_WAIT=0
 REVIEW_START_TIMEOUT=4000
 REVIEW_BOARD=
+REVIEW_BRIEF=
 EOF
 # write_request <kind> <base> <round>; artifact/target are fixed to the fixture and HEAD.
 write_request() {
@@ -521,10 +522,17 @@ assert_eq "${RUN_STATUS}" 3 'closed round-2 cycle then code commit status'
 assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'closed round-2 cycle triage prompt count'
 echo 'PASS closed round-2 cycle does not block triage of later commits'
 
-# ---- Brief gate: the reviewer reads the brief every round, so a stale brief stops dispatch. ----
+# ---- Brief gate: the reviewer reads the brief every round, so a missing or stale brief stops dispatch. ----
 rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}/.triage" "${REVIEW_DIR}/.triage.sent" "${REVIEW_DIR}/triage.md"
+grep -v '^REVIEW_BRIEF=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
 printf 'REVIEW_BRIEF_MAX_COMMITS=2\n' >> "${REPO}/.review.conf"
 mkdir -p "${REPO}/docs"
+# No brief at all: a fresh repo is asked to write one before anything is routed.
+commit_file src/b0.py 'c0'
+run_review new
+assert_eq "${RUN_STATUS}" 7 'missing brief status'
+grep -q '还没有 docs/reviewer-brief.md' "${TMP}/stdout" || fail 'missing brief stdout'
+assert_eq "$(call_count '^agent ')" 0 'missing brief agent calls'
 V=$(git -C "${REPO}" rev-parse HEAD)
 printf '<!-- verified at: %s -->\n# brief\n' "${V}" > "${REPO}/docs/reviewer-brief.md"
 git -C "${REPO}" add docs/reviewer-brief.md; git -C "${REPO}" commit -qm 'brief'
@@ -580,6 +588,8 @@ run_review new
 assert_eq "${RUN_STATUS}" 7 'deep-path brief status'
 grep -q '改过风险图上的 deep 路径' "${TMP}/stdout" || fail 'deep-path brief stdout'
 git -C "${REPO}" rm -q .review-map; git -C "${REPO}" commit -qm 'drop map'
+# .review-map 是规则文件，这两次改它的提交当作已走过 plan 评审
+printf '2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
 printf 'REVIEW_BRIEF_MAX_COMMITS=2\n' >> "${REPO}/.review.conf"
 # REVIEW_BRIEF= disables the gate.
 printf 'REVIEW_BRIEF=\n' >> "${REPO}/.review.conf"
@@ -598,8 +608,8 @@ src/util/**   light   # helpers
 docs/**       skip    # notes
 MAP
 git -C "${REPO}" add .review-map; git -C "${REPO}" commit -qm 'risk map'
-# 把"上次代码评审"钉在这里，后面的范围从这个提交起算
-printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" > "${REPO}/docs/reviews/timing.md"
+# 把"上次代码评审"和"上次计划评审"都钉在这里，后面的范围从这个提交起算（引入 .review-map 的提交视为已审）
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" "$(git -C "${REPO}" rev-parse --short HEAD)" > "${REPO}/docs/reviews/timing.md"
 # A mapped deep path is routed without the reviewer, with kind / level / base printed for the writer.
 commit_file src/core/a.py 'core change'
 run_review new
@@ -631,6 +641,52 @@ grep -q '^level: deep' "${TMP}/stdout" || fail 'reviewer level not honoured'
 grep -q '建议加进风险图：src/new/\*\* deep' "${TMP}/stderr" || fail 'map hint not surfaced'
 echo 'PASS risk map routes mapped paths and asks the reviewer only for unmapped ones'
 
+# Map semantics found by the first live map review: plan rows route as plan even when absent from
+# .review.conf; `*` does not cross directories; a text file counts only when the map says deep/review.
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+cat > "${REPO}/.review-map" <<'MAP'
+src/core/**    deep    # core
+src/util/*     light   # top-level helpers only
+docs/specs/**  plan    # specs are plans, not in .review.conf
+docs/**        skip    # notes
+README.md      review  # pointers that were wrong before
+MAP
+git -C "${REPO}" add .review-map; git -C "${REPO}" commit -qm 'map v2'
+printf '2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+commit_file docs/specs/s.md 'spec'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'map plan row status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'map plan row not routed as plan'
+printf '2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+commit_file src/util/sub/deep.py 'new subpackage'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'single-star subdir status'
+grep -q '^Unmapped paths.*src/util/sub/deep.py' "${MOCK_LOG}" || fail 'single star crossed a directory'
+printf 'SKIP\nfine\nTRIAGE-COMPLETE\n' > "${TRIAGE_OUT}"; run_review live
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+commit_file README.md 'readme pointer'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'mapped text file status'
+grep -q '^level: review' "${TMP}/stdout" || fail 'README review row ignored'
+printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
+commit_file docs/x.md 'plain note'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'unmapped-text status'
+grep -q '^SKIP: .*只改了 .md' "${TMP}/stdout" || fail 'plain note not skipped'
+git -C "${REPO}" checkout -q HEAD~5 -- .review-map 2>/dev/null || true
+cat > "${REPO}/.review-map" <<'MAP'
+# pattern   level   # reason
+src/core/**   deep    # core
+src/util/**   light   # helpers
+docs/**       skip    # notes
+MAP
+git -C "${REPO}" commit -qam 'map back'
+printf '2026-09-01 | %s | round 1/2 | 30s | plan\n2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+echo 'PASS map plan rows route, single star stays in its directory, mapped text files count'
+
 # With a completed code review on record, routing looks at the whole range since its target.
 A=$(git -C "${REPO}" rev-parse HEAD)
 printf '2026-09-01 | %s | round 1/3 | 60s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
@@ -646,18 +702,27 @@ run_review new
 assert_eq "${RUN_STATUS}" 0 'carry-over status'
 grep -q '^SKIP: .*沿用' "${TMP}/stdout" || fail 'carry-over stdout'
 assert_eq "$(call_count '^agent ')" 0 'carry-over agent calls'
-# The next code commit is triaged over the accumulated range: 3 commits since A.
+# A commit the human skipped with SKIP_REVIEW stays out of the range: the next text-only commit is still a carry-over.
+commit_file src/other/h.py 'human-skipped'
+( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new MOCK_REVIEW_WT="${REVIEW_WT}" SKIP_REVIEW=1 "${REQUEST_REVIEW}" "deploy" >/dev/null )
+commit_file docs/note2.md 'note2'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'skipped commit excluded status'
+grep -q '^SKIP: .*沿用' "${TMP}/stdout" || fail 'skipped commit not excluded from range'
+# The next code commit is triaged over the accumulated range: 3 unskipped commits since A.
 commit_file src/new/d.py 'd'
 run_review new
 assert_eq "${RUN_STATUS}" 3 'range triage status'
-grep -q "^Range: ${A}\.\..* (3 commits" "${MOCK_LOG}" || fail 'range prompt lacks the accumulated range'
-assert_eq "$(grep -c '^  [0-9a-f]\{7\} ' "${MOCK_LOG}")" 3 'range prompt commit list'
+grep -q "^Range: ${A}\.\..* (5 commits" "${MOCK_LOG}" || fail 'range prompt lacks the accumulated range'
+assert_eq "$(grep -c '^  [0-9a-f]\{7\} ' "${MOCK_LOG}")" 5 'range prompt commit list'
+grep -q '^Unmapped paths.*src/new/d.py' "${MOCK_LOG}" || fail 'unmapped list lacks d.py'
+grep -q '^Unmapped paths.*src/other/h.py' "${MOCK_LOG}" && fail 'human-skipped file leaked into the unmapped list'
 # Past the accumulation cap the script reviews without asking.
 printf 'REVIEW_ACCUM_COMMITS=2\n' >> "${REPO}/.review.conf"
 rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
 run_review new
 assert_eq "${RUN_STATUS}" 6 'accumulation cap status'
-grep -q '^REVIEW: .*累积 3 个提交.*超过上限' "${TMP}/stdout" || fail 'accumulation cap stdout'
+grep -q '^REVIEW: .*累积 5 个提交.*超过上限' "${TMP}/stdout" || fail 'accumulation cap stdout'
 assert_eq "$(call_count '^agent ')" 0 'accumulation cap agent calls'
 grep -q "^base sha: ${A}" "${TMP}/stdout" || fail 'accumulation cap base is the last code review'
 grep -v '^REVIEW_ACCUM_COMMITS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"

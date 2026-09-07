@@ -16,7 +16,7 @@
 #   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
-#   7 = reviewer brief 过期，先重写 brief（单独提交，它会作为 kind: plan 送审），再运行
+#   7 = reviewer brief 缺失或过期，先写/重写 brief（单独提交，它会作为 kind: plan 送审），再运行
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -34,8 +34,8 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_START_TIMEOUT:=60000}"
 : "${REVIEW_POLL:=10}"          # 等哨兵时的轮询间隔（秒）；测试用，一般不改
 : "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
-: "${REVIEW_RULE_PATHS=AGENTS.md CLAUDE.md docs/reviewer-brief.md}"   # 规则文件：按计划文档路由与校验；置空关闭
-: "${REVIEW_BRIEF=docs/reviewer-brief.md}"        # 评审方简报；置空或文件不存在则不做过期检查
+: "${REVIEW_RULE_PATHS=AGENTS.md CLAUDE.md docs/reviewer-brief.md .review-map}"   # 规则文件：按计划文档路由与校验；置空关闭
+: "${REVIEW_BRIEF=docs/reviewer-brief.md}"        # 评审方简报；缺失或过期都 exit 7；置空关闭这道门
 : "${REVIEW_BRIEF_MAX_COMMITS:=50}"                # 简报 verified-at 之后累计超过这么多提交视为过期
 : "${REVIEW_MAP=.review-map}"                      # 风险图（仓库内，规则文件）；置空或不存在则所有代码路径交评审方 triage
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
@@ -382,29 +382,43 @@ wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   exit 3
 }
 
-# 路径是否属于计划/规则文档（REVIEW_PLAN_PATHS + REVIEW_RULE_PATHS）。模式按 shell case 匹配，* 可跨 /。
+# 路径是否属于计划/规则文档：.review.conf 的 REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS（shell case 匹配，* 可跨 /），
+# 或风险图上等级为 plan 的行。
 path_is_plan() {         # $1=path
   local pat; set -f
   for pat in ${REVIEW_PLAN_PATHS} ${REVIEW_RULE_PATHS}; do
     # shellcheck disable=SC2254
     case "$1" in ${pat}) set +f; return 0;; esac
   done
-  set +f; return 1
+  set +f
+  [ "$(map_level "$1")" = plan ]
 }
 
-# ---- 风险图：`模式  等级  # 理由`，等级 deep/review/light/plan/skip。最长匹配的模式生效。----
+# ---- 风险图：`模式  等级  # 理由`，等级 deep/review/light/plan/skip。----
+# 模式：`**` 可跨目录，`*` 不跨（src/jbgen/* 只是顶层文件，新子包不会被它盖住）。命中多条时最长的模式生效。
 map_file() { [ -n "${REVIEW_MAP}" ] && [ -f "${REPO}/${REVIEW_MAP}" ] && printf '%s' "${REPO}/${REVIEW_MAP}"; }
 
+map_pat_re() {           # $1=模式 → 正则（纯 bash，避开 sed 方言）
+  local p="$1" out="" c i
+  for ((i = 0; i < ${#p}; i++)); do
+    c="${p:i:1}"
+    case "${c}" in
+      '*') if [ "${p:i+1:1}" = '*' ]; then out+='.*'; i=$((i + 1)); else out+='[^/]*'; fi;;
+      '.'|'^'|'$'|'+'|'?'|'('|')'|'{'|'}'|'|'|'['|']'|'\\') out+="\\${c}";;
+      *) out+="${c}";;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
 map_level() {            # $1=path → 等级；没匹配到输出 unknown；没有图输出 nomap
-  local f pat lvl best="" best_len=0
+  local f pat lvl re best="" best_len=0
   f=$(map_file) || { echo nomap; return; }
-  set -f
   while read -r pat lvl _; do
     case "${pat}" in ''|'#'*) continue;; esac
-    # shellcheck disable=SC2254
-    case "$1" in ${pat}) [ "${#pat}" -gt "${best_len}" ] && { best="${lvl}"; best_len=${#pat}; };; esac
+    re=$(map_pat_re "${pat}")
+    [[ "$1" =~ ^${re}$ ]] && [ "${#pat}" -gt "${best_len}" ] && { best="${lvl}"; best_len=${#pat}; }
   done < "${f}"
-  set +f
   echo "${best:-unknown}"
 }
 
@@ -473,17 +487,32 @@ last_target() {          # $1=code|plan → 完整 sha，或空
   done < <(awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' "${ARCHIVE_DIR}/timing.md")
 }
 
+# 范围内的改动文件 = 范围内每个提交各自改的文件之并集，但跳过人用 SKIP_REVIEW 放过的提交（记在 skipped.md）：
+# 人的跳过是终审，不是推后，那些文件不该再把范围推给评审方。
 range_files() {          # $1=base(可空) $2=head → 改动文件列表
-  if [ -n "$1" ]; then git diff --name-only "$1" "$2"; else git diff-tree --root --no-commit-id --name-only -r "$2"; fi
+  local c skipped
+  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ')
+  for c in $(git rev-list ${1:+"$1.."}"$2"); do
+    case " ${skipped} " in *" $(git rev-parse --short "${c}") "*) continue;; esac
+    if git rev-parse -q --verify "${c}^" >/dev/null 2>&1; then git diff --name-only "${c}^" "${c}"; else git diff-tree --root --no-commit-id --name-only -r "${c}"; fi
+  done | sort -u
 }
 
-# ---- 简报过期门：评审方每轮都读 brief，brief 过期评审就建立在错的地图上。----
-# verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、或基线不在 HEAD 历史里，就停下让写手先重写。
-# 这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
+# ---- 简报门：评审方每轮都读 brief，没有 brief 它只能从零爬仓库，brief 过期评审就建立在错的地图上。----
+# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、改过风险图 deep 路径、或基线不在 HEAD 历史里，
+# 都停下让写手先写/重写。这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
+# 新仓库接入靠的就是这道门：herdsman-init 之后写手第一次跑就被要求写简报。
 brief_gate() {
   local v n f deep_hit
-  [ -n "${REVIEW_BRIEF}" ] && [ -f "${REPO}/${REVIEW_BRIEF}" ] || return 0
+  [ -n "${REVIEW_BRIEF}" ] || return 0
   git diff-tree --no-commit-id --name-only -r HEAD | grep -qx "${REVIEW_BRIEF}" && return 0
+  if [ ! -f "${REPO}/${REVIEW_BRIEF}" ]; then
+    echo "STOP: 还没有 ${REVIEW_BRIEF}，评审方没有项目简报无法有效评审或 triage。"
+    echo "      先生成简报：用 ${HOME}/.config/review/brief-prompt.md 的提示词生成 ${REVIEW_BRIEF}，"
+    echo "      第一行 verified at 写当前 HEAD；单独提交（不混其他文件）后再运行 request-review，"
+    echo "      它会作为 kind: plan 送审，评审方核对简报与代码是否相符。"
+    exit 7
+  fi
   v=$(sed -n '1s/.*verified at:[[:space:]]*\([0-9a-f]\{7,40\}\).*/\1/p' "${REPO}/${REVIEW_BRIEF}")
   if [ -z "${v}" ]; then
     echo "STOP: ${REVIEW_BRIEF} 第一行没有 \`<!-- verified at: <sha> -->\`，无法判断新旧。"
@@ -535,7 +564,7 @@ triage_print_review() {  # $1=理由 $2=kind $3=base $4=level
 }
 
 triage_head() {
-  local head files f plan_hits text_only verdict reason pane saved level
+  local head files f plan_hits verdict reason pane saved level
   local code_base plan_base ncommits nlines prev_sha prev_verdict prev_base new_text
   head=$(git rev-parse HEAD)
   git diff --quiet && git diff --cached --quiet \
@@ -562,14 +591,18 @@ triage_head() {
   done < <(range_files "${plan_base}" "${head}")
   [ -z "${plan_hits}" ] || triage_conclude "${head}" REVIEW 脚本 "触及计划/规则文档（自 ${plan_base:0:7} 起）：${plan_hits}" plan "${plan_base}" review
 
-  # 2. 代码范围：自上次 code 评审起
-  files=$(range_files "${code_base}" "${head}")
-  text_only=1
+  # 2. 代码范围：自上次 code 评审起。纯文本文件默认是状态记录、不参与判定，除非风险图明确把它标为 deep 或 review
+  #    （README 之类出过阻断的文档）；light / skip / 图上没有的文本一律不算。
+  files=""
   while IFS= read -r f; do
     [ -n "${f}" ] || continue
-    case "${f}" in *.md|*.markdown|*.rst|*.txt) ;; *) text_only=0;; esac
-  done <<< "${files}"
-  [ "${text_only}" -eq 0 ] || triage_conclude "${head}" SKIP 纯文本 "自 ${code_base:0:7} 起只改了 .md/.rst/.txt，视为状态记录"
+    case "${f}" in
+      *.md|*.markdown|*.rst|*.txt)
+        case "$(map_level "${f}")" in deep|review) files="${files}${f}"$'\n';; esac;;
+      *) files="${files}${f}"$'\n';;
+    esac
+  done < <(range_files "${code_base}" "${head}")
+  [ -n "${files}" ] || triage_conclude "${head}" SKIP 纯文本 "自 ${code_base:0:7} 起只改了 .md/.rst/.txt（风险图未要求审），视为状态记录"
 
   # 3. 风险图能定的直接定：全 skip → SKIP；有等级 → REVIEW 带等级；有没在图上的路径 → 往下问评审方
   level=$(printf '%s\n' "${files}" | files_level)
@@ -587,8 +620,11 @@ triage_head() {
       new_text=1
       while IFS= read -r f; do
         [ -n "${f}" ] || continue
-        case "${f}" in *.md|*.markdown|*.rst|*.txt) ;; *) new_text=0;; esac
-      done < <(git diff --name-only "${prev_sha}" "${head}")
+        case "${f}" in
+          *.md|*.markdown|*.rst|*.txt) case "$(map_level "${f}")" in deep|review) new_text=0;; esac;;
+          *) new_text=0;;
+        esac
+      done < <(range_files "${prev_sha}" "${head}")
       [ "${new_text}" -eq 0 ] || triage_conclude "${head}" SKIP 沿用 "自 ${prev_sha:0:7} 起只新增纯文本提交，沿用上次 SKIP" code "${code_base}"
     fi
   fi
