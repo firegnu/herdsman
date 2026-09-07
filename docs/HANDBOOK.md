@@ -81,7 +81,7 @@
         跑 request-review。有针对 HEAD 的 request.md 就是明确的评审请求，不再 triage
 
 ⑤ 脚本：简报过期门 → 检查工作区干净 → 读 round → 校验 kind、level、base sha 是 HEAD 祖先
-        （配了计划/规则路径则 round 1 逐提交校验：每个提交只碰一种产物，target 提交种类 = kind）
+        （配了计划/规则路径则 round 1 校验 target 提交：只碰一种产物，种类 = kind；范围里的历史提交只是上下文）
         → 归档上一周期并清空交接目录
         按 cwd 找评审方（没有就建 pane 起一个）
         把 review worktree reset --hard 到 target sha
@@ -1002,21 +1002,19 @@ case "${level}" in
   *) echo "ERROR: ${REQ} 的 level 只能是 deep、review 或 light，现在是 ${level}"; exit 2;;
 esac
 
-# 配了计划/规则路径时，round 1 逐提交校验：范围里每个提交要么只碰计划/规则文档，要么完全不碰；
-# target 提交的种类必须等于 request 的 kind。另一种的提交可以在范围里，那是已在自己周期里审过的上下文。
-# （round 2+ 范围已冻结，不再校验。）
+# 配了计划/规则路径时，round 1 校验 target 提交：只碰一种产物，且种类等于 request 的 kind。
+# 范围里更早的提交不再逐个验 —— 它们是历史（各自成为 target 时已经验过，或按当时的规则处理过），
+# 在这次评审里只是上下文。（round 2+ 范围已冻结，不再校验。）
 if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}${REVIEW_RULE_PATHS}" ]; then
-  for c in $(git rev-list --reverse "${base}..HEAD"); do
-    plan_hits=""; other_hits=""
-    while IFS= read -r f; do
-      [ -n "${f}" ] || continue
-      if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
-    done < <(git diff --name-only "${c}^" "${c}" 2>/dev/null || git diff-tree --root --no-commit-id --name-only -r "${c}")
-    if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
-      echo "ERROR: 提交 $(git rev-parse --short "${c}") 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
-      printf '%s' "${plan_hits}${other_hits}"; exit 2
-    fi
-  done
+  plan_hits=""; other_hits=""
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
+  done < <(git diff --name-only HEAD^ HEAD 2>/dev/null || git diff-tree --root --no-commit-id --name-only -r HEAD)
+  if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
+    echo "ERROR: target 提交 $(git rev-parse --short HEAD) 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
+    printf '%s' "${plan_hits}${other_hits}"; exit 2
+  fi
   target_kind=$(commit_kind HEAD)
   if [ "${kind}" != "${target_kind}" ]; then
     echo "ERROR: request 的 kind 是 ${kind}，但 target 提交 $(git rev-parse --short HEAD) 按文件判是 ${target_kind}。kind 跟着 target 提交走。"; exit 2
@@ -1419,8 +1417,7 @@ Required sections:
 之类——单独 commit，不得与 code 或 plan 同一 commit；纯文本的会被脚本直接跳过。
 一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
 `base sha` 用 request-review 输出里给的那个（上次评审的 target）；脚本会校验它是 HEAD 的祖先，
-还会逐个提交校验 base..HEAD 里每个提交都只碰一种产物、target 提交的种类等于 kind，不符则 exit 2。
-范围里另一种产物的提交是已在自己周期里审过的上下文，允许存在。
+还会校验 target 提交只碰一种产物、种类等于 kind，不符则 exit 2。范围里更早的提交是上下文，不再验。
 
 ### 评审周期（triage 判 REVIEW 或人要求评审之后）
 1. 提交产物（工作区必须干净）

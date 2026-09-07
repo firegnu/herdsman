@@ -689,21 +689,19 @@ case "${level}" in
   *) echo "ERROR: ${REQ} 的 level 只能是 deep、review 或 light，现在是 ${level}"; exit 2;;
 esac
 
-# 配了计划/规则路径时，round 1 逐提交校验：范围里每个提交要么只碰计划/规则文档，要么完全不碰；
-# target 提交的种类必须等于 request 的 kind。另一种的提交可以在范围里，那是已在自己周期里审过的上下文。
-# （round 2+ 范围已冻结，不再校验。）
+# 配了计划/规则路径时，round 1 校验 target 提交：只碰一种产物，且种类等于 request 的 kind。
+# 范围里更早的提交不再逐个验 —— 它们是历史（各自成为 target 时已经验过，或按当时的规则处理过），
+# 在这次评审里只是上下文。（round 2+ 范围已冻结，不再校验。）
 if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}${REVIEW_RULE_PATHS}" ]; then
-  for c in $(git rev-list --reverse "${base}..HEAD"); do
-    plan_hits=""; other_hits=""
-    while IFS= read -r f; do
-      [ -n "${f}" ] || continue
-      if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
-    done < <(git diff --name-only "${c}^" "${c}" 2>/dev/null || git diff-tree --root --no-commit-id --name-only -r "${c}")
-    if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
-      echo "ERROR: 提交 $(git rev-parse --short "${c}") 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
-      printf '%s' "${plan_hits}${other_hits}"; exit 2
-    fi
-  done
+  plan_hits=""; other_hits=""
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
+  done < <(git diff --name-only HEAD^ HEAD 2>/dev/null || git diff-tree --root --no-commit-id --name-only -r HEAD)
+  if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
+    echo "ERROR: target 提交 $(git rev-parse --short HEAD) 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
+    printf '%s' "${plan_hits}${other_hits}"; exit 2
+  fi
   target_kind=$(commit_kind HEAD)
   if [ "${kind}" != "${target_kind}" ]; then
     echo "ERROR: request 的 kind 是 ${kind}，但 target 提交 $(git rev-parse --short HEAD) 按文件判是 ${target_kind}。kind 跟着 target 提交走。"; exit 2

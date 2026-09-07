@@ -674,15 +674,30 @@ grep -q '^kind: plan' "${TMP}/stdout" || fail 'plan range kind'
 grep -q "^base sha: ${P}" "${TMP}/stdout" || fail 'plan range base is the last plan review'
 echo 'PASS plan paths accumulate from the last plan review'
 
-# Round 1 checks each commit in the range for purity and the target commit for kind.
+# Round 1 checks the target commit for purity and kind; older commits in the range are history.
 rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md" "${REVIEW_DIR}"/.r*.sent
 B=$(git -C "${REPO}" rev-parse HEAD)
 commit_file src/core/c2.py 'code after plan'
-write_request code "${P}" 1/3            # range P..HEAD = plan commit + code commit, each pure → ok
+write_request code "${P}" 1/3            # range P..HEAD = plan commit + code commit → ok
 run_review new
 assert_eq "${RUN_STATUS}" 3 'pure mixed-range status'
 grep -q '^Level: deep' "${MOCK_LOG}" || fail 'review prompt lacks the derived level'
 rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+# A mixed commit earlier in the range does not block; the same mix as the target does.
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+printf 'p\n' >> "${REPO}/docs/plans/q.md"; printf 'r\n' >> "${REPO}/README.md"
+git -C "${REPO}" add docs/plans/q.md README.md; git -C "${REPO}" commit -qm 'historical mixed status commit'
+commit_file src/core/c3.py 'code after mixed history'
+write_request code "${P}" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 3 'mixed history in range status'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+printf 'p2\n' >> "${REPO}/docs/plans/q.md"; printf 'x\n' > "${REPO}/src/core/c4.py"
+git -C "${REPO}" add docs/plans/q.md src/core/c4.py; git -C "${REPO}" commit -qm 'mixed target'
+write_request code "${P}" 1/3
+run_review none
+assert_rejected 'mixed target commit' 'target 提交'
+git -C "${REPO}" reset -q --hard HEAD~1
 write_request plan "${P}" 1/2
 run_review none
 assert_rejected 'kind vs target' 'kind 跟着 target 提交走'
