@@ -256,6 +256,7 @@ def project_state(repo, conf):
 
     latest = max([mtime(f"{d}/{f}") or 0 for f in os.listdir(d)] or [0]) if os.path.isdir(d) else 0
     p["last_activity"] = latest
+    p["accum"] = since_last_review(repo, conf)
     if explicit:
         pend = pending_decisions(prev)
         if this and this["sent"]:
@@ -342,6 +343,42 @@ def load_archives(repo):
                     "secs": timing.get(sha, 0), "deferred": deferred, "ending": ending,
                     "artifact": req.get("artifact", ""), "text": text})
     return out
+
+
+def path_is_plan(path, patterns):
+    import fnmatch
+    return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+
+
+def since_last_review(repo, conf):
+    """观察用：上次 code 评审的 target 到 HEAD 之间积了多少提交，其中多少被 SKIP、多少走了 plan 评审、
+    多少根本没经过路由。只读 timing.md / self-closed.md / git，不改任何机制。"""
+    plan_pats = (conf.get("REVIEW_PLAN_PATHS") or "").split()
+    rows = [l for l in (read(f"{repo}/docs/reviews/timing.md") or "").splitlines() if re.match(r'\S+ \| \w+ \|', l)]
+    def row_kind(sha):
+        cols = [c.strip() for c in l.split("|")]
+        if len(cols) >= 5 and cols[4] in ("code", "plan"):
+            return cols[4]
+        files = git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split()
+        return "plan" if files and all(path_is_plan(f, plan_pats) for f in files) else "code"
+    base = None
+    plan_targets = set()
+    for l in reversed(rows):
+        sha = [c.strip() for c in l.split("|")][1]
+        k = row_kind(sha)
+        if k == "plan":
+            plan_targets.add(sha[:7]); continue
+        if subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True).returncode == 0:
+            base = sha; break
+    if not base:
+        return None
+    commits = [c for c in git(repo, "rev-list", f"{base}..HEAD").split() if c]
+    if not commits:
+        return {"base": base, "n": 0, "skipped": 0, "plan": 0, "unrouted": 0}
+    closed = read(f"{repo}/docs/reviews/self-closed.md") or ""
+    skipped = sum(1 for c in commits if c[:7] in closed)
+    plan = sum(1 for c in commits if c[:7] in plan_targets)
+    return {"base": base, "n": len(commits), "skipped": skipped, "plan": plan, "unrouted": len(commits) - skipped - plan}
 
 
 def load_self_closed(repo):
@@ -452,6 +489,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#5f5e5a;font-size:12.5px}
 .idle{padding:28px 0;color:#8a8883}
+.accum{font-size:12px;margin-top:8px}.accum.warn{color:#8a4b08}.accum b{font-weight:700}
 .cycle{margin-top:20px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px 14px 20px;border-left:4px solid #c9c7c1}
 .cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
 .cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
@@ -774,6 +812,19 @@ def render_panel(p, archives, self_closed):
     rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
     parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
+    acc = p.get("accum")
+    if acc is None:
+        parts.append('<div class="accum mute">尚无已完成的代码评审，无法计算累积</div>')
+    else:
+        bits = [f'上次代码评审 <code>{esc(acc["base"][:7])}</code> 以来 <b>{acc["n"]}</b> 个提交']
+        if acc["n"]:
+            bits.append(f'{acc["skipped"]} 个 SKIP')
+            if acc["plan"]:
+                bits.append(f'{acc["plan"]} 个走了计划评审')
+            if acc["unrouted"]:
+                bits.append(f'<b>{acc["unrouted"]} 个未经路由</b>')
+        cls = "accum warn" if acc["n"] and not p["waiting"] and not p["needs_me"] else "accum mute"
+        parts.append(f'<div class="{cls}">' + " · ".join(bits) + '</div>')
     if p.get("triage_reason"):
         parts.append(f'<div class="idle" style="padding:14px 0">{esc(p["triage_reason"])}</div>')
     stale = bool(p["rounds"]) and p["closed"] and not p["waiting"]

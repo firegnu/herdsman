@@ -260,7 +260,9 @@ rubric 放仓库外还有个用意：写手读不到（虽然有 shell 就能 ca
 - **顶部横幅**：跨项目列出等你的事 —— 待裁决的 reject / blocking defer，点一条落到那行 finding。没有时一行灰字。
 - **左栏**：所有配了 `.review.conf` 的项目，各带状态与停留时长；状态标签按"谁在等"配色：红 = 等你，
   蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等；等你的排最前。
-- **右栏**：选中项目的当前周期（标题是 target 提交的 commit 标题，plan 再带文档标题；然后是写手交的
+- **右栏**：项目头下一行是观察量"上次代码评审以来 N 个提交 · 多少个 SKIP · 多少个未经路由"（从
+  timing.md、self-closed.md 和 git 算，不改机制；路由现在只看 HEAD 一个提交，这行用来看累积到底发生不发生）；
+  然后是选中项目的当前周期（标题是 target 提交的 commit 标题，plan 再带文档标题；然后是写手交的
   artifact / checks、折叠的自述、diff stat 与折叠的完整 diff）、
   每轮一张 finding 表（编号、严重度与第 2 轮起的状态、评审方 claim 与 evidence、写手回应、裁决）、
   暂缓清单（历史归档里的 defer）、最近归档（可展开原文）、自闭合记录。页面把协议词翻成中文
@@ -1515,6 +1517,7 @@ def project_state(repo, conf):
 
     latest = max([mtime(f"{d}/{f}") or 0 for f in os.listdir(d)] or [0]) if os.path.isdir(d) else 0
     p["last_activity"] = latest
+    p["accum"] = since_last_review(repo, conf)
     if explicit:
         pend = pending_decisions(prev)
         if this and this["sent"]:
@@ -1601,6 +1604,42 @@ def load_archives(repo):
                     "secs": timing.get(sha, 0), "deferred": deferred, "ending": ending,
                     "artifact": req.get("artifact", ""), "text": text})
     return out
+
+
+def path_is_plan(path, patterns):
+    import fnmatch
+    return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+
+
+def since_last_review(repo, conf):
+    """观察用：上次 code 评审的 target 到 HEAD 之间积了多少提交，其中多少被 SKIP、多少走了 plan 评审、
+    多少根本没经过路由。只读 timing.md / self-closed.md / git，不改任何机制。"""
+    plan_pats = (conf.get("REVIEW_PLAN_PATHS") or "").split()
+    rows = [l for l in (read(f"{repo}/docs/reviews/timing.md") or "").splitlines() if re.match(r'\S+ \| \w+ \|', l)]
+    def row_kind(sha):
+        cols = [c.strip() for c in l.split("|")]
+        if len(cols) >= 5 and cols[4] in ("code", "plan"):
+            return cols[4]
+        files = git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split()
+        return "plan" if files and all(path_is_plan(f, plan_pats) for f in files) else "code"
+    base = None
+    plan_targets = set()
+    for l in reversed(rows):
+        sha = [c.strip() for c in l.split("|")][1]
+        k = row_kind(sha)
+        if k == "plan":
+            plan_targets.add(sha[:7]); continue
+        if subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True).returncode == 0:
+            base = sha; break
+    if not base:
+        return None
+    commits = [c for c in git(repo, "rev-list", f"{base}..HEAD").split() if c]
+    if not commits:
+        return {"base": base, "n": 0, "skipped": 0, "plan": 0, "unrouted": 0}
+    closed = read(f"{repo}/docs/reviews/self-closed.md") or ""
+    skipped = sum(1 for c in commits if c[:7] in closed)
+    plan = sum(1 for c in commits if c[:7] in plan_targets)
+    return {"base": base, "n": len(commits), "skipped": skipped, "plan": plan, "unrouted": len(commits) - skipped - plan}
 
 
 def load_self_closed(repo):
@@ -1711,6 +1750,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#5f5e5a;font-size:12.5px}
 .idle{padding:28px 0;color:#8a8883}
+.accum{font-size:12px;margin-top:8px}.accum.warn{color:#8a4b08}.accum b{font-weight:700}
 .cycle{margin-top:20px;border:1px solid #e3e1dc;background:#fff;padding:14px 18px 14px 20px;border-left:4px solid #c9c7c1}
 .cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
 .cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
@@ -2033,6 +2073,19 @@ def render_panel(p, archives, self_closed):
     rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
     parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
+    acc = p.get("accum")
+    if acc is None:
+        parts.append('<div class="accum mute">尚无已完成的代码评审，无法计算累积</div>')
+    else:
+        bits = [f'上次代码评审 <code>{esc(acc["base"][:7])}</code> 以来 <b>{acc["n"]}</b> 个提交']
+        if acc["n"]:
+            bits.append(f'{acc["skipped"]} 个 SKIP')
+            if acc["plan"]:
+                bits.append(f'{acc["plan"]} 个走了计划评审')
+            if acc["unrouted"]:
+                bits.append(f'<b>{acc["unrouted"]} 个未经路由</b>')
+        cls = "accum warn" if acc["n"] and not p["waiting"] and not p["needs_me"] else "accum mute"
+        parts.append(f'<div class="{cls}">' + " · ".join(bits) + '</div>')
     if p.get("triage_reason"):
         parts.append(f'<div class="idle" style="padding:14px 0">{esc(p["triage_reason"])}</div>')
     stale = bool(p["rounds"]) and p["closed"] and not p["waiting"]

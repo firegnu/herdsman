@@ -78,6 +78,9 @@ cp "$D/request.md" "$D/.cycle-request.md"
 printf '%s\n%s\ndelta-pane\n' "$((now - 600))" "$H" > "$D/.r1.sent"
 printf 'F1 | nit\nclaim:    命名\nevidence: a.py:1\n\nREVIEW-COMPLETE\n' > "$D/r1-findings.md"
 printf 'F1 defer — 以后\n' > "$D/r1-responses.md"
+# delta 还有一次更早的 code 评审（target = HEAD~1）：HEAD 之后没路由 → 累积 1 个、1 个未经路由
+mkdir -p "${TMP}/delta/repo/docs/reviews"
+printf '2026-09-01 | %s | round 1/3 | 60s\n' "$(git -C "${TMP}/delta/repo" rev-parse --short HEAD~1)" > "${TMP}/delta/repo/docs/reviews/timing.md"
 
 # gamma：没有 request，.triage.sent 指向 HEAD 且 triage.md 未完成 → triage 中；另有一份归档和自闭合记录
 H=$(git -C "${TMP}/gamma/repo" rev-parse HEAD)
@@ -163,6 +166,8 @@ has '回应 ' 'round timing shown'
 # delta：闭合未归档 → 折叠成一行摘要
 has '<details class="prev"><summary>' 'closed cycle collapsed'
 has '1 轮</span><span>1 暂缓</span>' 'collapsed summary counts'
+has '以来 <b>1</b> 个提交 · 0 个 SKIP · <b>1 个未经路由</b>' 'accumulation counter'
+has '尚无已完成的代码评审' 'no-review accumulation note'
 lacks 'class="cycle stale"' 'old stale styling gone'
 
 # request 字段与 diff
