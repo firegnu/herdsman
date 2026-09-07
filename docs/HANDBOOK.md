@@ -66,7 +66,7 @@
         每个 commit 后跑 request-review，不自己判断要不要审
 
 ③' 脚本路由，看的是「上次评审以来」这一整段，不是最新一个提交：
-            简报缺失或过期（verified-at 之后 >50 提交 / 改过 deep 路径）→ exit 7，写手先写/重写简报（单独提交，自动走 plan 评审）
+            简报缺失或过期（verified-at 之后 >50 提交）→ exit 7，写手先写/重写简报（单独提交，自动走 plan 评审）
             自上次 plan 评审起碰了 REVIEW_PLAN_PATHS 或规则文件（AGENTS.md / CLAUDE.md / brief / .review-map）→ REVIEW（kind: plan），exit 6
             范围 = 这段里未被人 SKIP_REVIEW 的提交各自改的文件
             自上次 code 评审起只改 .md/.rst/.txt（且图上没把它们标为 deep/review）→ SKIP，记 self-closed.md，exit 0
@@ -809,7 +809,7 @@ last_target() {          # $1=code|plan → 完整 sha，或空
 # 人的跳过是终审，不是推后，那些文件不该再把范围推给评审方。
 range_files() {          # $1=base(可空) $2=head → 改动文件列表
   local c skipped
-  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ')
+  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ' | tr '\n' ' ')
   for c in $(git rev-list ${1:+"$1.."}"$2"); do
     case " ${skipped} " in *" $(git rev-parse --short "${c}") "*) continue;; esac
     if git rev-parse -q --verify "${c}^" >/dev/null 2>&1; then git diff --name-only "${c}^" "${c}"; else git diff-tree --root --no-commit-id --name-only -r "${c}"; fi
@@ -817,11 +817,11 @@ range_files() {          # $1=base(可空) $2=head → 改动文件列表
 }
 
 # ---- 简报门：评审方每轮都读 brief，没有 brief 它只能从零爬仓库，brief 过期评审就建立在错的地图上。----
-# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、改过风险图 deep 路径、或基线不在 HEAD 历史里，
+# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、或基线不在 HEAD 历史里，
 # 都停下让写手先写/重写。这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
 # 新仓库接入靠的就是这道门：herdsman-init 之后写手第一次跑就被要求写简报。
 brief_gate() {
-  local v n f deep_hit
+  local v n
   [ -n "${REVIEW_BRIEF}" ] || return 0
   git diff-tree --no-commit-id --name-only -r HEAD | grep -qx "${REVIEW_BRIEF}" && return 0
   if [ ! -f "${REPO}/${REVIEW_BRIEF}" ]; then
@@ -838,18 +838,10 @@ brief_gate() {
     echo "STOP: ${REVIEW_BRIEF} 的基线 ${v:0:7} 不在 HEAD 的历史里，简报无法核实。"
   else
     n=$(git rev-list --count "${v}..HEAD")
-    if [ "${n}" -gt "${REVIEW_BRIEF_MAX_COMMITS}" ]; then
-      echo "STOP: ${REVIEW_BRIEF} 自 ${v:0:7} 起已累计 ${n} 个提交（上限 ${REVIEW_BRIEF_MAX_COMMITS}），简报过期。"
-    else
-      # 风险图上 deep 的路径在基线之后改过：核心变了，简报描述的核心路径和不变量可能已不对
-      deep_hit=""
-      while IFS= read -r f; do
-        [ -n "${f}" ] || continue
-        [ "$(map_level "${f}")" = deep ] && { deep_hit="${f}"; break; }
-      done < <(git diff --name-only "${v}" HEAD)
-      [ -n "${deep_hit}" ] || return 0
-      echo "STOP: ${REVIEW_BRIEF} 基线 ${v:0:7} 之后改过风险图上的 deep 路径（如 ${deep_hit}），简报过期。"
-    fi
+    # 只按提交数判过期。"deep 路径改过就过期"试过：每次改核心代码都会先被要求重写简报，不可行；
+    # 简报是否还描述得对核心路径，由评审方在 deep 评审里判断（rubric 读序第 2 条）。
+    [ "${n}" -le "${REVIEW_BRIEF_MAX_COMMITS}" ] && return 0
+    echo "STOP: ${REVIEW_BRIEF} 自 ${v:0:7} 起已累计 ${n} 个提交（上限 ${REVIEW_BRIEF_MAX_COMMITS}），简报过期。"
   fi
   echo "      先重写简报：用 ${HOME}/.config/review/brief-prompt.md 的提示词重写 ${REVIEW_BRIEF}，"
   echo "      第一行 verified at 写当前 HEAD；单独提交（不混其他文件）后再运行 request-review，"
@@ -2693,7 +2685,7 @@ lint/typecheck 等确定性检查命令。若全量测试当前无法通过，�
 
 - **缺失和过期都由脚本判**。没有简报的仓库第一次跑 `request-review` 就 exit 7 要求写一份 —— 新仓库接入靠的就是这道门。
   有简报时看第一行的 verified-at：之后累计超过
-  `REVIEW_BRIEF_MAX_COMMITS`（默认 50）个提交、或改过风险图上 deep 的路径、或该 sha 不在 HEAD 历史里，就 exit 7 停下，输出里写明
+  `REVIEW_BRIEF_MAX_COMMITS`（默认 50）个提交，或该 sha 不在 HEAD 历史里，就 exit 7 停下，输出里写明
   怎么重写。写手用 `~/.config/review/brief-prompt.md` 的提示词重写、verified-at 写当前 HEAD、单独提交。
 - **重写由评审方核对**。简报是规则文件（`REVIEW_RULE_PATHS`），那个提交自动路由为 kind: plan 评审，rubric
   里"For the reviewer brief"一段规定核对什么：verified-at 是否为 target 的父提交、核心路径是否真实且与
@@ -2827,7 +2819,7 @@ lint/typecheck 等确定性检查命令。若全量测试当前无法通过，�
 | `REVIEW: …` 后跟 `level: deep` | 风险图判为深审 | 写手照抄进 request，评审方会跑测试、三轮；正常 |
 | `NOTE: 风险图升级 X → deep` | 本轮在 X 上报出阻断 | 脚本已把 X 追加进 .review-map，写手随下次提交带上；不用管 |
 | 看板"风险图有 N 条建议" | 证据说某路径可以降级，或有新目录不在图上 | 你看理由，同意就改 .review-map 那一行提交；不同意不理 |
-| `exit 7` / `STOP: 还没有 … 简报` 或 `… 简报过期` | 没有 brief；或 verified-at 之后超过 50 个提交、改过 deep 路径、基线不在 HEAD 历史里 | 写手按输出写/重写 brief 单独提交，自动走 plan 评审；正常 |
+| `exit 7` / `STOP: 还没有 … 简报` 或 `… 简报过期` | 没有 brief；或 verified-at 之后超过 50 个提交、基线不在 HEAD 历史里 | 写手按输出写/重写 brief 单独提交，自动走 plan 评审；正常 |
 | `ERROR: kind: code 的 request 混入了计划/规则文档` | 代码和 AGENTS.md / CLAUDE.md / reviewer-brief.md 同一个 commit | 拆开，规则文件单独提交走 plan 评审 |
 | `STOP: triage 文件第一行不是 REVIEW 或 SKIP` | 评审方没按格式写 | 看 triage.md，手动改成 REVIEW/SKIP 后重跑，或删掉重发 |
 | 想跳过 triage 直接审 | — | 写 request.md（target sha = HEAD）再运行即可 |

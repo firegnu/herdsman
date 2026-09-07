@@ -491,7 +491,7 @@ last_target() {          # $1=code|plan → 完整 sha，或空
 # 人的跳过是终审，不是推后，那些文件不该再把范围推给评审方。
 range_files() {          # $1=base(可空) $2=head → 改动文件列表
   local c skipped
-  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ')
+  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ' | tr '\n' ' ')
   for c in $(git rev-list ${1:+"$1.."}"$2"); do
     case " ${skipped} " in *" $(git rev-parse --short "${c}") "*) continue;; esac
     if git rev-parse -q --verify "${c}^" >/dev/null 2>&1; then git diff --name-only "${c}^" "${c}"; else git diff-tree --root --no-commit-id --name-only -r "${c}"; fi
@@ -499,11 +499,11 @@ range_files() {          # $1=base(可空) $2=head → 改动文件列表
 }
 
 # ---- 简报门：评审方每轮都读 brief，没有 brief 它只能从零爬仓库，brief 过期评审就建立在错的地图上。----
-# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、改过风险图 deep 路径、或基线不在 HEAD 历史里，
+# 缺失、verified-at 之后超过 REVIEW_BRIEF_MAX_COMMITS 个提交、或基线不在 HEAD 历史里，
 # 都停下让写手先写/重写。这次提交本身改了 brief 时放行 —— 那正是重写提交，它按规则文件路由为 kind: plan 送审。
 # 新仓库接入靠的就是这道门：herdsman-init 之后写手第一次跑就被要求写简报。
 brief_gate() {
-  local v n f deep_hit
+  local v n
   [ -n "${REVIEW_BRIEF}" ] || return 0
   git diff-tree --no-commit-id --name-only -r HEAD | grep -qx "${REVIEW_BRIEF}" && return 0
   if [ ! -f "${REPO}/${REVIEW_BRIEF}" ]; then
@@ -520,18 +520,10 @@ brief_gate() {
     echo "STOP: ${REVIEW_BRIEF} 的基线 ${v:0:7} 不在 HEAD 的历史里，简报无法核实。"
   else
     n=$(git rev-list --count "${v}..HEAD")
-    if [ "${n}" -gt "${REVIEW_BRIEF_MAX_COMMITS}" ]; then
-      echo "STOP: ${REVIEW_BRIEF} 自 ${v:0:7} 起已累计 ${n} 个提交（上限 ${REVIEW_BRIEF_MAX_COMMITS}），简报过期。"
-    else
-      # 风险图上 deep 的路径在基线之后改过：核心变了，简报描述的核心路径和不变量可能已不对
-      deep_hit=""
-      while IFS= read -r f; do
-        [ -n "${f}" ] || continue
-        [ "$(map_level "${f}")" = deep ] && { deep_hit="${f}"; break; }
-      done < <(git diff --name-only "${v}" HEAD)
-      [ -n "${deep_hit}" ] || return 0
-      echo "STOP: ${REVIEW_BRIEF} 基线 ${v:0:7} 之后改过风险图上的 deep 路径（如 ${deep_hit}），简报过期。"
-    fi
+    # 只按提交数判过期。"deep 路径改过就过期"试过：每次改核心代码都会先被要求重写简报，不可行；
+    # 简报是否还描述得对核心路径，由评审方在 deep 评审里判断（rubric 读序第 2 条）。
+    [ "${n}" -le "${REVIEW_BRIEF_MAX_COMMITS}" ] && return 0
+    echo "STOP: ${REVIEW_BRIEF} 自 ${v:0:7} 起已累计 ${n} 个提交（上限 ${REVIEW_BRIEF_MAX_COMMITS}），简报过期。"
   fi
   echo "      先重写简报：用 ${HOME}/.config/review/brief-prompt.md 的提示词重写 ${REVIEW_BRIEF}，"
   echo "      第一行 verified at 写当前 HEAD；单独提交（不混其他文件）后再运行 request-review，"

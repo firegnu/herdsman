@@ -578,19 +578,6 @@ commit_file src/b5.py 'c5'
 run_review new
 assert_eq "${RUN_STATUS}" 7 'non-ancestor brief status'
 grep -q '不在 HEAD 的历史里' "${TMP}/stdout" || fail 'non-ancestor brief stdout'
-# A brief whose baseline predates a change to a deep path is stale even under the commit cap.
-grep -v '^REVIEW_BRIEF_MAX_COMMITS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
-printf 'src/deep/**  deep  # core\n' > "${REPO}/.review-map"
-printf '<!-- verified at: %s -->\n' "$(git -C "${REPO}" rev-parse HEAD)" > "${REPO}/docs/reviewer-brief.md"
-git -C "${REPO}" add .review-map docs/reviewer-brief.md; git -C "${REPO}" commit -qm 'brief fresh + map'
-commit_file src/deep/core.py 'core touched'
-run_review new
-assert_eq "${RUN_STATUS}" 7 'deep-path brief status'
-grep -q '改过风险图上的 deep 路径' "${TMP}/stdout" || fail 'deep-path brief stdout'
-git -C "${REPO}" rm -q .review-map; git -C "${REPO}" commit -qm 'drop map'
-# .review-map 是规则文件，这两次改它的提交当作已走过 plan 评审
-printf '2026-09-01 | %s | round 1/2 | 30s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
-printf 'REVIEW_BRIEF_MAX_COMMITS=2\n' >> "${REPO}/.review.conf"
 # REVIEW_BRIEF= disables the gate.
 printf 'REVIEW_BRIEF=\n' >> "${REPO}/.review.conf"
 run_review new
@@ -705,6 +692,8 @@ assert_eq "$(call_count '^agent ')" 0 'carry-over agent calls'
 # A commit the human skipped with SKIP_REVIEW stays out of the range: the next text-only commit is still a carry-over.
 commit_file src/other/h.py 'human-skipped'
 ( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new MOCK_REVIEW_WT="${REVIEW_WT}" SKIP_REVIEW=1 "${REQUEST_REVIEW}" "deploy" >/dev/null )
+commit_file src/other/h2.py 'human-skipped again'
+( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new MOCK_REVIEW_WT="${REVIEW_WT}" SKIP_REVIEW=1 "${REQUEST_REVIEW}" "deploy2" >/dev/null )
 commit_file docs/note2.md 'note2'
 run_review new
 assert_eq "${RUN_STATUS}" 0 'skipped commit excluded status'
@@ -713,16 +702,16 @@ grep -q '^SKIP: .*沿用' "${TMP}/stdout" || fail 'skipped commit not excluded f
 commit_file src/new/d.py 'd'
 run_review new
 assert_eq "${RUN_STATUS}" 3 'range triage status'
-grep -q "^Range: ${A}\.\..* (5 commits" "${MOCK_LOG}" || fail 'range prompt lacks the accumulated range'
-assert_eq "$(grep -c '^  [0-9a-f]\{7\} ' "${MOCK_LOG}")" 5 'range prompt commit list'
+grep -q "^Range: ${A}\.\..* (6 commits" "${MOCK_LOG}" || fail 'range prompt lacks the accumulated range'
+assert_eq "$(grep -c '^  [0-9a-f]\{7\} ' "${MOCK_LOG}")" 6 'range prompt commit list'
 grep -q '^Unmapped paths.*src/new/d.py' "${MOCK_LOG}" || fail 'unmapped list lacks d.py'
-grep -q '^Unmapped paths.*src/other/h.py' "${MOCK_LOG}" && fail 'human-skipped file leaked into the unmapped list'
+grep -q '^Unmapped paths.*src/other/h' "${MOCK_LOG}" && fail 'human-skipped file leaked into the unmapped list'
 # Past the accumulation cap the script reviews without asking.
 printf 'REVIEW_ACCUM_COMMITS=2\n' >> "${REPO}/.review.conf"
 rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md"
 run_review new
 assert_eq "${RUN_STATUS}" 6 'accumulation cap status'
-grep -q '^REVIEW: .*累积 5 个提交.*超过上限' "${TMP}/stdout" || fail 'accumulation cap stdout'
+grep -q '^REVIEW: .*累积 6 个提交.*超过上限' "${TMP}/stdout" || fail 'accumulation cap stdout'
 assert_eq "$(call_count '^agent ')" 0 'accumulation cap agent calls'
 grep -q "^base sha: ${A}" "${TMP}/stdout" || fail 'accumulation cap base is the last code review'
 grep -v '^REVIEW_ACCUM_COMMITS=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
