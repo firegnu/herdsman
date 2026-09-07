@@ -467,7 +467,12 @@ details.prev>summary{padding:12px 0;display:flex;gap:16px;align-items:baseline;f
 details.prev>summary .lab{font-size:12px;color:#8a8883}
 details.prev .cycle{border:0;background:transparent;padding:0 0 14px;margin-top:0}
 details.desc>summary,details.ev>summary{color:#8a8883;font-size:11.5px;display:flex;gap:6px;align-items:center}
-details.ev{margin-top:3px}details.ev>summary::before{content:"▸ ";font-size:10px}details[open].ev>summary::before{content:"▾ "}
+details.ev{margin-top:5px}details.ev>summary{display:flex;gap:8px;align-items:center;min-width:0}
+.evbtn{display:inline-block;border:1px solid #c9c7c1;border-radius:3px;padding:0 6px;line-height:17px;font-size:11px;color:#3a3936;background:#fff;flex:none}
+.evbtn::before{content:"▸ ";font-size:9px;color:#8a8883}details[open].ev .evbtn::before{content:"▾ "}
+details.ev>summary:hover .evbtn{background:#ecebe7}
+.evteaser{font-size:11px;color:#8a8883;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+details[open].ev .evteaser{display:none}
 details.bgrp{margin-top:10px}details.bgrp>summary.bhead{cursor:pointer}
 details.sc>summary{cursor:pointer}details.sc>summary h2{display:inline}
 .filter{margin:0 0 8px;font:12.5px inherit;padding:4px 8px;border:1px solid #d6d4ce;border-radius:2px;width:320px;background:#fff}
@@ -488,9 +493,11 @@ h2 .sub{font-weight:400;color:#8a8883;font-size:12px;margin-left:6px}
 .frow{display:grid;grid-template-columns:44px 96px minmax(0,2.1fr) minmax(0,1.6fr) minmax(0,1.2fr);border-top:1px solid #e3e1dc;background:#fff}
 .frow.pend{background:#fff6f8}
 .frow>div{padding:10px 8px}.frow>div:first-child{padding-left:0;font-weight:700}.frow>div:last-child{padding-right:0}
-.sev{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;border:1px solid #c9c7c1;color:#5f5e5a;background:#fff}
-.sev.blocking{border-color:#1c1c1a;color:#1c1c1a;font-weight:700}
-.sev.should{border-color:#1c1c1a;color:#1c1c1a}
+.sev{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;border:1px solid transparent;color:#5f5e5a;background:#ecebe7}
+.sev.blocking{color:#9a2a22;background:#fbecea;font-weight:700}
+.sev.should{color:#8a4b08;background:#fbe9d0}
+.sev.nit{color:#5f5e5a;background:#ecebe7}
+.fstat.ok{color:#2f6b3a}.fstat.bad{color:#9a2a22;font-weight:600}.fstat.wait{color:#8a4b08}
 .fstat{margin-top:4px;font-size:11.5px;color:#5f5e5a}
 .claim{text-wrap:pretty}.evid{display:block;margin-top:5px;font-size:11.5px;color:#5f5e5a;word-break:break-all}
 .verb{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;line-height:18px;border-radius:2px;margin-right:6px}
@@ -665,10 +672,15 @@ def render_round(p, rnd):
         resp, dec = r.get(fid), dcs.get(fid)
         anchor = f"f-{p['name']}-{fid}"
         pend = fid in pend_ids
-        sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat">{zh(v["status"])}</div>' if v.get("status") else "")
+        st = (v.get("status") or "").lower()
+        stc = {"resolved": "ok", "not-resolved": "bad", "regressed": "bad", "deferred": "wait"}.get(st, "")
+        sev_cell = sev_tag(v.get("sev", "")) + (f'<div class="fstat {stc}">{zh(v["status"])}</div>' if st else "")
         if v.get("claim"):
+            ev = v.get("evidence", "")
+            teaser = ev if len(ev) <= 60 else ev[:60] + "…"
             claim_cell = f'<div class="claim">{esc(v["claim"])}</div>' + (
-                f'<details class="ev"><summary>evidence</summary><code class="evid">{esc(v["evidence"])}</code></details>' if v.get("evidence") else "")
+                f'<details class="ev"><summary><span class="evbtn">evidence</span><code class="evteaser">{esc(teaser)}</code></summary>'
+                f'<code class="evid">{esc(ev)}</code></details>' if ev else "")
         else:  # 第 2 轮常只有 evidence（核实叙述），没有 claim：直接当正文
             claim_cell = f'<div class="claim">{esc(v.get("evidence", ""))}</div>'
         if resp:
@@ -706,7 +718,7 @@ def render_cycle(p):
            f'<span class="dim">{esc(p["cycle_note"])}</span>')
     sub = cycle_subject(p)
     title = ""
-    if sub["subject"]:
+    if sub["subject"] and not stale:   # 折叠的上一周期在 summary 行里已经有标题
         title = f'<div class="title">{esc(sub["subject"])}</div>'
         if sub["plan_title"]:
             title += f'<div class="subtitle">计划：{esc(sub["plan_title"])}</div>'

@@ -155,7 +155,7 @@ has '<span class="verb accept" title="accept">接受</span>' 'accept verb transl
 has 'class="verb reject"' 'reject verb'
 has 'class="verb defer"' 'defer verb'
 has '等你裁决' 'pending decision cell'
-has '<details class="ev"><summary>evidence</summary><code class="evid">docs/x.json:8' 'evidence folded'
+has '<span class="evbtn">evidence</span><code class="evteaser">docs/x.json:8</code>' 'evidence fold with teaser'
 has 'class="frow pend"' 'pending row tint'
 has '评审中，findings 尚未完成' 'unfinished round note'
 has '回应 ' 'round timing shown'
