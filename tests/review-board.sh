@@ -158,8 +158,8 @@ has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'b
 has 'href="#p-beta/repo"' 'stop item links to project'
 has '评审方 working' 'gamma working note'
 # 活动条：写手/评审方在干什么，来自 herdr agent list 的状态与标题，working 时再读 pane 最后那句
-has '<span class="dot working"></span>写手 working · Working (12m 03s)' 'alpha writer chip with activity'
-has '<span class="dot working"></span>评审方 working · Triage request · Reviewing diff… (3m 10s)' 'gamma reviewer chip with title and activity'
+has '<span class="dot st-working"></span>写手 working · Working (12m 03s)' 'alpha writer chip with activity'
+has '<span class="dot st-working"></span>评审方 working · Triage request · Reviewing diff… (3m 10s)' 'gamma reviewer chip with title and activity'
 # 「过程」一节折叠显示
 has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'

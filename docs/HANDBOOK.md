@@ -2185,7 +2185,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .agents{display:flex;flex-wrap:wrap;gap:6px 22px;padding:8px 0 0;font-size:12px;color:#a3a19b}
 .agents .agent{display:inline-flex;align-items:center;gap:6px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5a5955}
-.dot.working{background:#5fb36a}.dot.blocked{background:#e5533d}.dot.idle,.dot.done{background:#8b8985}
+.dot.st-working{background:#5fb36a}.dot.st-blocked{background:#e5533d}.dot.st-idle,.dot.st-done{background:#8b8985}
 details.proc{margin-top:8px}details.proc>summary{color:#8b8985;font-size:11.5px;display:flex;gap:6px;align-items:center;cursor:pointer}
 details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px solid #2e2e2e;border-radius:4px;font-size:12px;white-space:pre-wrap;color:#c9c7c1}
 .idle{padding:28px 0;color:#8b8985}
@@ -2527,7 +2527,7 @@ def render_panel(p, archives, self_closed):
             a = ag.get(role)
             if not a:
                 continue
-            bits = [f'<span class="dot {esc(a["status"])}"></span>{label} {esc(a["status"])}']
+            bits = [f'<span class="dot st-{esc(a["status"])}"></span>{label} {esc(a["status"])}']
             if a["title"]:
                 bits.append(esc(a["title"]))
             if a["activity"]:
