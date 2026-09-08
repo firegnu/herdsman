@@ -78,6 +78,8 @@ D="${TMP}/beta/review"
 printf 'artifact: a.py\nkind: code\nbase sha: %s\ntarget sha: %s\nround: 1/3\n' "$B" "$H" > "$D/request.md"
 cp "$D/request.md" "$D/.cycle-request.md"
 printf '%s\n%s\nbeta-pane\n' "$((now - 240))" "$H" > "$D/.r1.sent"
+printf '2 %s\n' "$((now - 120))" > "$D/.last"
+printf 'NOTE: something\nERROR: request 的 kind 是 plan，但脚本对这个 HEAD 的路由判定是 code。\n' > "$D/.last.out"
 
 # delta：round 1 已完成且写手已回应、无 accepted 改动 → 闭合未归档，页面上收成一行
 H=$(git -C "${TMP}/delta/repo" rev-parse HEAD); B=$(git -C "${TMP}/delta/repo" rev-parse HEAD~1)
@@ -159,6 +161,11 @@ has 'href="#p-beta/repo"' 'stop item links to project'
 # 活动条：写手/评审方在干什么，来自 herdr agent list 的状态与标题，working 时再读 pane 最后那句
 has '<span class="dot st-working"></span><b>写手</b><span class="st st-working">working</span><span class="act">Working (12m 03s)</span>' 'alpha writer chip with activity'
 has '<b>评审方</b><span class="st st-working">working</span><span class="ttl">Triage request</span><span class="act">Reviewing diff… (3m 10s)</span>' 'gamma reviewer chip with title and activity'
+# 写手上次停下的运行：退出码、多久前、ERROR 那行；exit 0/3 不显示
+has '<b>写手上次运行 exit 2</b>' 'last run shown'
+has 'ERROR: request 的 kind 是 plan' 'last run headline'
+# evidence 的 path:line 链到 zed
+has 'href="zed://file' 'evidence zed link'
 # 「过程」一节折叠显示
 has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'

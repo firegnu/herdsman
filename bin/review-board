@@ -306,6 +306,31 @@ def watch_reviewer(p, pane, expecting):
         p["cycle_note"] += "；评审方 working"
 
 
+EV_LOC_RE = re.compile(r'((?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+):(\d+)')
+
+
+def linkify(text, repo):
+    """evidence 里的 path:line 变成 zed://file/… 链接，点了直接到那一行。文本先转义，链接后拼。"""
+    out, pos = [], 0
+    for m in EV_LOC_RE.finditer(text or ""):
+        out.append(esc(text[pos:m.start()]))
+        out.append(f'<a class="loc" href="zed://file{esc(os.path.join(repo, m.group(1)))}:{m.group(2)}">{esc(m.group(0))}</a>')
+        pos = m.end()
+    out.append(esc((text or "")[pos:]))
+    return "".join(out)
+
+
+def last_run(d):
+    """写手上次运行 request-review 的结果：.last 是「退出码 时间」，.last.out 是全部输出。
+    只有停下的那几种退出码（2/4/5/7）值得显示；写手之后跑成功一次就自然消失。"""
+    raw = (read(f"{d}/.last") or "").split()
+    if len(raw) < 2 or raw[0] not in ("2", "4", "5", "7"):
+        return None
+    out = (read(f"{d}/.last.out") or "").strip()
+    head = next((l for l in out.splitlines() if l.startswith(("ERROR", "STOP"))), out.splitlines()[0] if out else "")
+    return {"code": raw[0], "ts": int(raw[1]), "head": head, "out": out}
+
+
 def project_state(repo, conf):
     d = conf["REVIEW_DIR"]
     head = git(repo, "rev-parse", "HEAD").strip()
@@ -365,6 +390,7 @@ def project_state(repo, conf):
             p["cycle_note"] = "已闭合；下面的 Round 是它的最终结果"
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
+    p["last_run"] = last_run(d)
     return p
 
 
@@ -607,6 +633,11 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .crew .ttl{color:#d6d3cc}.crew .act{color:#a3a19b}
 .crew .ttl::before,.crew .act::before{content:"·";color:#5a5955;margin-right:10px}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#5a5955;flex:none}
+details.lastrun{margin:10px 0 0;border:1px solid #7a2f26;background:#2b1a17;border-radius:4px;padding:8px 12px}
+details.lastrun>summary{display:flex;gap:12px;align-items:baseline;cursor:pointer;font-size:13.5px;color:#f0776a}
+details.lastrun .age{color:#a3a19b;font-size:12px}details.lastrun .msg{color:#e6e4df;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+details.lastrun pre{margin:8px 0 0;font-size:12px;white-space:pre-wrap;color:#c9c7c1}
+a.loc{color:#8fb8ee;text-decoration:none;border-bottom:1px dotted #4a6a95}a.loc:hover{border-bottom-style:solid}
 .dot.st-working{background:#5fb36a;box-shadow:0 0 0 3px rgba(95,179,106,.25)}.dot.st-blocked{background:#e5533d;box-shadow:0 0 0 3px rgba(229,83,61,.25)}.dot.st-idle,.dot.st-done{background:#8b8985}
 details.proc{margin-top:8px}details.proc>summary{color:#8b8985;font-size:11.5px;display:flex;gap:6px;align-items:center;cursor:pointer}
 details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px solid #2e2e2e;border-radius:4px;font-size:12px;white-space:pre-wrap;color:#c9c7c1}
@@ -848,9 +879,9 @@ def render_round(p, rnd):
             teaser = ev if len(ev) <= 60 else ev[:60] + "…"
             claim_cell = f'<div class="claim">{esc(v["claim"])}</div>' + (
                 f'<details class="ev"><summary><span class="evbtn">evidence</span><code class="evteaser">{esc(teaser)}</code></summary>'
-                f'<code class="evid">{esc(ev)}</code></details>' if ev else "")
+                f'<code class="evid">{linkify(ev, p["repo"])}</code></details>' if ev else "")
         else:  # 第 2 轮常只有 evidence（核实叙述），没有 claim：直接当正文
-            claim_cell = f'<div class="claim">{esc(v.get("evidence", ""))}</div>'
+            claim_cell = f'<div class="claim">{linkify(v.get("evidence", ""), p["repo"])}</div>'
         if resp:
             resp_cell = zh(resp[0], f"verb {resp[0]}") + f'<span class="claim">{esc(resp[1])}</span>'
         elif rnd["responses"] is None:
@@ -962,6 +993,11 @@ def render_panel(p, archives, self_closed):
                 bits.append(f'<span class="act">{esc(a["activity"])}</span>')
             chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
         parts.append(f'<div class="crew">{"".join(chips)}</div>')
+    lr = p.get("last_run")
+    if lr:
+        parts.append(f'<details class="lastrun"><summary><span class="tri">▶</span><b>写手上次运行 exit {esc(lr["code"])}</b>'
+                     f'<span class="age">{ago(lr["ts"])} 前</span><span class="msg">{esc(lr["head"])}</span></summary>'
+                     f'<pre>{esc(lr["out"])}</pre></details>')
     b = p.get("brief")
     if b:
         if b["n"] is None:

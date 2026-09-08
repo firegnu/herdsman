@@ -44,11 +44,21 @@ CONF="${REPO}/.review.conf"
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
 
-# 每次退出（不论退出码）都刷新看板：状态只在脚本退出时变化。看板是只读的派生视图，缺席不影响流程。
-# shellcheck disable=SC2064
-trap "[ -n '${REVIEW_BOARD}' ] && command -v '${REVIEW_BOARD}' >/dev/null && '${REVIEW_BOARD}' --quiet 2>/dev/null; true" EXIT
-
 DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
+
+# 本次运行的全部输出留一份在 .last.out，退出码和时间写 .last：写手停下时看板直接显示脚本说了什么，
+# 人不必去翻写手的终端。每次退出（不论退出码）都刷新看板：状态只在脚本退出时变化。看板是只读的派生视图。
+: > "${DIR}/.last.out"
+exec > >(tee -a "${DIR}/.last.out"); TEE_OUT=$!
+exec 2> >(tee -a "${DIR}/.last.out" >&2); TEE_ERR=$!
+on_exit() {
+  local code=$?
+  printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"
+  exec 1>&- 2>&-; wait "${TEE_OUT}" "${TEE_ERR}" 2>/dev/null
+  [ -n "${REVIEW_BOARD}" ] && command -v "${REVIEW_BOARD}" >/dev/null && "${REVIEW_BOARD}" --quiet >/dev/null 2>&1
+  true
+}
+trap on_exit EXIT
 REQ="${DIR}/request.md"
 PANE_CACHE="${DIR}/.pane"
 CYCLE_SHA="${DIR}/.cycle"

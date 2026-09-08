@@ -233,6 +233,9 @@ assert_rejected() {
 grep -v '^kind:' "${REVIEW_DIR}/request.md" > "${TMP}/req" && mv "${TMP}/req" "${REVIEW_DIR}/request.md"
 run_review none
 assert_rejected 'missing kind' '缺 kind'
+# Every run leaves its exit code and output in the handoff dir for the board.
+assert_eq "$(cut -d' ' -f1 "${REVIEW_DIR}/.last")" 2 'last exit code recorded'
+grep -q '缺 kind' "${REVIEW_DIR}/.last.out" || fail 'last output not recorded'
 write_request docs "${BASE}" 1/3
 run_review none
 assert_rejected 'invalid kind' '只能是 code 或 plan'
