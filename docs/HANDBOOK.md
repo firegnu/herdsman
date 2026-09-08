@@ -1714,7 +1714,7 @@ def agents_of(repo, wt, reviewer_pane):
         title = (a.get("terminal_title_stripped") or "").strip()
         if title == os.path.basename(repo):
             title = ""
-        out[role] = {"status": st, "title": title, "pane": a.get("pane_id", ""),
+        out[role] = {"status": st, "title": title, "pane": a.get("pane_id", ""), "kind": a.get("agent", ""),
                      "activity": pane_activity(a.get("pane_id", "")) if st == "working" else ""}
     return out
 
@@ -2182,15 +2182,15 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#a3a19b;font-size:12.5px}
-.agents{display:flex;flex-wrap:wrap;gap:8px 12px;padding:12px 0 2px;font-size:14px;color:#e6e4df}
-.agents .agent{display:inline-flex;align-items:center;gap:10px;padding:7px 14px;border-radius:4px;background:#232323;border:1px solid #333}
-.agents .agent.st-working{border-color:#2f5a36;background:#1c2a1e}
-.agents .agent.st-blocked{border-color:#7a2f26;background:#2b1a17}
-.agents .agent b{font-weight:600}
-.agents .st{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#a3a19b}
-.agents .st.st-working{color:#7fd48a}.agents .st.st-blocked{color:#f0776a}
-.agents .ttl{color:#d6d3cc}.agents .act{color:#a3a19b}
-.agents .ttl::before,.agents .act::before{content:"·";color:#5a5955;margin-right:10px}
+.crew{display:flex;flex-wrap:wrap;gap:8px 12px;padding:12px 0 2px;font-size:14px;color:#e6e4df}
+.crew .agent{display:inline-flex;align-items:center;gap:10px;padding:7px 14px;border-radius:4px;background:#232323;border:1px solid #333}
+.crew .agent.st-working{border-color:#2f5a36;background:#1c2a1e}
+.crew .agent.st-blocked{border-color:#7a2f26;background:#2b1a17}
+.crew .agent b{font-weight:600}
+.crew .st{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#a3a19b}
+.crew .st.st-working{color:#7fd48a}.crew .st.st-blocked{color:#f0776a}
+.crew .ttl{color:#d6d3cc}.crew .act{color:#a3a19b}
+.crew .ttl::before,.crew .act::before{content:"·";color:#5a5955;margin-right:10px}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#5a5955;flex:none}
 .dot.st-working{background:#5fb36a;box-shadow:0 0 0 3px rgba(95,179,106,.25)}.dot.st-blocked{background:#e5533d;box-shadow:0 0 0 3px rgba(229,83,61,.25)}.dot.st-idle,.dot.st-done{background:#8b8985}
 details.proc{margin-top:8px}details.proc>summary{color:#8b8985;font-size:11.5px;display:flex;gap:6px;align-items:center;cursor:pointer}
@@ -2347,8 +2347,9 @@ def cycle_subject(p):
     return out
 
 
-def agents_line(kind):
-    """写手与评审方各是哪个 agent、什么 model、什么 effort。只能读配置文件：herdr 不报 model，
+def agents_line(kind, writer_kind):
+    """写手与评审方各是哪个 agent、什么 model、什么 effort。写手是谁看 herdr 在仓库里见到的 agent，
+    评审方是谁看 .review.conf 的 REVIEW_KIND。model 只能读配置文件：herdr 不报 model，
     会话里临时切换的看不到，所以页面上标"按配置文件"。"""
     def codex():
         t = read(os.path.expanduser("~/.codex/config.toml")) or ""
@@ -2364,9 +2365,13 @@ def agents_line(kind):
         eff = (d.get("modelSettings", {}).get(base, {}) or {}).get("effortLevel") or d.get("effortLevel", "?")
         return (model, eff)
     readers = {"codex": codex, "claude": claude}
-    w = readers["codex"]()
     r = readers.get(kind, lambda: ("?", "?"))()
-    return (f'<span class="ag"><b>写手</b> codex · {esc(w[0])} · {esc(w[1])}</span>'
+    if not writer_kind:
+        wtxt = "未在运行"
+    else:
+        w = readers.get(writer_kind, lambda: ("?", "?"))()
+        wtxt = f"{esc(writer_kind)} · {esc(w[0])} · {esc(w[1])}"
+    return (f'<span class="ag"><b>写手</b> {wtxt}</span>'
             f'<span class="ag"><b>评审方</b> {esc(kind)} · {esc(r[0])} · {esc(r[1])}</span><span class="mute">按配置文件</span>')
 
 
@@ -2541,7 +2546,7 @@ def render_panel(p, archives, self_closed):
             if a["activity"]:
                 bits.append(f'<span class="act">{esc(a["activity"])}</span>')
             chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
-        parts.append(f'<div class="agents">{"".join(chips)}</div>')
+        parts.append(f'<div class="crew">{"".join(chips)}</div>')
     b = p.get("brief")
     if b:
         if b["n"] is None:
@@ -2666,7 +2671,8 @@ def render(projects, archives, self_closed):
     panels = "".join(render_panel(p, archives[p["name"]], self_closed[p["name"]]) for p in projects)
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     kinds = sorted({p["kind"] for p in projects}) or ["claude"]
-    agents = agents_line(kinds[0])
+    writer_kinds = [((p.get("agents") or {}).get("writer") or {}).get("kind") for p in projects]
+    agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""))
     mast = (f'<div class="mast"><span class="brand">Review board</span><span class="agents">{agents}</span>'
             f'<span class="gen">生成于 {gen[11:]}</span></div>')
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>Review board</title><style>{CSS}</style></head><body>'
