@@ -2150,7 +2150,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .wrap{min-height:100vh;display:flex;flex-direction:column;min-width:1200px}
 .mast{display:flex;align-items:baseline;gap:28px;padding:10px 24px 9px;background:#0f0f0f;color:#e8e6e1;border-bottom:4px solid #c8375a;position:sticky;top:0;z-index:5}
 .mast .brand{font-weight:700;font-size:14px;letter-spacing:.02em;color:#fff}
-.mast .agents{display:flex;gap:22px;font-size:12px;color:#4a4a4a}.mast .ag b{color:#fff;font-weight:600;margin-right:4px}
+.mast .agents{display:flex;gap:22px;font-size:13px;color:#d6d3cc}.mast .ag b{color:#fff;font-weight:600;margin-right:6px}
 .mast .agents .mute{color:#8b8985}
 .mast .gen{margin-left:auto;font-size:12px;color:#8b8985;font-variant-numeric:tabular-nums}
 .banner{background:#3a1a22;border-bottom:2px solid #c8375a;padding:9px 24px;display:flex;gap:28px;align-items:baseline}
