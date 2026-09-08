@@ -31,10 +31,16 @@ cat > "${TMP}/herdr" <<'MOCK'
 case "$1 $2 $3" in
   'agent get beta-pane')  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n';;
   'agent get gamma-pane') printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
+  'agent list ') printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","cwd":"%s","pane_id":"alpha-writer","terminal_title_stripped":"repo"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"gamma-pane","terminal_title_stripped":"Triage request"}]}}\n' "${MOCK_ALPHA}" "${MOCK_GAMMA}";;
+  'agent read alpha-writer') printf 'some output\n• Working (12m 03s • esc to interrupt)\n\n› Ask Codex\n';;
+  'agent read gamma-pane') printf '✻ Reviewing diff… (3m 10s · esc to interrupt)\n\n❯\n';;
   *) printf '{"error":{"code":"agent_not_found"}}\n' >&2; exit 1;;
 esac
 MOCK
 chmod +x "${TMP}/herdr"
+export MOCK_ALPHA="${TMP}/alpha/repo" MOCK_GAMMA="${TMP}/gamma/repo"
+# alpha 的评审 worktree 另在别处，这样 cwd 是仓库的 agent 才算写手
+sed -i '' "s|^REVIEW_WT=.*|REVIEW_WT=${TMP}/alpha/wt|" "${TMP}/alpha/repo/.review.conf"
 
 # alpha：round 2 的 request 指向 HEAD，r1 里 F2 reject、F3(blocking) defer，无裁决 → 待人裁决
 H=$(git -C "${TMP}/alpha/repo" rev-parse HEAD); B=$(git -C "${TMP}/alpha/repo" rev-parse HEAD~1)
@@ -58,6 +64,9 @@ evidence: docs/x.json:8
 F3 | blocking
 claim:    聚合上限未回显
 evidence: a.py:1
+
+## 过程
+读了 a.py 全文和 tests/test_a.py；跑了 pytest -q，12 passed；没有查性能。
 
 REVIEW-COMPLETE
 EOF
@@ -148,6 +157,12 @@ has '<span class="badge none">已闭合</span>' 'delta closed grey'
 has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'banner stop item'
 has 'href="#p-beta/repo"' 'stop item links to project'
 has '评审方 working' 'gamma working note'
+# 活动条：写手/评审方在干什么，来自 herdr agent list 的状态与标题，working 时再读 pane 最后那句
+has '<span class="dot working"></span>写手 working · Working (12m 03s)' 'alpha writer chip with activity'
+has '<span class="dot working"></span>评审方 working · Triage request · Reviewing diff… (3m 10s)' 'gamma reviewer chip with title and activity'
+# 「过程」一节折叠显示
+has '评审方怎么看的' 'process fold present'
+has '跑了 pytest -q，12 passed' 'process text shown'
 
 # 横幅：两条裁决 + 一条 STOP；alpha 排在最前
 has '等你 · 3' 'banner count'

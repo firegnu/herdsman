@@ -1349,6 +1349,9 @@ Do not proceed on a request you cannot verify.
 ## Output contract
 Write everything to the absolute findings path given in the injected prompt.
 Reply with only that file path. Never paste findings into the terminal.
+After the findings, add a "## 过程" section of 3–5 plain lines: what you read, what you
+ran and what it returned, what you did not check. No findings there; it is for the human
+reading the board, and it is archived with the round.
 End the file with a single line: REVIEW-COMPLETE
 
 ## Finding format
@@ -1663,6 +1666,59 @@ def reviewer_status(pane):
         return "unknown"
 
 
+_AGENTS = None
+
+
+def herdr_agents():
+    """`herdr agent list` 一次，全页共用；herdr 不在就是空列表。"""
+    global _AGENTS
+    if _AGENTS is None:
+        try:
+            out = subprocess.run([HERDR, "agent", "list"], capture_output=True, text=True, timeout=5).stdout
+            _AGENTS = json.loads(out).get("result", {}).get("agents", []) or []
+        except Exception:
+            _AGENTS = []
+    return _AGENTS
+
+
+def pane_activity(pane):
+    """pane 最后几行里那句「Working (47m · esc to interrupt)」；拿不到就空。只在 working 时问。"""
+    try:
+        out = subprocess.run([HERDR, "agent", "read", pane, "--lines", "15", "--format", "text"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+    for line in reversed(out.splitlines()):
+        if "esc to interrupt" in line:
+            line = re.sub(r'\s*[•·]\s*esc to interrupt', "", line).strip().lstrip("•·*✻✽✶✳✢⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+            return line[:80]
+    return ""
+
+
+def agents_of(repo, wt, reviewer_pane):
+    """{"writer": info, "reviewer": info}：写手 = cwd 是仓库的 agent；评审方 = 派发时记下的 pane，或 cwd 是评审 worktree。
+    info = {status, title, activity}；找不到的角色不出现。"""
+    def real(x):
+        return os.path.realpath(x) if x else ""
+    out = {}
+    for a in herdr_agents():
+        cwd = real(a.get("cwd"))
+        role = None
+        if reviewer_pane and a.get("pane_id") == reviewer_pane or (wt and cwd == real(wt)):
+            role = "reviewer"
+        elif cwd == real(repo):
+            role = "writer"
+        if not role or role in out:
+            continue
+        st = a.get("agent_status") or "unknown"
+        title = (a.get("terminal_title_stripped") or "").strip()
+        if title == os.path.basename(repo):
+            title = ""
+        out[role] = {"status": st, "title": title, "pane": a.get("pane_id", ""),
+                     "activity": pane_activity(a.get("pane_id", "")) if st == "working" else ""}
+    return out
+
+
 def ago(ts):
     if not ts:
         return ""
@@ -1776,6 +1832,20 @@ def parse_sent(text):
         return None
 
 
+def parse_process(text):
+    """findings 里评审方写的「过程」一节（读了什么、跑了什么、没查什么）：从 `## 过程` / `## Process` 到下一个标题或哨兵。"""
+    lines, keep = [], False
+    for line in (text or "").splitlines():
+        if re.match(r'^#{1,6}\s*(过程|process|how i looked)\b', line.strip(), re.I):
+            keep = True
+            continue
+        if keep and (re.match(r'^#{1,6}\s', line) or line.strip() == "REVIEW-COMPLETE"):
+            break
+        if keep:
+            lines.append(line.rstrip())
+    return "\n".join(lines).strip()
+
+
 def load_rounds(d):
     rounds = []
     for n in range(1, 6):
@@ -1786,7 +1856,7 @@ def load_rounds(d):
         if ft is None and rt is None and st is None:
             continue
         rounds.append({
-            "n": n, "findings": parse_findings(ft), "done": sentinel_ok(ft),
+            "n": n, "findings": parse_findings(ft), "done": sentinel_ok(ft), "process": parse_process(ft),
             "responses": parse_lines(rt, RESP_RE) if rt is not None else None,
             "decisions": parse_lines(dt, DEC_RE) if dt is not None else None,
             "sent": st, "t_findings": mtime(f"{d}/r{n}-findings.md"), "t_responses": mtime(f"{d}/r{n}-responses.md"),
@@ -1879,6 +1949,8 @@ def project_state(repo, conf):
         if rounds:
             p["closed"] = True
             p["cycle_note"] = "已闭合；下面的 Round 是它的最终结果"
+    pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
+    p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     return p
 
 
@@ -2110,6 +2182,12 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#a3a19b;font-size:12.5px}
+.agents{display:flex;flex-wrap:wrap;gap:6px 22px;padding:8px 0 0;font-size:12px;color:#a3a19b}
+.agents .agent{display:inline-flex;align-items:center;gap:6px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5a5955}
+.dot.working{background:#5fb36a}.dot.blocked{background:#e5533d}.dot.idle,.dot.done{background:#8b8985}
+details.proc{margin-top:8px}details.proc>summary{color:#8b8985;font-size:11.5px;display:flex;gap:6px;align-items:center;cursor:pointer}
+details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px solid #2e2e2e;border-radius:4px;font-size:12px;white-space:pre-wrap;color:#c9c7c1}
 .idle{padding:28px 0;color:#8b8985}
 .accum{font-size:12px;margin-top:8px}
 details.mapsug{margin-top:8px;font-size:12px}details.mapsug>summary{color:#e5b866;cursor:pointer}details.mapsug li{margin:3px 0 3px 16px}.accum.warn{color:#e5b866}.accum b{font-weight:700}
@@ -2365,9 +2443,13 @@ def render_round(p, rnd):
                 f'<span class="mute" style="font-size:12px">评审中，findings 尚未完成</span></div></div>')
     if not rows:
         rows.append('<div class="empty">没有可解析的 finding 行</div>')
+    proc = ""
+    if rnd.get("process"):
+        proc = (f'<details class="proc"><summary><span class="tri">▶</span>评审方怎么看的</summary>'
+                f'<pre>{esc(rnd["process"])}</pre></details>')
     return (f'<div class="round"><div class="rh"><h2>Round {rnd["n"]}</h2><span class="mute" style="font-size:12px">{esc(summary)}</span></div>'
             f'<div class="ftab"><div class="fcols"><div>编号</div><div>严重度 · 状态</div><div>评审方 claim</div>'
-            f'<div>写手回应</div><div>裁决</div></div>{"".join(rows)}</div></div>')
+            f'<div>写手回应</div><div>裁决</div></div>{"".join(rows)}</div>{proc}</div>')
 
 
 def render_cycle(p):
@@ -2436,9 +2518,22 @@ def render_cycle(p):
 def render_panel(p, archives, self_closed):
     parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
     badge = state_badge(p)
-    rv = f'<span class="mute">评审方 {esc(p["reviewer"])}</span>' if p["reviewer"] and p["reviewer"] != "unknown" else ""
-    parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>{rv}'
+    parts.append(f'<div class="head"><h1>{esc(p["name"])}</h1>{badge}<span class="mute">{ago(p["since"])}</span>'
                  f'<span class="hd">HEAD <code>{esc(p["head"][:7])}</code></span></div>')
+    ag = p.get("agents") or {}
+    if ag:
+        chips = []
+        for role, label in (("writer", "写手"), ("reviewer", "评审方")):
+            a = ag.get(role)
+            if not a:
+                continue
+            bits = [f'<span class="dot {esc(a["status"])}"></span>{label} {esc(a["status"])}']
+            if a["title"]:
+                bits.append(esc(a["title"]))
+            if a["activity"]:
+                bits.append(esc(a["activity"]))
+            chips.append(f'<span class="agent" title="pane {esc(a["pane"])}">{" · ".join(bits)}</span>')
+        parts.append(f'<div class="agents">{"".join(chips)}</div>')
     b = p.get("brief")
     if b:
         if b["n"] is None:

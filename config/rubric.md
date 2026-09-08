@@ -90,6 +90,9 @@ Do not proceed on a request you cannot verify.
 ## Output contract
 Write everything to the absolute findings path given in the injected prompt.
 Reply with only that file path. Never paste findings into the terminal.
+After the findings, add a "## 过程" section of 3–5 plain lines: what you read, what you
+ran and what it returned, what you did not check. No findings there; it is for the human
+reading the board, and it is archived with the round.
 End the file with a single line: REVIEW-COMPLETE
 
 ## Finding format
