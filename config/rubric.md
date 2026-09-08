@@ -158,9 +158,11 @@ against the territory. Same output sections as for plans, plus:
   a directory many modules import, or one fixed repeatedly, that the
   brief omits -> should. A listed path that nothing depends on and that
   was never fixed -> nit, and ask for the reason.
-- Every test / lint / typecheck command the brief states: run it once.
-  A stated result you cannot reproduce -> blocking (the brief claims
-  GREEN it does not have).
+- Every test / lint / typecheck command the brief states: run it once,
+  with a 5-minute cap. Past the cap, stop it and record how far it got
+  and whether anything failed; that is not a finding. A command that
+  does not exist or does not start -> blocking (the brief claims a check
+  it does not have). A failure the brief calls GREEN -> blocking.
 - Every invariant or frozen contract the brief states: point at the code
   that enforces it. None found -> should.
 - Do not rewrite the brief and do not propose wording; findings only.
