@@ -786,6 +786,13 @@ assert_eq "${RUN_STATUS}" 0 'findings delivered status'
 grep -q '^src/util/u.py *deep *# 自动升级' "${REPO}/.review-map" || fail 'map not auto-upgraded'
 grep -q '升级 src/util/u.py → deep' "${TMP}/stderr" || fail 'upgrade note missing'
 tail -1 "${REPO}/docs/reviews/timing.md" | grep -q '| code$' || fail 'timing row lacks kind'
+# Running again before responses are written re-delivers the path without a second row.
+n_timing=$(grep -c . "${REPO}/docs/reviews/timing.md"); n_prec=$(grep -c . "${REPO}/docs/reviews/precision.md")
+run_review live
+assert_eq "${RUN_STATUS}" 0 'redelivery status'
+assert_eq "$(cat "${TMP}/stdout")" "${REVIEW_DIR}/r1-findings.md" 'redelivery prints the findings path'
+assert_eq "$(grep -c . "${REPO}/docs/reviews/timing.md")" "${n_timing}" 'redelivery duplicated a timing row'
+assert_eq "$(grep -c . "${REPO}/docs/reviews/precision.md")" "${n_prec}" 'redelivery duplicated a precision row'
 rm -f "${REPO}/src/util/u.py"
 echo 'PASS a blocking finding upgrades its path in the map'
 

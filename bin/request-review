@@ -94,6 +94,8 @@ finish() {
   local elapsed sha nb
   elapsed=$(( $(date +%s) - START ))
   sha=$(git rev-parse --short "${TARGET:-HEAD}")
+  # 同一 sha 同一轮只记一次：写手在写 responses 之前再跑一遍，只是再领一次路径
+  grep -q "| ${sha} | round ${cur}/${cap} |" "${ARCHIVE_DIR}/timing.md" 2>/dev/null && { echo "${OUT}"; exit 0; }
   printf '%s | %s | round %s/%s | %ss | %s\n' \
     "$(date +%F)" "${sha}" "${cur}" "${cap}" "${elapsed}" "${kind:-code}" >> "${ARCHIVE_DIR}/timing.md"
   map_auto_upgrade
