@@ -2182,10 +2182,17 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .head h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
 .head .badge{font-size:12px;padding:1px 8px}
 .head .hd{margin-left:auto;color:#a3a19b;font-size:12.5px}
-.agents{display:flex;flex-wrap:wrap;gap:6px 22px;padding:8px 0 0;font-size:12px;color:#a3a19b}
-.agents .agent{display:inline-flex;align-items:center;gap:6px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5a5955}
-.dot.st-working{background:#5fb36a}.dot.st-blocked{background:#e5533d}.dot.st-idle,.dot.st-done{background:#8b8985}
+.agents{display:flex;flex-wrap:wrap;gap:8px 12px;padding:12px 0 2px;font-size:14px;color:#e6e4df}
+.agents .agent{display:inline-flex;align-items:center;gap:10px;padding:7px 14px;border-radius:4px;background:#232323;border:1px solid #333}
+.agents .agent.st-working{border-color:#2f5a36;background:#1c2a1e}
+.agents .agent.st-blocked{border-color:#7a2f26;background:#2b1a17}
+.agents .agent b{font-weight:600}
+.agents .st{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#a3a19b}
+.agents .st.st-working{color:#7fd48a}.agents .st.st-blocked{color:#f0776a}
+.agents .ttl{color:#d6d3cc}.agents .act{color:#a3a19b}
+.agents .ttl::before,.agents .act::before{content:"·";color:#5a5955;margin-right:10px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#5a5955;flex:none}
+.dot.st-working{background:#5fb36a;box-shadow:0 0 0 3px rgba(95,179,106,.25)}.dot.st-blocked{background:#e5533d;box-shadow:0 0 0 3px rgba(229,83,61,.25)}.dot.st-idle,.dot.st-done{background:#8b8985}
 details.proc{margin-top:8px}details.proc>summary{color:#8b8985;font-size:11.5px;display:flex;gap:6px;align-items:center;cursor:pointer}
 details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px solid #2e2e2e;border-radius:4px;font-size:12px;white-space:pre-wrap;color:#c9c7c1}
 .idle{padding:28px 0;color:#8b8985}
@@ -2527,12 +2534,13 @@ def render_panel(p, archives, self_closed):
             a = ag.get(role)
             if not a:
                 continue
-            bits = [f'<span class="dot st-{esc(a["status"])}"></span>{label} {esc(a["status"])}']
+            st = esc(a["status"])
+            bits = [f'<span class="dot st-{st}"></span><b>{label}</b><span class="st st-{st}">{st}</span>']
             if a["title"]:
-                bits.append(esc(a["title"]))
+                bits.append(f'<span class="ttl">{esc(a["title"])}</span>')
             if a["activity"]:
-                bits.append(esc(a["activity"]))
-            chips.append(f'<span class="agent" title="pane {esc(a["pane"])}">{" · ".join(bits)}</span>')
+                bits.append(f'<span class="act">{esc(a["activity"])}</span>')
+            chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
         parts.append(f'<div class="agents">{"".join(chips)}</div>')
     b = p.get("brief")
     if b:

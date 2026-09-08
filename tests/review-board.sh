@@ -156,10 +156,9 @@ has '<span class="badge rv">triage 中</span>' 'gamma waiting on reviewer blue'
 has '<span class="badge none">已闭合</span>' 'delta closed grey'
 has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'banner stop item'
 has 'href="#p-beta/repo"' 'stop item links to project'
-has '评审方 working' 'gamma working note'
 # 活动条：写手/评审方在干什么，来自 herdr agent list 的状态与标题，working 时再读 pane 最后那句
-has '<span class="dot st-working"></span>写手 working · Working (12m 03s)' 'alpha writer chip with activity'
-has '<span class="dot st-working"></span>评审方 working · Triage request · Reviewing diff… (3m 10s)' 'gamma reviewer chip with title and activity'
+has '<span class="dot st-working"></span><b>写手</b><span class="st st-working">working</span><span class="act">Working (12m 03s)</span>' 'alpha writer chip with activity'
+has '<b>评审方</b><span class="st st-working">working</span><span class="ttl">Triage request</span><span class="act">Reviewing diff… (3m 10s)</span>' 'gamma reviewer chip with title and activity'
 # 「过程」一节折叠显示
 has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'
