@@ -2586,8 +2586,11 @@ def main():
     self_closed = {p["name"]: self_closed[p["repo"]] for p in projects}
     projects.sort(key=lambda p: (not p["needs_me"], -(p["since"] or p["last_activity"] or 0), p["name"]))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
+    # 先写临时文件再改名：浏览器 30 秒一刷，直接覆盖会有一瞬读到空文件
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(render(projects, archives, self_closed))
+    os.replace(tmp, out_path)
     if "--quiet" not in args:
         print(out_path)
     if "--open" in args:
