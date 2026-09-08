@@ -906,9 +906,11 @@ triage_head() {
   tree_clean || { echo "ERROR: 工作区未提交。先提交，再运行 request-review 判定要不要评审"; exit 2; }
   brief_gate
 
-  # 已对这个 HEAD 判过，或自上次判定起只多了脚本自己写的记录：直接复用，不再问评审方，也不再记一行
+  # 已对这个 HEAD 判过：直接复用，不再问评审方。上次判的是 SKIP 且之后只多了脚本自己写的记录，也复用，
+  # 不再记一行。REVIEW 不跨提交复用 —— 评审做完后 timing 已把起点推过去，重新路由才是对的。
   if [ -f "${TRIAGE_MARK}" ] && { [ "$(sed -n '1p' "${TRIAGE_MARK}")" = "${head}" ] \
-       || { git merge-base --is-ancestor "$(sed -n '1p' "${TRIAGE_MARK}")" "${head}" 2>/dev/null \
+       || { [ "$(sed -n '2p' "${TRIAGE_MARK}")" = SKIP ] \
+            && git merge-base --is-ancestor "$(sed -n '1p' "${TRIAGE_MARK}")" "${head}" 2>/dev/null \
             && [ -z "$(range_files "$(sed -n '1p' "${TRIAGE_MARK}")" "${head}")" ]; }; }; then
     verdict=$(sed -n '2p' "${TRIAGE_MARK}"); reason=$(sed -n '3p' "${TRIAGE_MARK}")
     if [ "${verdict}" = SKIP ]; then echo "SKIP: ${reason}（已记录）"; exit 0; fi

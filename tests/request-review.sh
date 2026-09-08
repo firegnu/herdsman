@@ -828,6 +828,15 @@ run_review new
 assert_eq "${RUN_STATUS}" 0 'records after skip status'
 assert_eq "$(grep -c . "${SELF_CLOSED}")" "${n_closed}" 'records after skip wrote another self-closed row'
 grep -q '已记录' "${TMP}/stdout" || fail 'records after skip should reuse the cached verdict'
+# A REVIEW verdict is not reused across a records-only commit: once reviewed, routing must start over.
+commit_file src/core/c6.py 'core again'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'review before records status'
+printf '2026-09-03 | %s | round 1/3 | 1s | code\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+git -C "${REPO}" add docs/reviews/timing.md; git -C "${REPO}" commit -qm 'records after review'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'records after review status'
+grep -q '无需路由' "${TMP}/stdout" || fail 'records after a completed review should not re-request it'
 # A plan commit with records and an upgrade line riding along is still a pure plan commit.
 printf 'p3\n' >> "${REPO}/docs/plans/q.md"
 printf '2026-09-03 | x | blocking 0 | 误报 ?\n' >> "${REPO}/docs/reviews/precision.md"
