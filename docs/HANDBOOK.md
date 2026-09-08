@@ -906,8 +906,10 @@ triage_head() {
   tree_clean || { echo "ERROR: 工作区未提交。先提交，再运行 request-review 判定要不要评审"; exit 2; }
   brief_gate
 
-  # 已对这个 HEAD 判过：直接复用，不再问评审方
-  if [ -f "${TRIAGE_MARK}" ] && [ "$(sed -n '1p' "${TRIAGE_MARK}")" = "${head}" ]; then
+  # 已对这个 HEAD 判过，或自上次判定起只多了脚本自己写的记录：直接复用，不再问评审方，也不再记一行
+  if [ -f "${TRIAGE_MARK}" ] && { [ "$(sed -n '1p' "${TRIAGE_MARK}")" = "${head}" ] \
+       || { git merge-base --is-ancestor "$(sed -n '1p' "${TRIAGE_MARK}")" "${head}" 2>/dev/null \
+            && [ -z "$(range_files "$(sed -n '1p' "${TRIAGE_MARK}")" "${head}")" ]; }; }; then
     verdict=$(sed -n '2p' "${TRIAGE_MARK}"); reason=$(sed -n '3p' "${TRIAGE_MARK}")
     if [ "${verdict}" = SKIP ]; then echo "SKIP: ${reason}（已记录）"; exit 0; fi
     triage_print_review "${reason}（已判定，写 ${REQ} 后再运行）" "$(sed -n '4p' "${TRIAGE_MARK}")" "$(sed -n '5p' "${TRIAGE_MARK}")" "$(sed -n '6p' "${TRIAGE_MARK}")"

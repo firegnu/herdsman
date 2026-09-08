@@ -817,6 +817,17 @@ grep -q '无需路由' "${TMP}/stdout" || fail 'records-only commit was routed'
 assert_eq "$(grep -c . "${SELF_CLOSED}")" "${n_closed}" 'records-only commit left a self-closed row'
 [ -f "${REVIEW_DIR}/.triage" ] && fail 'records-only commit left a triage cache'
 assert_eq "$(call_count '^agent ')" 0 'records-only agent calls'
+# A records-only commit after a real SKIP verdict reuses that verdict instead of writing another row.
+commit_file docs/note3.md 'status note'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'text commit after records status'
+n_closed=$(grep -c . "${SELF_CLOSED}")
+printf '2026-09-03 | x | blocking 0 | 误报 ?\n' >> "${REPO}/docs/reviews/precision.md"
+git -C "${REPO}" add docs/reviews/precision.md; git -C "${REPO}" commit -qm 'records after skip'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'records after skip status'
+assert_eq "$(grep -c . "${SELF_CLOSED}")" "${n_closed}" 'records after skip wrote another self-closed row'
+grep -q '已记录' "${TMP}/stdout" || fail 'records after skip should reuse the cached verdict'
 # A plan commit with records and an upgrade line riding along is still a pure plan commit.
 printf 'p3\n' >> "${REPO}/docs/plans/q.md"
 printf '2026-09-03 | x | blocking 0 | 误报 ?\n' >> "${REPO}/docs/reviews/precision.md"
