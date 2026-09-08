@@ -248,7 +248,8 @@ run_review none
 assert_rejected 'non-ancestor base' '不是 HEAD 的祖先'
 echo 'PASS base sha must be an ancestor of HEAD'
 
-# With REVIEW_PLAN_PATHS set, round 1 refuses a diff that does not match the declared kind.
+# A human-requested review of a mixed diff is accepted as whatever kind the human declares: the script no
+# longer judges purity, it only makes a routed kind stick (tested with the risk map below).
 mkdir -p "${REPO}/docs/plans" "${REPO}/src"
 printf 'plan\n' > "${REPO}/docs/plans/p.md"
 printf 'code\n' > "${REPO}/src/a.txt"
@@ -256,17 +257,18 @@ git -C "${REPO}" add docs/plans/p.md src/a.txt
 git -C "${REPO}" commit -qm mixed
 printf 'REVIEW_PLAN_PATHS="docs/plans/*"\n' >> "${REPO}/.review.conf"
 write_request code "${BASE}" 1/3
-run_review none
-assert_rejected 'mixed code request' 'docs/plans/p.md'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'mixed code request status'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
 write_request plan "${BASE}" 1/3
-run_review none
-assert_rejected 'mixed plan request' 'src/a.txt'
-# Round 2+ is frozen scope: the same diff is not re-checked.
+run_review new
+assert_eq "${RUN_STATUS}" 3 'mixed plan request status'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
 write_request code "${BASE}" 2/3
 run_review new
 assert_eq "${RUN_STATUS}" 3 'mixed diff round 2 status'
 rm -f "${REVIEW_DIR}"/.r*.sent "${PANE_CACHE}"
-echo 'PASS REVIEW_PLAN_PATHS refuses a round-1 diff that contradicts kind'
+echo 'PASS a human-requested review is not judged for purity'
 
 # A pure plan diff passes as kind: plan, and an unset REVIEW_PLAN_PATHS never gates.
 printf 'plan2\n' >> "${REPO}/docs/plans/p.md"
@@ -562,15 +564,18 @@ commit_file src/b3.py 'c3'
 run_review new
 assert_eq "${RUN_STATUS}" 3 'fresh brief routing status'
 assert_eq "$(call_count '^agent prompt reviewer-pane Triage request')" 1 'fresh brief triage prompt'
-# A kind: code request that bundles the brief with code is refused as mixed.
-rm -f "${REVIEW_DIR}"/.triage*
+# A commit bundling the brief with code routes as plan (rule file), and a kind: code request against it is refused.
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/request.md"
 printf '<!-- verified at: %s -->\n# brief v3\n' "$(git -C "${REPO}" rev-parse HEAD)" > "${REPO}/docs/reviewer-brief.md"
 commit_file src/b4.py 'code with brief'
 git -C "${REPO}" add docs/reviewer-brief.md; git -C "${REPO}" commit -q --amend --no-edit
+run_review new
+assert_eq "${RUN_STATUS}" 6 'brief with code routing status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'brief with code should route as plan'
 write_request code "$(git -C "${REPO}" rev-parse HEAD~1)" 1/3
 run_review none
-assert_rejected 'brief mixed into code' 'docs/reviewer-brief.md'
-rm -f "${REVIEW_DIR}/request.md"
+assert_rejected 'brief mixed into code' '照抄 request-review 的输出'
+rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.triage*
 # A verified-at that is not in HEAD's history is stale too.
 printf '<!-- verified at: 0123456789abcdef0123456789abcdef01234567 -->\n' > "${REPO}/docs/reviewer-brief.md"
 git -C "${REPO}" commit -qam 'brief bad base'
@@ -746,15 +751,23 @@ write_request code "${P}" 1/3
 run_review new
 assert_eq "${RUN_STATUS}" 3 'mixed history in range status'
 rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+# A target commit mixing plan and code is not rejected: the plan range and the code range are reviewed separately.
 printf 'p2\n' >> "${REPO}/docs/plans/q.md"; printf 'x\n' > "${REPO}/src/core/c4.py"
 git -C "${REPO}" add docs/plans/q.md src/core/c4.py; git -C "${REPO}" commit -qm 'mixed target'
 write_request code "${P}" 1/3
-run_review none
-assert_rejected 'mixed target commit' 'target 提交'
+run_review new
+assert_eq "${RUN_STATUS}" 3 'mixed target status'
+rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
 git -C "${REPO}" reset -q --hard HEAD~1
-write_request plan "${P}" 1/2
+# When the script routed this HEAD, the request's kind must copy the verdict; a human-requested review is free.
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/request.md"
+run_review new
+assert_eq "${RUN_STATUS}" 6 'routing before kind check status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'expected the plan range to route first'
+write_request code "${P}" 1/3
 run_review none
-assert_rejected 'kind vs target' 'kind 跟着 target 提交走'
+assert_rejected 'kind vs routed verdict' '照抄 request-review 的输出'
+rm -f "${REVIEW_DIR}"/.triage*
 write_request code "${P}" 1/3
 sed -i '' 's|^round:|level: huge\nround:|' "${REVIEW_DIR}/request.md"
 run_review none
@@ -763,7 +776,7 @@ sed -i '' 's|^level: huge|level: light|' "${REVIEW_DIR}/request.md"
 run_review new
 assert_eq "${RUN_STATUS}" 3 'explicit level status'
 grep -q '^Level: light' "${MOCK_LOG}" || fail 'explicit level not passed to the reviewer'
-echo 'PASS round 1 checks per-commit purity and honours an explicit level'
+echo 'PASS round 1 makes kind follow the routed verdict and honours an explicit level'
 
 # When findings land, a blocking on a path below deep upgrades the map automatically and timing.md records the kind.
 printf 'F1 | blocking\nclaim:    boom\nevidence: src/util/u.py:3\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"

@@ -82,7 +82,7 @@
         跑 request-review。有针对 HEAD 的 request.md 就是明确的评审请求，不再 triage
 
 ⑤ 脚本：简报过期门 → 检查工作区干净 → 读 round → 校验 kind、level、base sha 是 HEAD 祖先
-        （配了计划/规则路径则 round 1 校验 target 提交：只碰一种产物，种类 = kind；范围里的历史提交只是上下文）
+        （脚本路由过的 HEAD，round 1 核对 request 的 kind 与路由判定一致；不看单个提交碰了什么文件）
         → 归档上一周期并清空交接目录
         按 cwd 找评审方（没有就建 pane 起一个）
         把 review worktree reset --hard 到 target sha
@@ -151,7 +151,7 @@ herdsman-init <短名>
 
 `.review.conf` 有四个必填变量：`REVIEW_KIND` 是评审 agent 类型，`REVIEW_WT` 是评审 worktree，`REVIEW_DIR` 是交接目录，`REVIEW_WAIT` 是等待秒数；其中路径值必须是绝对路径。
 
-可选的 `REVIEW_PLAN_PATHS` 是计划/设计文档的路径模式（空格分隔，按 shell `case` 匹配，`*` 可跨 `/`，如 `"docs/plans/*"`）。配了以后 round 1 会校验 `kind: code` 的 diff 不含这些路径、`kind: plan` 的 diff 只含这些路径，混装 exit 2。不配就不校验，只靠常驻指令约束写手。
+可选的 `REVIEW_PLAN_PATHS` 是计划/设计文档的路径模式（空格分隔，按 shell `case` 匹配，`*` 可跨 `/`，如 `"docs/plans/*"`）。配了以后，范围里碰到这些路径的改动会先以 `kind: plan` 送审，代码范围随后单独送审；不再校验单个提交是否混装。不配就只靠 `.review-map` 的 plan 行和规则文件。
 
 没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
@@ -330,7 +330,7 @@ review（常规）、light（一轮、只找阻断、不跑测试）、plan（�
 # 退出码：
 #   0 = 评审完成，stdout 为 findings 文件路径；或 triage 判定跳过，stdout 为 SKIP: <理由>
 #   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
-#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / 评审单元混装 / 上轮 responses 格式不合规范）
+#       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / kind 与路由判定不符 / 上轮 responses 格式不合规范）
 #   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
@@ -352,7 +352,7 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_WAIT:=600}"
 : "${REVIEW_START_TIMEOUT:=60000}"
 : "${REVIEW_POLL:=10}"          # 等哨兵时的轮询间隔（秒）；测试用，一般不改
-: "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；空则不做混装校验
+: "${REVIEW_PLAN_PATHS:=}"   # 可选：计划/设计文档的路径模式，空格分隔；路由时这些路径先按 kind: plan 送审
 : "${REVIEW_RULE_PATHS=AGENTS.md CLAUDE.md docs/reviewer-brief.md .review-map}"   # 规则文件：按计划文档路由与校验；置空关闭
 : "${REVIEW_BRIEF=docs/reviewer-brief.md}"        # 评审方简报；缺失或过期都 exit 7；置空关闭这道门
 : "${REVIEW_BRIEF_MAX_COMMITS:=50}"                # 简报 verified-at 之后累计超过这么多提交视为过期
@@ -806,7 +806,7 @@ last_target() {          # $1=code|plan → 完整 sha，或空
 }
 
 # 脚本自己写的东西自己无视：docs/reviews 下全部，以及 .review-map 里只新增了“# 自动升级”行的改动。
-# 它们不算工作区脏、不参与路由、不算混装，随写手下一次真实提交自然带走。
+# 它们不算工作区脏、不参与路由、不算改动，随写手下一次真实提交自然带走。
 # drop_own 从 stdin 过滤路径；参数是 git diff 的范围（"A B" 为两提交之间，"HEAD" 为工作区对 HEAD，空则不查图）。
 ARCHIVE_REL="docs/reviews"
 map_only_auto() {        # .review-map 在给定范围内的改动是否只有新增的自动升级行
@@ -1062,23 +1062,15 @@ case "${level}" in
   *) echo "ERROR: ${REQ} 的 level 只能是 deep、review 或 light，现在是 ${level}"; exit 2;;
 esac
 
-# 配了计划/规则路径时，round 1 校验 target 提交：只碰一种产物，且种类等于 request 的 kind。
-# 范围里更早的提交不再逐个验 —— 它们是历史（各自成为 target 时已经验过，或按当时的规则处理过），
-# 在这次评审里只是上下文。（round 2+ 范围已冻结，不再校验。）
-if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}${REVIEW_RULE_PATHS}" ]; then
-  plan_hits=""; other_hits=""
-  while IFS= read -r f; do
-    [ -n "${f}" ] || continue
-    if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
-  done < <(commit_files HEAD)
-  if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
-    echo "ERROR: target 提交 $(git rev-parse --short HEAD) 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
-    printf '%s' "${plan_hits}${other_hits}"; exit 2
-  fi
-  target_kind=$(commit_kind HEAD)
-  if [ "${kind}" != "${target_kind}" ]; then
-    echo "ERROR: request 的 kind 是 ${kind}，但 target 提交 $(git rev-parse --short HEAD) 按文件判是 ${target_kind}。kind 跟着 target 提交走。"; exit 2
-  fi
+# round 1 时 kind 跟着脚本的路由判定走：路由已对这个 HEAD 判过 REVIEW 的话，request 的 kind 必须照抄。
+# 不再看 target 提交自己碰了什么文件 —— 范围评审里 target 只是最后一个提交，计划和代码各按自己的范围
+# 分别送审（计划范围先审，之后代码范围仍包含那些提交），不需要靠单个提交的纯度来隔离。
+# 人直接要求的评审（没有路由记录）kind 由人定。（round 2+ 范围已冻结，不再校验。）
+if [ "${cur}" -eq 1 ] && [ -f "${TRIAGE_MARK}" ] \
+   && [ "$(sed -n '1p' "${TRIAGE_MARK}")" = "$(git rev-parse HEAD)" ] && [ "$(sed -n '2p' "${TRIAGE_MARK}")" = REVIEW ]; then
+  routed_kind=$(sed -n '4p' "${TRIAGE_MARK}")
+  [ "${kind}" = "${routed_kind}" ] \
+    || { echo "ERROR: request 的 kind 是 ${kind}，但脚本对这个 HEAD 的路由判定是 ${routed_kind}。kind 照抄 request-review 的输出。"; exit 2; }
 fi
 
 OUT="${DIR}/r${cur}-findings.md"
@@ -1476,7 +1468,7 @@ Required sections:
 之类——单独 commit，不得与 code 或 plan 同一 commit；纯文本的会被脚本直接跳过。
 一个任务同时产出代码和计划时，各自一个 commit、各自一个评审周期。
 `base sha` 用 request-review 输出里给的那个（上次评审的 target）；脚本会校验它是 HEAD 的祖先，
-还会校验 target 提交只碰一种产物、种类等于 kind，不符则 exit 2。范围里更早的提交是上下文，不再验。
+kind 也照抄，脚本会核对它与自己的判定一致，不符则 exit 2。不看单个提交碰了什么文件：计划范围先审，代码范围随后。
 
 ### 评审周期（triage 判 REVIEW 或人要求评审之后）
 1. 提交产物（工作区必须干净）
