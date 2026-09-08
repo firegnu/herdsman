@@ -782,12 +782,11 @@ map_auto_upgrade() {
 # ---- 上次评审到哪：timing.md 每完成一轮写一行 `日期 | sha | round | 秒 | kind`。按种类各取最新一行。----
 # 旧行没有 kind 列，按那个提交碰没碰计划路径推断。sha 不在 HEAD 历史里（rebase 过）视为没有。
 commit_kind() {          # $1=sha → plan|code（按该提交自己的文件）
-  local f plan=0 other=0 parent
-  parent=$(git rev-parse -q --verify "$1^" 2>/dev/null)
+  local f plan=0 other=0
   while IFS= read -r f; do
     [ -n "${f}" ] || continue
     if path_is_plan "${f}"; then plan=1; else other=1; fi
-  done < <(if [ -n "${parent}" ]; then git diff --name-only "${parent}" "$1"; else git diff-tree --root --no-commit-id --name-only -r "$1"; fi)
+  done < <(commit_files "$1")
   [ "${plan}" -eq 1 ] && [ "${other}" -eq 0 ] && echo plan || echo code
 }
 
@@ -806,6 +805,30 @@ last_target() {          # $1=code|plan → 完整 sha，或空
   done < <(awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' "${ARCHIVE_DIR}/timing.md")
 }
 
+# 脚本自己写的东西自己无视：docs/reviews 下全部，以及 .review-map 里只新增了“# 自动升级”行的改动。
+# 它们不算工作区脏、不参与路由、不算混装，随写手下一次真实提交自然带走。
+# drop_own 从 stdin 过滤路径；参数是 git diff 的范围（"A B" 为两提交之间，"HEAD" 为工作区对 HEAD，空则不查图）。
+ARCHIVE_REL="docs/reviews"
+map_only_auto() {        # .review-map 在给定范围内的改动是否只有新增的自动升级行
+  [ -n "${REVIEW_MAP}" ] || return 1
+  git diff "$@" -- "${REVIEW_MAP}" | grep -E '^[-+][^-+]' | grep -vqE '^\+.*# 自动升级' && return 1
+  return 0
+}
+drop_own() {
+  local f keep_map=1
+  [ $# -eq 0 ] || ! map_only_auto "$@" || keep_map=0
+  while IFS= read -r f; do
+    case "${f}" in "${ARCHIVE_REL}"/*) continue;; esac
+    [ "${f}" = "${REVIEW_MAP}" ] && [ "${keep_map}" -eq 0 ] && continue
+    printf '%s\n' "${f}"
+  done
+}
+tree_clean() { [ -z "$(git diff --name-only HEAD | drop_own HEAD)" ]; }
+commit_files() {         # $1=sha → 该提交自己改的文件，已去掉脚本写的
+  if git rev-parse -q --verify "$1^" >/dev/null 2>&1; then git diff --name-only "$1^" "$1" | drop_own "$1^" "$1"
+  else git diff-tree --root --no-commit-id --name-only -r "$1" | drop_own; fi
+}
+
 # 范围内的改动文件 = 范围内每个提交各自改的文件之并集，但跳过人用 SKIP_REVIEW 放过的提交（记在 skipped.md）：
 # 人的跳过是终审，不是推后，那些文件不该再把范围推给评审方。
 range_files() {          # $1=base(可空) $2=head → 改动文件列表
@@ -813,7 +836,7 @@ range_files() {          # $1=base(可空) $2=head → 改动文件列表
   skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ' | tr '\n' ' ')
   for c in $(git rev-list ${1:+"$1.."}"$2"); do
     case " ${skipped} " in *" $(git rev-parse --short "${c}") "*) continue;; esac
-    if git rev-parse -q --verify "${c}^" >/dev/null 2>&1; then git diff --name-only "${c}^" "${c}"; else git diff-tree --root --no-commit-id --name-only -r "${c}"; fi
+    commit_files "${c}"
   done | sort -u
 }
 
@@ -878,8 +901,7 @@ triage_head() {
   local head files f plan_hits verdict reason pane saved level
   local code_base plan_base ncommits nlines prev_sha prev_verdict prev_base new_text
   head=$(git rev-parse HEAD)
-  git diff --quiet && git diff --cached --quiet \
-    || { echo "ERROR: 工作区未提交。先提交，再运行 request-review 判定要不要评审"; exit 2; }
+  tree_clean || { echo "ERROR: 工作区未提交。先提交，再运行 request-review 判定要不要评审"; exit 2; }
   brief_gate
 
   # 已对这个 HEAD 判过：直接复用，不再问评审方
@@ -901,6 +923,10 @@ triage_head() {
     path_is_plan "${f}" && plan_hits="${plan_hits}${f} "
   done < <(range_files "${plan_base}" "${head}")
   [ -z "${plan_hits}" ] || triage_conclude "${head}" REVIEW 脚本 "触及计划/规则文档（自 ${plan_base:0:7} 起）：${plan_hits}" plan "${plan_base}" review
+
+  # 1.5 范围里只有脚本写的评审记录：不路由、不记录，直接结束
+  [ -n "$(range_files "${code_base}" "${head}")" ] \
+    || { echo "SKIP: 自 ${code_base:0:7} 起只有脚本写的评审记录，无需路由"; exit 0; }
 
   # 2. 代码范围：自上次 code 评审起。纯文本文件默认是状态记录、不参与判定，除非风险图明确把它标为 deep 或 review
   #    （README 之类出过阻断的文档）；light / skip / 图上没有的文本一律不算。
@@ -942,7 +968,7 @@ triage_head() {
 
   # 5. 累积上限：不问评审方直接审
   ncommits=$(git rev-list --count "${code_base:+${code_base}..}${head}" 2>/dev/null || echo 1)
-  nlines=$(git diff --shortstat ${code_base:+"${code_base}"} "${head}" 2>/dev/null | grep -oE '[0-9]+ (insertion|deletion)' | awk '{s+=$1} END{print s+0}')
+  nlines=$(git diff --shortstat ${code_base:+"${code_base}"} "${head}" -- . ":(exclude)${ARCHIVE_REL}" 2>/dev/null | grep -oE '[0-9]+ (insertion|deletion)' | awk '{s+=$1} END{print s+0}')
   if [ "${ncommits}" -gt "${REVIEW_ACCUM_COMMITS}" ] || [ "${nlines:-0}" -gt "${REVIEW_ACCUM_LINES}" ]; then
     triage_conclude "${head}" REVIEW 脚本 "自 ${code_base:0:7} 起累积 ${ncommits} 个提交、${nlines:-0} 行改动，超过上限（${REVIEW_ACCUM_COMMITS} 提交 / ${REVIEW_ACCUM_LINES} 行）" code "${code_base}" review
   fi
@@ -1044,7 +1070,7 @@ if [ "${cur}" -eq 1 ] && [ -n "${REVIEW_PLAN_PATHS}${REVIEW_RULE_PATHS}" ]; then
   while IFS= read -r f; do
     [ -n "${f}" ] || continue
     if path_is_plan "${f}"; then plan_hits="${plan_hits}${f}"$'\n'; else other_hits="${other_hits}${f}"$'\n'; fi
-  done < <(git diff --name-only HEAD^ HEAD 2>/dev/null || git diff-tree --root --no-commit-id --name-only -r HEAD)
+  done < <(commit_files HEAD)
   if [ -n "${plan_hits}" ] && [ -n "${other_hits}" ]; then
     echo "ERROR: target 提交 $(git rev-parse --short HEAD) 把计划/规则文档和其他文件混在一起（REVIEW_PLAN_PATHS / REVIEW_RULE_PATHS）。拆成两个 commit，计划/规则文档以 kind: plan 单独送审："
     printf '%s' "${plan_hits}${other_hits}"; exit 2
@@ -1070,8 +1096,7 @@ fi
 # 只在即将派发时要求工作区干净。续等时 target 已钉在 .sent 里，而且脚本自己会弄脏
 # 工作区（归档、timing、precision），再查一次只会把写手挡在已完成的评审外面。
 if [ ! -f "${SENT}" ]; then
-  git diff --quiet && git diff --cached --quiet \
-    || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
+  tree_clean || { echo "ERROR: 工作区未提交。评审必须对着已提交的 sha，否则行号会漂、构建产物互踩"; exit 2; }
 fi
 
 # ---- 新周期开始：先归档上一周期，再记录本周期的 request 与 sha ----
@@ -2616,8 +2641,8 @@ if __name__ == "__main__":
 完成以下验证后再写正文：
 
 1. 用 `git rev-parse HEAD` 取得完整 sha；用 `git status --short` 判断工作区是否干净。
-   工作区必须干净；若输出非空，停下并告知用户先提交或 stash，不要在脏工作树上
-   生成本文件。
+   工作区必须干净（docs/reviews/ 和 .review-map 里评审脚本自己写的记录除外，随本文件一起
+   提交即可）；若还有别的输出，停下并告知用户先提交或 stash，不要在脏工作树上生成本文件。
 2. 实际尝试运行项目的测试与检查命令，不得照抄 README 或其他文档的结论：
    - 运行一次全量测试，记录真实结果（通过、失败或无法运行，以及失败位置或阻塞原因）。
    - 运行 lint 与 typecheck；若没有相应配置，确认并记录“不存在”。

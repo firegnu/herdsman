@@ -775,3 +775,46 @@ grep -q '升级 src/util/u.py → deep' "${TMP}/stderr" || fail 'upgrade note mi
 tail -1 "${REPO}/docs/reviews/timing.md" | grep -q '| code$' || fail 'timing row lacks kind'
 rm -f "${REPO}/src/util/u.py"
 echo 'PASS a blocking finding upgrades its path in the map'
+
+# ---- Script-written files never block, route, or count as a mix ----
+# The tree now carries the round's timing/precision rows and the map upgrade line, uncommitted.
+# A new code commit that leaves them behind is still dispatchable: they are the script's, not the writer's.
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/triage.md" "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+git -C "${REPO}" status --porcelain -- docs/reviews | grep -q . || fail "fixture: docs/reviews should be dirty: $(git -C "${REPO}" status --porcelain)"
+git -C "${REPO}" status --porcelain | grep -q '^ M .review-map' || fail 'fixture: .review-map should be dirty'
+commit_file src/core/c5.py 'code with records left behind'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'dirty records routing status'
+grep -q '未提交' "${TMP}/stdout" && fail 'script-written files counted as a dirty tree'
+# A commit that only carries the records and the upgrade line is not routed and leaves no trace.
+printf '2026-09-03 | %s | round 1/3 | 1s | code\n2026-09-03 | %s | round 1/2 | 1s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+rm -f "${REVIEW_DIR}"/.triage*
+n_closed=$(grep -c . "${SELF_CLOSED}")
+git -C "${REPO}" add -A docs/reviews .review-map; git -C "${REPO}" commit -qm 'records only'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'records-only status'
+grep -q '无需路由' "${TMP}/stdout" || fail 'records-only commit was routed'
+assert_eq "$(grep -c . "${SELF_CLOSED}")" "${n_closed}" 'records-only commit left a self-closed row'
+[ -f "${REVIEW_DIR}/.triage" ] && fail 'records-only commit left a triage cache'
+assert_eq "$(call_count '^agent ')" 0 'records-only agent calls'
+# A plan commit with records and an upgrade line riding along is still a pure plan commit.
+printf 'p3\n' >> "${REPO}/docs/plans/q.md"
+printf '2026-09-03 | x | blocking 0 | 误报 ?\n' >> "${REPO}/docs/reviews/precision.md"
+printf '%-40s deep    # 自动升级：abc1234 第 1 轮出阻断（原 light）\n' src/util/v.py >> "${REPO}/.review-map"
+git -C "${REPO}" add docs/plans/q.md docs/reviews/precision.md .review-map; git -C "${REPO}" commit -qm 'plan with records riding along'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'plan with records routing status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'plan with records kind'
+base=$(sed -n 's/^base sha: \([0-9a-f]*\).*/\1/p' "${TMP}/stdout")
+write_request plan "${base}" 1/2
+run_review new
+assert_eq "${RUN_STATUS}" 3 'plan with records dispatch status'
+# A human edit to the map is still a rule change and routes as plan.
+rm -f "${REVIEW_DIR}"/.triage* "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/.cycle* "${PANE_CACHE}"
+printf '2026-09-04 | %s | round 1/2 | 1s | plan\n' "$(git -C "${REPO}" rev-parse --short HEAD)" >> "${REPO}/docs/reviews/timing.md"
+printf 'src/legacy/**   skip   # human decision\n' >> "${REPO}/.review-map"
+git -C "${REPO}" add -A docs/reviews .review-map; git -C "${REPO}" commit -qm 'human map edit'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'human map edit status'
+grep -q '^kind: plan' "${TMP}/stdout" || fail 'human map edit should route as plan'
+echo 'PASS script-written records and map upgrades never block, route, or mix'
