@@ -54,11 +54,26 @@ reviewer() {
     "${status}" "${pane}" "${MOCK_REVIEW_WT}" "${session}"
 }
 
+planner() {
+  local pane="$1" status="$2"
+  printf '{"agent":"claude","agent_status":"%s","pane_id":"%s","terminal_id":"term-plan","name":"pl-repo-","cwd":"%s","foreground_cwd":"%s","interactive_ready":true,"agent_session":{"source":"herdr:claude","agent":"claude","kind":"id","value":"session-plan"}}' \
+    "${status}" "${pane}" "${MOCK_REPO}" "${MOCK_REPO}"
+}
+writer() {  # 写手和规划者同目录、没有名字：按目录找会撞上它
+  printf '{"agent":"codex","agent_status":"working","pane_id":"writer-pane","terminal_id":"term-writer","cwd":"%s","foreground_cwd":"%s","interactive_ready":true}' "${MOCK_REPO}" "${MOCK_REPO}"
+}
+
 case "$1 $2" in
   'agent list')
     case "${MOCK_SCENARIO}" in
       new|live|lost-once|lost|stalled-working)
         printf '{"result":{"agents":['; reviewer reviewer-pane working; printf ']}}\n';;
+      plan-new)
+        printf '{"result":{"agents":['; writer; printf ']}}\n';;
+      plan-live)
+        printf '{"result":{"agents":['; writer; printf ','; planner new-pane working; printf ']}}\n';;
+      plan-idle)
+        printf '{"result":{"agents":['; writer; printf ','; planner new-pane idle; printf ']}}\n';;
       changed)
         printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","pane_id":"reviewer-pane","terminal_id":"term-review","cwd":"/other","foreground_cwd":"%s","interactive_ready":true}]}}\n' "${MOCK_REVIEW_WT}";;
       session-changed)
@@ -81,6 +96,14 @@ case "$1 $2" in
         printf '{"result":{"agent":{"agent":"claude","agent_status":"working","pane_id":"old-pane","terminal_id":"term-other","cwd":"/Users/firegnu/.local/share/blender_mcp/mcp","foreground_cwd":"/Users/firegnu/.local/share/blender_mcp/mcp","interactive_ready":true}}}\n';;
       stale:new-pane)
         printf '{"result":{"agent":'; reviewer new-pane idle; printf '}}\n';;
+      plan-new:new-pane|plan-idle:new-pane)
+        if [ "$(grep -c '^agent prompt ' "${MOCK_LOG}")" -eq 0 ]; then
+          printf '{"result":{"agent":'; planner new-pane idle; printf '}}\n'
+        else
+          printf '{"result":{"agent":'; planner new-pane working; printf '}}\n'
+        fi;;
+      plan-live:new-pane)
+        printf '{"result":{"agent":'; planner new-pane working; printf '}}\n';;
       *)
         printf '{"error":{"code":"agent_not_found"}}\n' >&2
         exit 1;;
@@ -101,7 +124,10 @@ case "$1 $2" in
       || { [ "${MOCK_SCENARIO}" = lost-once ] && [ "$(grep -c '^agent prompt ' "${MOCK_LOG}")" -eq 1 ]; }; then
       printf '{"error":{"code":"agent_prompt_stalled"}}\n' >&2; exit 1
     fi
-    printf '{"result":{"agent":'; reviewer "$3" working; printf '}}\n';;
+    case "${MOCK_SCENARIO}" in
+      plan-*) printf '{"result":{"agent":'; planner "$3" working; printf '}}\n';;
+      *) printf '{"result":{"agent":'; reviewer "$3" working; printf '}}\n';;
+    esac;;
   *) echo "unexpected herdr call: $*" >&2; exit 1;;
 esac
 EOF
@@ -126,15 +152,15 @@ call_count() {
 }
 
 run_review() {
-  local scenario="$1"
+  local scenario="$1"; shift
   : > "${MOCK_LOG}"
   set +e
   (
     cd "${REPO}"
     PATH="${MOCK_BIN}:${PATH}" \
-      MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO="${scenario}" MOCK_REVIEW_WT="${REVIEW_WT}" \
+      MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO="${scenario}" MOCK_REVIEW_WT="${REVIEW_WT}" MOCK_REPO="$(cd "${REPO}" && pwd -P)" \
       HERDR_PANE_ID=writer-pane \
-      "${REQUEST_REVIEW}"
+      "${REQUEST_REVIEW}" "$@"
   ) > "${TMP}/stdout" 2> "${TMP}/stderr"
   RUN_STATUS=$?
   set -e
@@ -861,3 +887,77 @@ run_review new
 assert_eq "${RUN_STATUS}" 6 'human map edit status'
 grep -q '^kind: plan' "${TMP}/stdout" || fail 'human map edit should route as plan'
 echo 'PASS script-written records and map upgrades never block, route, or mix'
+
+# ---- Planner: request-review plan ----
+# Not configured → exit 2 and the writer plans on its own.
+run_review none plan
+assert_rejected 'planner unconfigured' '未配置规划者'
+printf 'PLAN_KIND=claude\nPLAN_AGENT_ARGS="--model claude-opus-5"\n' >> "${REPO}/.review.conf"
+run_review none plan
+assert_rejected 'planner without request' 'plan-request.md'
+printf 'task: 做 M5\nconstraints: 不改 WorldProposal\n' > "${REVIEW_DIR}/plan-request.md"
+# A stale brief stops the request before the planner is even spawned: the writer rewrites it first (exit 7).
+grep -v '^REVIEW_BRIEF=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+run_review none plan
+assert_eq "${RUN_STATUS}" 7 'planner behind a stale brief status'
+assert_eq "$(call_count '^agent ')" 0 'stale brief must not spawn the planner'
+printf 'REVIEW_BRIEF=\n' >> "${REPO}/.review.conf"
+printf 'wip\n' > "${REPO}/src/wip.py"; git -C "${REPO}" add src/wip.py
+run_review none plan
+assert_rejected 'planner on a dirty tree' '工作区未提交'
+git -C "${REPO}" reset -q src/wip.py; rm -f "${REPO}/src/wip.py"
+# The writer sits in the repo dir with no name; the planner is spawned there by name with its args.
+run_review plan-new plan
+assert_eq "${RUN_STATUS}" 3 'planner dispatch status'
+assert_eq "$(call_count '^pane split ')" 1 'planner split count'
+grep -q '^agent start pl-repo- --kind claude --pane new-pane --timeout [0-9]* -- --model claude-opus-5$' "${MOCK_LOG}" || fail 'planner start line'
+assert_eq "$(call_count '^agent prompt new-pane Plan request for repo')" 1 'planner prompt count'
+grep -q 'planner-prompt.md' "${MOCK_LOG}" || fail 'planner prompt lacks the planner rules path'
+[ -f "${REVIEW_DIR}/.plan.sent" ] || fail 'plan sent marker missing'
+assert_eq "$(sed -n '3p' "${REVIEW_DIR}/.plan.sent")" new-pane 'plan sent pane'
+# Waiting on the planner never overwrites .last (that belongs to the planner's own request-review runs).
+[ -f "${REVIEW_DIR}/.last-plan.out" ] || fail 'plan mode should log to .last-plan.out'
+[ "$(cut -d' ' -f1 "${REVIEW_DIR}/.last")" != 3 ] || fail 'plan wait wrote exit 3 into .last'
+# Continuation reuses the saved planner and never re-prompts.
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 3 'planner continuation status'
+assert_eq "$(call_count '^agent prompt ')" 0 'planner continuation prompt count'
+assert_eq "$(call_count '^pane split ')" 0 'planner continuation split count'
+# Delivery: plan.md complete, the tree clean, and the planner's commits touch only plan paths → exit 0.
+assert_eq "$(sed -n '6p' "${REVIEW_DIR}/.plan.sent")" "$(git -C "${REPO}" rev-parse HEAD)" 'dispatch HEAD recorded'
+commit_file docs/plans/M5.md 'docs: plan M5'
+printf 'PLAN: docs/plans/M5.md\n边界：不改 WorldProposal。\nPLAN-COMPLETE\n' > "${REVIEW_DIR}/plan.md"
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 0 'planner delivery status'
+assert_eq "$(cat "${TMP}/stdout")" "${REVIEW_DIR}/plan.md" 'planner delivery prints plan.md'
+# The planner committed code alongside the plan → exit 4, even with a clean tree.
+commit_file src/sneaky.py 'planner touched code'
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 4 'planner touched code status'
+grep -q '改了计划以外的文件：src/sneaky.py' "${TMP}/stdout" || fail 'stray file not named'
+git -C "${REPO}" reset -q --hard HEAD~1
+# Delivered but the planner left uncommitted work → exit 4.
+printf 'x\n' > "${REPO}/src/left.py"; git -C "${REPO}" add src/left.py
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 4 'planner left dirty tree status'
+grep -q '未提交的改动' "${TMP}/stdout" || fail 'dirty delivery message'
+git -C "${REPO}" reset -q src/left.py; rm -f "${REPO}/src/left.py"
+# A STOP answer → exit 4.
+printf 'STOP: 任务和 M4 计划冲突\nPLAN-COMPLETE\n' > "${REVIEW_DIR}/plan.md"
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 4 'planner stop status'
+grep -q '规划者停下了' "${TMP}/stdout" || fail 'planner stop message'
+assert_eq "$(cut -d' ' -f1 "${REVIEW_DIR}/.last")" 4 'planner stop recorded in .last'
+grep -q '规划者停下了' "${REVIEW_DIR}/.last.out" || fail 'planner stop output not copied to .last.out'
+# A changed request supersedes the old answer and is dispatched afresh to the existing planner.
+printf 'task: 做 M6\n' > "${REVIEW_DIR}/plan-request.md"
+run_review plan-idle plan
+assert_eq "${RUN_STATUS}" 3 'planner new request status'
+assert_eq "$(call_count '^agent prompt new-pane Plan request')" 1 'planner new request prompt count'
+assert_eq "$(call_count '^agent start ')" 0 'planner new request reuses the pane'
+[ -f "${REVIEW_DIR}/plan.md" ] && fail 'old plan.md should be discarded'
+# The review path is untouched by planner state: a plain run still routes.
+rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.triage*
+run_review new
+[ "${RUN_STATUS}" -ne 2 ] || fail "review path broken by planner files: $(cat "${TMP}/stdout")"
+echo 'PASS request-review plan dispatches, waits, delivers and stops like a review'

@@ -17,6 +17,10 @@
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
 #   7 = reviewer brief 缺失或过期，先写/重写 brief（单独提交，它会作为 kind: plan 送审），再运行
+#
+# request-review plan：请规划者（PLAN_KIND，前沿模型）决定一个任务要不要计划并起草它。写手把任务写进
+# $REVIEW_DIR/plan-request.md 后运行；3 = 规划中再运行续等；0 = 已交付，stdout 是 plan.md 的路径；
+# 2 = 未配置规划者或工作区未提交；4 = 规划者卡住或停下。规划者自己提交计划并走完计划评审。
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -41,6 +45,9 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
 : "${REVIEW_ACCUM_LINES:=2000}"                    # 同上，按改动行数
 : "${REVIEW_BOARD=review-board}"   # 退出时重新生成看板的命令；置空则不生成（测试用）
+: "${REVIEW_AGENT_ARGS=}"          # 拉起评审方时透传给 agent 的参数，如 "--model claude-opus-5"
+: "${PLAN_KIND=}"                  # 规划者 agent 类型；空则没有规划者，写手自己写计划
+: "${PLAN_AGENT_ARGS=}"            # 拉起规划者时透传的参数
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
 
@@ -48,12 +55,19 @@ DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
 
 # 本次运行的全部输出留一份在 .last.out，退出码和时间写 .last：写手停下时看板直接显示脚本说了什么，
 # 人不必去翻写手的终端。每次退出（不论退出码）都刷新看板：状态只在脚本退出时变化。看板是只读的派生视图。
-: > "${DIR}/.last.out"
-exec > >(tee -a "${DIR}/.last.out"); TEE_OUT=$!
-exec 2> >(tee -a "${DIR}/.last.out" >&2); TEE_ERR=$!
+# `plan` 模式（写手每 10 秒续等规划者）和规划者自己的 request-review 会同时跑：续等的输出单独放
+# .last-plan.out，只在真的停下（不是 0/3）时才覆盖 .last，免得把规划者那次运行的记录冲掉。
+LAST_OUT="${DIR}/.last.out"; [ "${1:-}" = plan ] && LAST_OUT="${DIR}/.last-plan.out"
+: > "${LAST_OUT}"
+exec > >(tee -a "${LAST_OUT}"); TEE_OUT=$!
+exec 2> >(tee -a "${LAST_OUT}" >&2); TEE_ERR=$!
 on_exit() {
   local code=$?
-  printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"
+  if [ "${LAST_OUT}" = "${DIR}/.last.out" ]; then
+    printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"
+  else
+    case "${code}" in 0|3) ;; *) printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"; cp "${LAST_OUT}" "${DIR}/.last.out" 2>/dev/null;; esac
+  fi
   exec 1>&- 2>&-; wait "${TEE_OUT}" "${TEE_ERR}" 2>/dev/null
   [ -n "${REVIEW_BOARD}" ] && command -v "${REVIEW_BOARD}" >/dev/null && "${REVIEW_BOARD}" --quiet >/dev/null 2>&1
   true
@@ -122,14 +136,18 @@ finish() {
 # 传输层 —— herdr 只出现在这一段。换 tmux / 非交互只改这里。
 # ============================================================
 
-# 按 cwd 找评审 agent。输出 "pane_id kind"，找不到输出空。
-# 找到多个视为异常（同一 worktree 不该有两个 agent），返回 2。
+# 传输层按角色参数化：评审方在 REVIEW_WT 里、按 cwd 认；规划者在仓库目录里，和写手同目录，只能按名字认。
+ROLE_LABEL="评审方"; AGENT_NAME=""; AGENT_ARGS="${REVIEW_AGENT_ARGS}"
+agent_name() { printf '%s-%s' "$1" "$(basename "${REPO}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)"; }
+
+# 按 cwd（配了 AGENT_NAME 再按名字）找 agent。输出 "pane_id kind"，找不到输出空。
+# 找到多个视为异常（同一 worktree 不该有两个），返回 2。
 transport_find() {
   local hits n
   hits=$(herdr agent list 2>/dev/null \
-    | jq -r --arg wt "${REVIEW_WT}" \
+    | jq -r --arg wt "${REVIEW_WT}" --arg name "${AGENT_NAME}" \
         '.result.agents[]
-         | select((.cwd // .foreground_cwd) == $wt)
+         | select((.cwd // .foreground_cwd) == $wt and ($name == "" or .name == $name))
          | "\(.pane_id) \(.agent)"')
   n=$(printf '%s' "${hits}" | grep -c . || true)
   if [ "${n:-0}" -gt 1 ]; then
@@ -155,7 +173,7 @@ transport_spawn() {
         cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
         if [ -n "${cached_kind}" ]; then
           if [ "${cached_kind}" = "${REVIEW_KIND}" ] && [ "${cached_cwd}" = "${REVIEW_WT}" ]; then
-            echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
+            echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} ${ROLE_LABEL}，直接复用。" >&2
             printf '%s' "${pane}"
             return 0
           fi
@@ -212,9 +230,10 @@ transport_spawn() {
     return 1
   fi
 
-  name="rv-$(basename "${REPO}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)"
+  name="${AGENT_NAME:-$(agent_name rv)}"
+  # shellcheck disable=SC2086
   err=$(herdr agent start "${name}" --kind "${REVIEW_KIND}" --pane "${pane}" \
-          --timeout "${REVIEW_START_TIMEOUT}" 2>&1 >/dev/null)
+          --timeout "${REVIEW_START_TIMEOUT}" ${AGENT_ARGS:+-- ${AGENT_ARGS}} 2>&1 >/dev/null)
   if [ -n "${err}" ]; then
     echo "STOP: 在 ${REVIEW_WT} 的 pane ${pane} 上启动 ${REVIEW_KIND} 失败。" >&2
     echo "herdr 原始返回: ${err}" >&2
@@ -233,7 +252,7 @@ transport_identity() {  # $1=pane_id
   cwd=$(printf '%s' "${payload}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
   terminal=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
   if [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] || [ -z "${terminal}" ]; then
-    echo "STOP: 无法确认 pane ${pane} 的 reviewer 身份（kind=${kind:-unknown}, cwd=${cwd:-unknown}, terminal_id=${terminal:-missing}）。" >&2
+    echo "STOP: 无法确认 pane ${pane} 的${ROLE_LABEL}身份（kind=${kind:-unknown}, cwd=${cwd:-unknown}, terminal_id=${terminal:-missing}）。" >&2
     return 1
   fi
   printf '%s' "${payload}" | jq -cS '.result.agent'
@@ -257,8 +276,8 @@ transport_resume() {    # $1=pane_id  $2=terminal_id(legacy 可空)  $3=agent_se
   session=$(printf '%s' "${agent}" | jq -cS '.agent_session // empty' 2>/dev/null)
   if [ -z "${pane}" ] || [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] \
     || { [ -n "${saved_session}" ] && [ "${session}" != "${saved_session}" ]; }; then
-    echo "STOP: 已发送轮次保存的 reviewer 不存在或身份已变化（pane=${saved_pane}, terminal_id=${saved_terminal:-legacy}）。" >&2
-    echo "      不会创建第二个 reviewer，也不会重发 prompt；请你亲自确认当前评审状态。" >&2
+    echo "STOP: 已发送的${ROLE_LABEL}不存在或身份已变化（pane=${saved_pane}, terminal_id=${saved_terminal:-legacy}）。" >&2
+    echo "      不会创建第二个${ROLE_LABEL}，也不会重发 prompt；请你亲自确认当前状态。" >&2
     return 1
   fi
   printf '%s' "${pane}"
@@ -285,12 +304,12 @@ transport_wait_ready() { # $1=pane_id
       idle|done)
         [ "${ready}" = "true" ] && return 0;;
       blocked)
-        echo "STOP: 评审方在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
+        echo "STOP: ${ROLE_LABEL}在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
         return 1;;
     esac
     sleep 1
   done
-  echo "STOP: 评审方未在 ${REVIEW_START_TIMEOUT}ms 内进入可接收状态（pane ${pane}）。" >&2
+  echo "STOP: ${ROLE_LABEL}未在 ${REVIEW_START_TIMEOUT}ms 内进入可接收状态（pane ${pane}）。" >&2
   echo "      last: interactive_ready=${ready}, agent_status=${state}；期望 interactive_ready=true 且 agent_status=idle/done。" >&2
   return 1
 }
@@ -349,16 +368,16 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
         { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
         return 0;;
     esac
-    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，评审方仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
+    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，${ROLE_LABEL}仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
   done
   case "${code}" in
     agent_blocked)
-      echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。" >&2
+      echo "STOP: ${ROLE_LABEL}停在审批或提问对话框，未发送任何输入。" >&2
       echo "      请你亲自查看 pane $1，不要让 agent 代答。" >&2;;
     agent_not_found|agent_not_running)
-      echo "STOP: 评审方在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
+      echo "STOP: ${ROLE_LABEL}在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
     agent_prompt_stalled|timeout)
-      echo "STOP: ${code}，重发一次后评审方仍 ${st:-unknown}，评审请求未送达（pane $1）。" >&2
+      echo "STOP: ${code}，重发一次后${ROLE_LABEL}仍 ${st:-unknown}，请求未送达（pane $1）。" >&2
       echo "      未写 $3；请你亲自查看 pane，确认状态后再决定是否重试。" >&2;;
     *)
       echo "STOP: 注入失败：${err}" >&2;;
@@ -379,18 +398,18 @@ wait_sentinel() {        # $1=file  $2=word  $3=pane_id
     st=$(transport_state "$3")
     case "${st}" in
       blocked)
-        echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
+        echo "STOP: ${ROLE_LABEL}进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
         exit 4;;
       idle|done)
         idle=$((idle + 1))
         if [ "${idle}" -ge 2 ]; then
-          echo "STOP: 评审方已空闲，但 $1 没有以 $2 结尾。它这轮没有交付，请你亲自查看 pane $3。"
+          echo "STOP: ${ROLE_LABEL}已空闲，但 $1 没有以 $2 结尾。它这轮没有交付，请你亲自查看 pane $3。"
           exit 4
         fi;;
       *) idle=0;;
     esac
   done
-  echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行 request-review 继续等待，不会重发 prompt。"
+  echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行${RERUN_HINT:- request-review} 继续等待，不会重发 prompt。"
   exit 3
 }
 
@@ -704,6 +723,80 @@ last line TRIAGE-COMPLETE. Reply with only that path." || exit 4
     *) echo "STOP: triage 文件第一行不是 REVIEW 或 SKIP：${TRIAGE_OUT}"; exit 4;;
   esac
 }
+
+# ============================================================
+# 规划者 —— request-review plan。写手把任务写进 plan-request.md，规划者（前沿模型）决定
+# 直接做 / 短计划 / 完整计划，起草计划、单独提交、自己跑 request-review 走完计划评审，
+# 然后把答复写进 plan.md（首行 PLAN: <路径> / DIRECT / STOP: <原因>，末行 PLAN-COMPLETE）。
+# 规划者在仓库目录里工作，写手等待期间不碰工作区。这段不影响评审周期的任何逻辑。
+# ============================================================
+plan_prompt() {
+  printf 'Plan request for %s.\nRead %s/.config/review/planner-prompt.md first, then %s.\nReviewer brief: %s\nHandoff dir: %s\nWrite your answer to %s with last line PLAN-COMPLETE. Reply with only that path.' \
+    "$(basename "${REPO}")" "${HOME}" "${PREQ}" "${REPO}/${REVIEW_BRIEF:-docs/reviewer-brief.md}" "${DIR}" "${POUT}"
+}
+acquire_planner() {      # 定位或拉起规划者，输出 pane_id；失败返回 1（已打印 STOP）
+  local found pane rkind
+  if ! found=$(transport_find); then
+    echo "STOP: 仓库里有多个叫 ${AGENT_NAME} 的 agent（见上）。关掉多余的再重试。" >&2; return 1
+  fi
+  if [ -n "${found}" ]; then
+    pane=$(printf '%s' "${found}" | awk '{print $1}'); rkind=$(printf '%s' "${found}" | awk '{print $2}')
+    [ "${rkind}" = "${REVIEW_KIND}" ] || { echo "STOP: ${AGENT_NAME} 是 ${rkind}，期望 ${REVIEW_KIND}。" >&2; return 1; }
+  else
+    echo "NOTE: 没有规划者，正在仓库目录里拉起 ${REVIEW_KIND} …" >&2
+    pane=$(transport_spawn) || return 1
+  fi
+  transport_wait_ready "${pane}" || return 1
+  printf '%s' "${pane}"
+}
+plan_deliver() {         # plan.md 已完成时的交付；返回 1 表示还没完成
+  local first
+  sentinel_ok "${POUT}" PLAN-COMPLETE || return 1
+  first=$(sed -n '1p' "${POUT}")
+  case "${first}" in
+    STOP*) echo "STOP: 规划者停下了：${first#STOP:}"; echo "      详情见 ${POUT}，请你亲自查看 pane $(sed -n '3p' "${PSENT}")。"; exit 4;;
+  esac
+  tree_clean || { echo "STOP: 规划者交活了，但工作区还有未提交的改动。请你看一眼 pane $(sed -n '3p' "${PSENT}")，确认后再让写手继续。"; exit 4; }
+  # 规划者只准动计划文件：派发时的 HEAD 到现在，去掉脚本记录后必须全是计划/规则路径
+  base=$(sed -n '6p' "${PSENT}"); stray=""
+  if [ -n "${base}" ] && git rev-parse -q --verify "${base}^{commit}" >/dev/null; then
+    while IFS= read -r f; do
+      [ -n "${f}" ] || continue
+      path_is_plan "${f}" || stray="${stray}${f} "
+    done < <(git diff --name-only "${base}" HEAD | drop_own "${base}" HEAD)
+  fi
+  if [ -n "${stray}" ]; then
+    echo "STOP: 规划者改了计划以外的文件：${stray}"
+    echo "      规划者只准写 docs/plans 下的计划。请你看一眼 pane $(sed -n '3p' "${PSENT}") 和这些提交，处理后再让写手继续。"; exit 4
+  fi
+  echo "${POUT}"; exit 0
+}
+if [ "${1:-}" = plan ]; then
+  [ -n "${PLAN_KIND}" ] || { echo "ERROR: 未配置规划者（.review.conf 里 PLAN_KIND 为空）。这个项目由写手自己写计划。"; exit 2; }
+  PREQ="${DIR}/plan-request.md"; PSENT="${DIR}/.plan.sent"; POUT="${DIR}/plan.md"
+  [ -s "${PREQ}" ] || { echo "ERROR: 缺 ${PREQ}。把任务原话和已知约束写进去，再运行 request-review plan"; exit 2; }
+  # 角色切换：传输层按这些全局变量工作
+  REVIEW_WT="${REPO}"; REVIEW_KIND="${PLAN_KIND}"; PANE_CACHE="${DIR}/.plan-pane"
+  ROLE_LABEL="规划者"; AGENT_NAME=$(agent_name pl); AGENT_ARGS="${PLAN_AGENT_ARGS}"; RERUN_HINT=" request-review plan"
+  fp=$(shasum -a 256 < "${PREQ}" | cut -c1-40)
+  # 请求内容变了 = 新请求，旧的发送记录与答复作废
+  if [ -f "${PSENT}" ] && [ "$(sed -n '2p' "${PSENT}")" != "${fp}" ]; then rm -f "${PSENT}" "${POUT}"; fi
+  [ -f "${PSENT}" ] && plan_deliver
+  if [ -f "${PSENT}" ]; then
+    pane=$(transport_resume "$(sed -n '3p' "${PSENT}")" "$(sed -n '4p' "${PSENT}")" "$(sed -n '5p' "${PSENT}")") || exit 4
+    echo "NOTE: 规划请求已发送，继续等待规划者 ${pane}；不会重发。" >&2
+  else
+    tree_clean || { echo "ERROR: 工作区未提交。规划者要在你的提交之上写计划，先提交再请它。"; exit 2; }
+    brief_gate   # 规划者读简报，之后送审也过这道门：简报过期就让写手先重写（exit 7），别让规划者卡在那
+    rm -f "${POUT}"
+    pane=$(acquire_planner) || exit 4
+    send_prompt "${pane}" "${fp}" "${PSENT}" "$(plan_prompt)" || exit 4
+    git rev-parse HEAD >> "${PSENT}"   # 第 6 行：派发时的 HEAD，交活时据此核对规划者只动了计划
+  fi
+  wait_sentinel "${POUT}" PLAN-COMPLETE "${pane}"
+  plan_deliver
+  exit 3
+fi
 
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----
 if [ "${SKIP_REVIEW:-0}" = "1" ]; then

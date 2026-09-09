@@ -14,6 +14,7 @@
 - 第 4 部分：四份文件的分工
 - 第 5 部分：所有模板原文
 - 第 6 部分：生成项目简报的提示词
+- 第 6b 部分：规划者（可选角色）
 - 第 7 部分：轮次控制
 - 第 8 部分：度量
 - 第 9 部分：失效模式与警戒线
@@ -336,6 +337,10 @@ review（常规）、light（一轮、只找阻断、不跑测试）、plan（�
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
 #   7 = reviewer brief 缺失或过期，先写/重写 brief（单独提交，它会作为 kind: plan 送审），再运行
+#
+# request-review plan：请规划者（PLAN_KIND，前沿模型）决定一个任务要不要计划并起草它。写手把任务写进
+# $REVIEW_DIR/plan-request.md 后运行；3 = 规划中再运行续等；0 = 已交付，stdout 是 plan.md 的路径；
+# 2 = 未配置规划者或工作区未提交；4 = 规划者卡住或停下。规划者自己提交计划并走完计划评审。
 set -uo pipefail
 
 command -v jq    >/dev/null || { echo "ERROR: jq 不在 PATH 中（PATH=${PATH}）"; exit 2; }
@@ -360,6 +365,9 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
 : "${REVIEW_ACCUM_LINES:=2000}"                    # 同上，按改动行数
 : "${REVIEW_BOARD=review-board}"   # 退出时重新生成看板的命令；置空则不生成（测试用）
+: "${REVIEW_AGENT_ARGS=}"          # 拉起评审方时透传给 agent 的参数，如 "--model claude-opus-5"
+: "${PLAN_KIND=}"                  # 规划者 agent 类型；空则没有规划者，写手自己写计划
+: "${PLAN_AGENT_ARGS=}"            # 拉起规划者时透传的参数
 
 [ -d "${REVIEW_WT}" ] || { echo "ERROR: REVIEW_WT 不存在：${REVIEW_WT}（先 git worktree add）"; exit 2; }
 
@@ -367,12 +375,19 @@ DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
 
 # 本次运行的全部输出留一份在 .last.out，退出码和时间写 .last：写手停下时看板直接显示脚本说了什么，
 # 人不必去翻写手的终端。每次退出（不论退出码）都刷新看板：状态只在脚本退出时变化。看板是只读的派生视图。
-: > "${DIR}/.last.out"
-exec > >(tee -a "${DIR}/.last.out"); TEE_OUT=$!
-exec 2> >(tee -a "${DIR}/.last.out" >&2); TEE_ERR=$!
+# `plan` 模式（写手每 10 秒续等规划者）和规划者自己的 request-review 会同时跑：续等的输出单独放
+# .last-plan.out，只在真的停下（不是 0/3）时才覆盖 .last，免得把规划者那次运行的记录冲掉。
+LAST_OUT="${DIR}/.last.out"; [ "${1:-}" = plan ] && LAST_OUT="${DIR}/.last-plan.out"
+: > "${LAST_OUT}"
+exec > >(tee -a "${LAST_OUT}"); TEE_OUT=$!
+exec 2> >(tee -a "${LAST_OUT}" >&2); TEE_ERR=$!
 on_exit() {
   local code=$?
-  printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"
+  if [ "${LAST_OUT}" = "${DIR}/.last.out" ]; then
+    printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"
+  else
+    case "${code}" in 0|3) ;; *) printf '%s %s\n' "${code}" "$(date +%s)" > "${DIR}/.last"; cp "${LAST_OUT}" "${DIR}/.last.out" 2>/dev/null;; esac
+  fi
   exec 1>&- 2>&-; wait "${TEE_OUT}" "${TEE_ERR}" 2>/dev/null
   [ -n "${REVIEW_BOARD}" ] && command -v "${REVIEW_BOARD}" >/dev/null && "${REVIEW_BOARD}" --quiet >/dev/null 2>&1
   true
@@ -441,14 +456,18 @@ finish() {
 # 传输层 —— herdr 只出现在这一段。换 tmux / 非交互只改这里。
 # ============================================================
 
-# 按 cwd 找评审 agent。输出 "pane_id kind"，找不到输出空。
-# 找到多个视为异常（同一 worktree 不该有两个 agent），返回 2。
+# 传输层按角色参数化：评审方在 REVIEW_WT 里、按 cwd 认；规划者在仓库目录里，和写手同目录，只能按名字认。
+ROLE_LABEL="评审方"; AGENT_NAME=""; AGENT_ARGS="${REVIEW_AGENT_ARGS}"
+agent_name() { printf '%s-%s' "$1" "$(basename "${REPO}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)"; }
+
+# 按 cwd（配了 AGENT_NAME 再按名字）找 agent。输出 "pane_id kind"，找不到输出空。
+# 找到多个视为异常（同一 worktree 不该有两个），返回 2。
 transport_find() {
   local hits n
   hits=$(herdr agent list 2>/dev/null \
-    | jq -r --arg wt "${REVIEW_WT}" \
+    | jq -r --arg wt "${REVIEW_WT}" --arg name "${AGENT_NAME}" \
         '.result.agents[]
-         | select((.cwd // .foreground_cwd) == $wt)
+         | select((.cwd // .foreground_cwd) == $wt and ($name == "" or .name == $name))
          | "\(.pane_id) \(.agent)"')
   n=$(printf '%s' "${hits}" | grep -c . || true)
   if [ "${n:-0}" -gt 1 ]; then
@@ -474,7 +493,7 @@ transport_spawn() {
         cached_cwd=$(printf '%s' "${cached_agent}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
         if [ -n "${cached_kind}" ]; then
           if [ "${cached_kind}" = "${REVIEW_KIND}" ] && [ "${cached_cwd}" = "${REVIEW_WT}" ]; then
-            echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} 评审方，直接复用。" >&2
+            echo "NOTE: 缓存 pane ${pane} 已有 ${cached_kind} ${ROLE_LABEL}，直接复用。" >&2
             printf '%s' "${pane}"
             return 0
           fi
@@ -531,9 +550,10 @@ transport_spawn() {
     return 1
   fi
 
-  name="rv-$(basename "${REPO}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)"
+  name="${AGENT_NAME:-$(agent_name rv)}"
+  # shellcheck disable=SC2086
   err=$(herdr agent start "${name}" --kind "${REVIEW_KIND}" --pane "${pane}" \
-          --timeout "${REVIEW_START_TIMEOUT}" 2>&1 >/dev/null)
+          --timeout "${REVIEW_START_TIMEOUT}" ${AGENT_ARGS:+-- ${AGENT_ARGS}} 2>&1 >/dev/null)
   if [ -n "${err}" ]; then
     echo "STOP: 在 ${REVIEW_WT} 的 pane ${pane} 上启动 ${REVIEW_KIND} 失败。" >&2
     echo "herdr 原始返回: ${err}" >&2
@@ -552,7 +572,7 @@ transport_identity() {  # $1=pane_id
   cwd=$(printf '%s' "${payload}" | jq -r '.result.agent.cwd // .result.agent.foreground_cwd // empty' 2>/dev/null)
   terminal=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
   if [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] || [ -z "${terminal}" ]; then
-    echo "STOP: 无法确认 pane ${pane} 的 reviewer 身份（kind=${kind:-unknown}, cwd=${cwd:-unknown}, terminal_id=${terminal:-missing}）。" >&2
+    echo "STOP: 无法确认 pane ${pane} 的${ROLE_LABEL}身份（kind=${kind:-unknown}, cwd=${cwd:-unknown}, terminal_id=${terminal:-missing}）。" >&2
     return 1
   fi
   printf '%s' "${payload}" | jq -cS '.result.agent'
@@ -576,8 +596,8 @@ transport_resume() {    # $1=pane_id  $2=terminal_id(legacy 可空)  $3=agent_se
   session=$(printf '%s' "${agent}" | jq -cS '.agent_session // empty' 2>/dev/null)
   if [ -z "${pane}" ] || [ "${kind}" != "${REVIEW_KIND}" ] || [ "${cwd}" != "${REVIEW_WT}" ] \
     || { [ -n "${saved_session}" ] && [ "${session}" != "${saved_session}" ]; }; then
-    echo "STOP: 已发送轮次保存的 reviewer 不存在或身份已变化（pane=${saved_pane}, terminal_id=${saved_terminal:-legacy}）。" >&2
-    echo "      不会创建第二个 reviewer，也不会重发 prompt；请你亲自确认当前评审状态。" >&2
+    echo "STOP: 已发送的${ROLE_LABEL}不存在或身份已变化（pane=${saved_pane}, terminal_id=${saved_terminal:-legacy}）。" >&2
+    echo "      不会创建第二个${ROLE_LABEL}，也不会重发 prompt；请你亲自确认当前状态。" >&2
     return 1
   fi
   printf '%s' "${pane}"
@@ -604,12 +624,12 @@ transport_wait_ready() { # $1=pane_id
       idle|done)
         [ "${ready}" = "true" ] && return 0;;
       blocked)
-        echo "STOP: 评审方在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
+        echo "STOP: ${ROLE_LABEL}在接收 prompt 前已 blocked（pane ${pane}），请你亲自查看。" >&2
         return 1;;
     esac
     sleep 1
   done
-  echo "STOP: 评审方未在 ${REVIEW_START_TIMEOUT}ms 内进入可接收状态（pane ${pane}）。" >&2
+  echo "STOP: ${ROLE_LABEL}未在 ${REVIEW_START_TIMEOUT}ms 内进入可接收状态（pane ${pane}）。" >&2
   echo "      last: interactive_ready=${ready}, agent_status=${state}；期望 interactive_ready=true 且 agent_status=idle/done。" >&2
   return 1
 }
@@ -668,16 +688,16 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
         { date +%s; echo "$2"; echo "$1"; echo "${terminal}"; echo "${session}"; } > "$3"
         return 0;;
     esac
-    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，评审方仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
+    [ "${attempt}" -eq 1 ] && echo "NOTE: ${code}，${ROLE_LABEL}仍 ${st:-unknown}，prompt 未送达，重发一次（pane $1）。" >&2
   done
   case "${code}" in
     agent_blocked)
-      echo "STOP: 评审方停在审批或提问对话框，未发送任何输入。" >&2
+      echo "STOP: ${ROLE_LABEL}停在审批或提问对话框，未发送任何输入。" >&2
       echo "      请你亲自查看 pane $1，不要让 agent 代答。" >&2;;
     agent_not_found|agent_not_running)
-      echo "STOP: 评审方在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
+      echo "STOP: ${ROLE_LABEL}在注入前消失了（pane $1）。重试一次本命令即可。" >&2;;
     agent_prompt_stalled|timeout)
-      echo "STOP: ${code}，重发一次后评审方仍 ${st:-unknown}，评审请求未送达（pane $1）。" >&2
+      echo "STOP: ${code}，重发一次后${ROLE_LABEL}仍 ${st:-unknown}，请求未送达（pane $1）。" >&2
       echo "      未写 $3；请你亲自查看 pane，确认状态后再决定是否重试。" >&2;;
     *)
       echo "STOP: 注入失败：${err}" >&2;;
@@ -698,18 +718,18 @@ wait_sentinel() {        # $1=file  $2=word  $3=pane_id
     st=$(transport_state "$3")
     case "${st}" in
       blocked)
-        echo "STOP: 评审方进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
+        echo "STOP: ${ROLE_LABEL}进入 blocked（审批或提问对话框）。请你亲自查看 pane $3。"
         exit 4;;
       idle|done)
         idle=$((idle + 1))
         if [ "${idle}" -ge 2 ]; then
-          echo "STOP: 评审方已空闲，但 $1 没有以 $2 结尾。它这轮没有交付，请你亲自查看 pane $3。"
+          echo "STOP: ${ROLE_LABEL}已空闲，但 $1 没有以 $2 结尾。它这轮没有交付，请你亲自查看 pane $3。"
           exit 4
         fi;;
       *) idle=0;;
     esac
   done
-  echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行 request-review 继续等待，不会重发 prompt。"
+  echo "PENDING: 尚未完成（已等待 ${REVIEW_WAIT}s）。再次运行${RERUN_HINT:- request-review} 继续等待，不会重发 prompt。"
   exit 3
 }
 
@@ -1023,6 +1043,80 @@ last line TRIAGE-COMPLETE. Reply with only that path." || exit 4
     *) echo "STOP: triage 文件第一行不是 REVIEW 或 SKIP：${TRIAGE_OUT}"; exit 4;;
   esac
 }
+
+# ============================================================
+# 规划者 —— request-review plan。写手把任务写进 plan-request.md，规划者（前沿模型）决定
+# 直接做 / 短计划 / 完整计划，起草计划、单独提交、自己跑 request-review 走完计划评审，
+# 然后把答复写进 plan.md（首行 PLAN: <路径> / DIRECT / STOP: <原因>，末行 PLAN-COMPLETE）。
+# 规划者在仓库目录里工作，写手等待期间不碰工作区。这段不影响评审周期的任何逻辑。
+# ============================================================
+plan_prompt() {
+  printf 'Plan request for %s.\nRead %s/.config/review/planner-prompt.md first, then %s.\nReviewer brief: %s\nHandoff dir: %s\nWrite your answer to %s with last line PLAN-COMPLETE. Reply with only that path.' \
+    "$(basename "${REPO}")" "${HOME}" "${PREQ}" "${REPO}/${REVIEW_BRIEF:-docs/reviewer-brief.md}" "${DIR}" "${POUT}"
+}
+acquire_planner() {      # 定位或拉起规划者，输出 pane_id；失败返回 1（已打印 STOP）
+  local found pane rkind
+  if ! found=$(transport_find); then
+    echo "STOP: 仓库里有多个叫 ${AGENT_NAME} 的 agent（见上）。关掉多余的再重试。" >&2; return 1
+  fi
+  if [ -n "${found}" ]; then
+    pane=$(printf '%s' "${found}" | awk '{print $1}'); rkind=$(printf '%s' "${found}" | awk '{print $2}')
+    [ "${rkind}" = "${REVIEW_KIND}" ] || { echo "STOP: ${AGENT_NAME} 是 ${rkind}，期望 ${REVIEW_KIND}。" >&2; return 1; }
+  else
+    echo "NOTE: 没有规划者，正在仓库目录里拉起 ${REVIEW_KIND} …" >&2
+    pane=$(transport_spawn) || return 1
+  fi
+  transport_wait_ready "${pane}" || return 1
+  printf '%s' "${pane}"
+}
+plan_deliver() {         # plan.md 已完成时的交付；返回 1 表示还没完成
+  local first
+  sentinel_ok "${POUT}" PLAN-COMPLETE || return 1
+  first=$(sed -n '1p' "${POUT}")
+  case "${first}" in
+    STOP*) echo "STOP: 规划者停下了：${first#STOP:}"; echo "      详情见 ${POUT}，请你亲自查看 pane $(sed -n '3p' "${PSENT}")。"; exit 4;;
+  esac
+  tree_clean || { echo "STOP: 规划者交活了，但工作区还有未提交的改动。请你看一眼 pane $(sed -n '3p' "${PSENT}")，确认后再让写手继续。"; exit 4; }
+  # 规划者只准动计划文件：派发时的 HEAD 到现在，去掉脚本记录后必须全是计划/规则路径
+  base=$(sed -n '6p' "${PSENT}"); stray=""
+  if [ -n "${base}" ] && git rev-parse -q --verify "${base}^{commit}" >/dev/null; then
+    while IFS= read -r f; do
+      [ -n "${f}" ] || continue
+      path_is_plan "${f}" || stray="${stray}${f} "
+    done < <(git diff --name-only "${base}" HEAD | drop_own "${base}" HEAD)
+  fi
+  if [ -n "${stray}" ]; then
+    echo "STOP: 规划者改了计划以外的文件：${stray}"
+    echo "      规划者只准写 docs/plans 下的计划。请你看一眼 pane $(sed -n '3p' "${PSENT}") 和这些提交，处理后再让写手继续。"; exit 4
+  fi
+  echo "${POUT}"; exit 0
+}
+if [ "${1:-}" = plan ]; then
+  [ -n "${PLAN_KIND}" ] || { echo "ERROR: 未配置规划者（.review.conf 里 PLAN_KIND 为空）。这个项目由写手自己写计划。"; exit 2; }
+  PREQ="${DIR}/plan-request.md"; PSENT="${DIR}/.plan.sent"; POUT="${DIR}/plan.md"
+  [ -s "${PREQ}" ] || { echo "ERROR: 缺 ${PREQ}。把任务原话和已知约束写进去，再运行 request-review plan"; exit 2; }
+  # 角色切换：传输层按这些全局变量工作
+  REVIEW_WT="${REPO}"; REVIEW_KIND="${PLAN_KIND}"; PANE_CACHE="${DIR}/.plan-pane"
+  ROLE_LABEL="规划者"; AGENT_NAME=$(agent_name pl); AGENT_ARGS="${PLAN_AGENT_ARGS}"; RERUN_HINT=" request-review plan"
+  fp=$(shasum -a 256 < "${PREQ}" | cut -c1-40)
+  # 请求内容变了 = 新请求，旧的发送记录与答复作废
+  if [ -f "${PSENT}" ] && [ "$(sed -n '2p' "${PSENT}")" != "${fp}" ]; then rm -f "${PSENT}" "${POUT}"; fi
+  [ -f "${PSENT}" ] && plan_deliver
+  if [ -f "${PSENT}" ]; then
+    pane=$(transport_resume "$(sed -n '3p' "${PSENT}")" "$(sed -n '4p' "${PSENT}")" "$(sed -n '5p' "${PSENT}")") || exit 4
+    echo "NOTE: 规划请求已发送，继续等待规划者 ${pane}；不会重发。" >&2
+  else
+    tree_clean || { echo "ERROR: 工作区未提交。规划者要在你的提交之上写计划，先提交再请它。"; exit 2; }
+    brief_gate   # 规划者读简报，之后送审也过这道门：简报过期就让写手先重写（exit 7），别让规划者卡在那
+    rm -f "${POUT}"
+    pane=$(acquire_planner) || exit 4
+    send_prompt "${pane}" "${fp}" "${PSENT}" "$(plan_prompt)" || exit 4
+    git rev-parse HEAD >> "${PSENT}"   # 第 6 行：派发时的 HEAD，交活时据此核对规划者只动了计划
+  fi
+  wait_sentinel "${POUT}" PLAN-COMPLETE "${pane}"
+  plan_deliver
+  exit 3
+fi
 
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----
 if [ "${SKIP_REVIEW:-0}" = "1" ]; then
@@ -1480,6 +1574,18 @@ Required sections:
 相关检查因本次改动失败时，任务尚未完成：先修复，不得用评审代替验证。
 你不得设置 SKIP_REVIEW —— 该变量只由人设置。
 
+### 计划由规划者写（项目配了 PLAN_KIND 时；你自己就是规划者时本节不适用）
+收到任务先查 docs/plans/ 里有没有已批准的计划覆盖它。有，照计划做。没有或不确定，
+不要自己起草：把任务原话和你知道的约束写进 $REVIEW_DIR/plan-request.md，运行
+`request-review plan`，按退出码办：
+- 3 → 规划中，再次运行续等。等待期间不改任何文件、不提交、不运行别的 request-review
+- 0 → 读它输出的 plan.md：首行 `PLAN: <路径>` 就照那份计划做（它已评审闭合）；
+      `DIRECT` 就按后面几行的边界直接做
+- 2 / 4 → 停下，把输出原样报告给人
+规划者会在你的工作区里提交计划，所以请它之前工作区必须干净。已有计划里的进度表、
+状态行、决策记录仍由你自己改，那是记账不是设计。项目没配 PLAN_KIND 时这一节不适用，
+计划由你自己写。
+
 ### 评审单元（送审前先切 commit）
 一个 request 只装一种产物，由 request.md 的 `kind:` 声明，评审方据此只执行一套契约：
 - `code`：代码及其直接相关的测试、docstring
@@ -1516,6 +1622,80 @@ kind 也照抄，脚本会核对它与自己的判定一致，不符则 exit 2�
    其他退出码 → 脚本崩溃，同样停下原样报告，不要重试。
 
 ### request.md 格式
+```
+artifact:      <被评审的路径或路径集合，不写清单式描述>
+kind:          <code 或 plan>
+level:         <deep、review 或 light；照抄 request-review 的输出>
+base sha:      <照抄 request-review 的输出：上次评审的 target>
+target sha:    <本次提交>
+round:         1/3
+out of scope:  <本次明确不做的>
+risk areas:    <自我声明的风险点>
+test paths:    <相关测试目录，填了能显著缩短评审时间>
+checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
+```
+只放事实与自我声明的风险点，不放辩解。
+
+### responses 文件格式
+一行一条，行首顶格，不加标题、列表符号或粗体：
+
+F1 accept — 一句理由
+F2 defer — 一句理由
+F3 reject — 一句理由
+
+脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
+并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
+
+### 你不得做的事
+- 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
+  严重度由评审方定 —— 这是轮次机制成立的前提。
+- 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane 或规划者 pane
+- 不要替评审方回答审批或提问对话框
+- 不要关闭不是自己创建的 pane，不要运行 herdr server stop
+- 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
+  追加升级行，随下次提交带上即可；不要 checkout 或 stash 掉脚本写进 docs/reviews 或 .review-map 的内容
+- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
+  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
+
+### 上限
+计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
+```
+artifact:      <被评审的路径或路径集合，不写清单式描述>
+kind:          <code 或 plan>
+level:         <deep、review 或 light；照抄 request-review 的输出>
+base sha:      <照抄 request-review 的输出：上次评审的 target>
+target sha:    <本次提交>
+round:         1/3
+out of scope:  <本次明确不做的>
+risk areas:    <自我声明的风险点>
+test paths:    <相关测试目录，填了能显著缩短评审时间>
+checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
+```
+只放事实与自我声明的风险点，不放辩解。
+
+### responses 文件格式
+一行一条，行首顶格，不加标题、列表符号或粗体：
+
+F1 accept — 一句理由
+F2 defer — 一句理由
+F3 reject — 一句理由
+
+脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
+并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
+
+### 你不得做的事
+- 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
+  严重度由评审方定 —— 这是轮次机制成立的前提。
+- 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane 或规划者 pane
+- 不要替评审方回答审批或提问对话框
+- 不要关闭不是自己创建的 pane，不要运行 herdr server stop
+- 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
+  追加升级行，随下次提交带上即可；不要 checkout 或 stash 掉脚本写进 docs/reviews 或 .review-map 的内容
+- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
+  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
+
+### 上限
+计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
 ```
 artifact:      <被评审的路径或路径集合，不写清单式描述>
 kind:          <code 或 plan>
@@ -1716,7 +1896,9 @@ def agents_of(repo, wt, reviewer_pane):
     for a in herdr_agents():
         cwd = real(a.get("cwd"))
         role = None
-        if reviewer_pane and a.get("pane_id") == reviewer_pane or (wt and cwd == real(wt)):
+        if (a.get("name") or "").startswith("pl-") and cwd == real(repo):
+            role = "planner"
+        elif reviewer_pane and a.get("pane_id") == reviewer_pane or (wt and cwd == real(wt)):
             role = "reviewer"
         elif cwd == real(repo):
             role = "writer"
@@ -1890,18 +2072,18 @@ def pending_decisions(rnd):
 
 
 # ============================================================ 项目状态
-def watch_reviewer(p, pane, expecting):
-    """评审中 / triage 中时问一下评审方在干什么。blocked 和 idle 都是它停了而没交付，等人去看 pane。"""
+def watch_reviewer(p, pane, expecting, who="评审方"):
+    """评审中 / triage 中 / 规划中时问一下对方在干什么。blocked 和 idle 都是它停了而没交付，等人去看 pane。"""
     st = reviewer_status(pane)
     p["reviewer"] = st
     if st == "blocked":
-        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 blocked")
-        p["human"].append(("stop", "", "blocked", "", f"评审方停在审批或提问对话框，去看 pane {pane}"))
+        p.update(needs_me=True, waiting="等你", state=p["state"] + f" · {who} blocked")
+        p["human"].append(("stop", "", "blocked", "", f"{who}停在审批或提问对话框，去看 pane {pane}"))
     elif st in ("idle", "done"):
-        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 idle")
-        p["human"].append(("stop", "", "idle", "", f"评审方已空闲但 {expecting} 没交付，去看 pane {pane}"))
+        p.update(needs_me=True, waiting="等你", state=p["state"] + f" · {who} idle")
+        p["human"].append(("stop", "", "idle", "", f"{who}已空闲但 {expecting} 没交付，去看 pane {pane}"))
     elif st == "working":
-        p["cycle_note"] += "；评审方 working"
+        p["cycle_note"] += f"；{who} working"
 
 
 EV_LOC_RE = re.compile(r'((?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+):(\d+)')
@@ -1936,7 +2118,8 @@ def project_state(repo, conf):
     cyc_req = parse_request(read(f"{d}/.cycle-request.md")) if os.path.exists(f"{d}/.cycle-request.md") else req
     rounds = load_rounds(d)
     p = {"name": os.path.basename(repo), "repo": repo, "dir": d, "head": head, "req": req, "cycle_req": cyc_req,
-         "kind": conf.get("REVIEW_KIND", "claude"),
+         "kind": conf.get("REVIEW_KIND", "claude"), "review_args": conf.get("REVIEW_AGENT_ARGS", ""),
+         "plan_kind": conf.get("PLAN_KIND", ""), "plan_args": conf.get("PLAN_AGENT_ARGS", ""),
          "rounds": rounds, "state": "空闲", "since": None, "waiting": "", "needs_me": False,
          "human": [], "cycle_note": "", "closed": False, "reviewer": ""}
     cur = req.get("_round", 1)
@@ -1986,6 +2169,15 @@ def project_state(repo, conf):
         if rounds:
             p["closed"] = True
             p["cycle_note"] = "已闭合；下面的 Round 是它的最终结果"
+    # 规划者：plan-request 已发出、plan.md 还没写完 → 规划中。规划者自己走的计划评审会以 explicit 周期出现在上面，
+    # 这一行让人知道那个周期是规划的一部分。
+    psent = parse_sent(read(f"{d}/.plan.sent"))
+    if psent and not sentinel_ok(read(f"{d}/plan.md"), "PLAN-COMPLETE"):
+        task = next((l.strip() for l in (read(f"{d}/plan-request.md") or "").splitlines() if l.strip()), "")
+        p["planning"] = {"task": task, "since": psent["start"], "pane": psent.get("pane")}
+        if not explicit:
+            p.update(state="规划中", waiting="等规划者", since=psent["start"], cycle_note="任务已交规划者，等它决定要不要计划")
+            watch_reviewer(p, psent.get("pane"), "plan.md", "规划者")
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     p["last_run"] = last_run(d)
@@ -2189,7 +2381,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .mast{display:flex;align-items:baseline;gap:28px;padding:10px 24px 9px;background:#0f0f0f;color:#e8e6e1;border-bottom:4px solid #c8375a;position:sticky;top:0;z-index:5}
 .mast .brand{font-weight:700;font-size:14px;letter-spacing:.02em;color:#fff}
 .mast .agents{display:flex;gap:22px;font-size:13px}.mast .ag b{font-weight:600;margin-right:6px}
-.mast .ag.wr{color:#e5b866}.mast .ag.rv{color:#8fb8ee}
+.mast .ag.wr{color:#e5b866}.mast .ag.rv{color:#8fb8ee}.mast .ag.pl{color:#c4a6f0}.mast .ag .off{color:#6a6866}
 .mast .agents .mute{color:#8b8985}
 .mast .gen{margin-left:auto;font-size:12px;color:#8b8985;font-variant-numeric:tabular-nums}
 .banner{background:#3a1a22;border-bottom:2px solid #c8375a;padding:9px 24px;display:flex;gap:28px;align-items:baseline}
@@ -2213,6 +2405,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:2px;line-height:18px}
 .badge.me{background:#c8375a;color:#fff}
 .badge.rv{background:#1e3350;color:#8fb8ee}
+.badge.pl{background:#2a2140;color:#c4a6f0}
 .badge.wr{background:#3d2e12;color:#e5b866}
 .badge.none{background:#262626;color:#a3a19b;font-weight:500}
 .main{padding:18px 28px 60px;min-width:0}
@@ -2231,6 +2424,8 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .crew .ttl{color:#d6d3cc}.crew .act{color:#a3a19b}
 .crew .ttl::before,.crew .act::before{content:"·";color:#5a5955;margin-right:10px}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#5a5955;flex:none}
+.planning{margin:10px 0 0;border:1px solid #4a3a72;background:#231c33;border-radius:4px;padding:8px 12px;font-size:13.5px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.planning b{color:#c4a6f0}.planning .age{color:#a3a19b;font-size:12px}.planning .task{color:#e6e4df}.planning .dim{color:#8b8985;font-size:12px}
 details.lastrun{margin:10px 0 0;border:1px solid #7a2f26;background:#2b1a17;border-radius:4px;padding:8px 12px}
 details.lastrun>summary{display:flex;gap:12px;align-items:baseline;cursor:pointer;font-size:13.5px;color:#f0776a}
 details.lastrun .age{color:#a3a19b;font-size:12px}details.lastrun .msg{color:#e6e4df;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
@@ -2243,7 +2438,7 @@ details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px s
 .accum{font-size:12px;margin-top:8px}
 details.mapsug{margin-top:8px;font-size:12px}details.mapsug>summary{color:#e5b866;cursor:pointer}details.mapsug li{margin:3px 0 3px 16px}.accum.warn{color:#e5b866}.accum b{font-weight:700}
 .cycle{margin-top:20px;border:1px solid #2e2e2e;background:#1f1f1f;padding:14px 18px 14px 20px;border-left:4px solid #4a4a4a}
-.cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
+.cycle.s-pl{border-left-color:#8f6ccf}.cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
 .cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
 .cycle .subtitle{font-size:13px;color:#4a4a4a;margin-bottom:2px}
 .cycle .body-msg{white-space:pre-wrap;color:#4a4a4a;font-size:12.5px;margin:4px 0 6px;max-width:900px}
@@ -2391,10 +2586,15 @@ def cycle_subject(p):
     return out
 
 
-def agents_line(kind, writer_kind):
-    """写手与评审方各是哪个 agent、什么 model、什么 effort。写手是谁看 herdr 在仓库里见到的 agent，
-    评审方是谁看 .review.conf 的 REVIEW_KIND。model 只能读配置文件：herdr 不报 model，
-    会话里临时切换的看不到，所以页面上标"按配置文件"。"""
+def agents_line(kind, writer_kind, review_args="", plan_kind="", plan_args=""):
+    """三个角色各是哪个 agent、什么 model、什么 effort。写手是谁看 herdr 在仓库里见到的 agent；
+    规划者和评审方看 .review.conf。model 只能读配置文件：herdr 不报 model，会话里临时切换的看不到，
+    所以页面上标"按配置文件"；拉起参数里指定的 model / effort 覆盖配置文件。"""
+    def override(base, args):
+        model, eff = base
+        m = re.search(r'(?:--model[= ]|\bmodel=)"?([^\s"]+)', args or "")
+        e = re.search(r'model_reasoning_effort=\\?"?([A-Za-z]+)', args or "")
+        return (m.group(1) if m else model, e.group(1) if e else eff)
     def codex():
         t = read(os.path.expanduser("~/.codex/config.toml")) or ""
         m = re.search(r'^model\s*=\s*"([^"]+)"', t, re.M); e = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', t, re.M)
@@ -2409,19 +2609,25 @@ def agents_line(kind, writer_kind):
         eff = (d.get("modelSettings", {}).get(base, {}) or {}).get("effortLevel") or d.get("effortLevel", "?")
         return (model, eff)
     readers = {"codex": codex, "claude": claude}
-    r = readers.get(kind, lambda: ("?", "?"))()
+    r = override(readers.get(kind, lambda: ("?", "?"))(), review_args)
     if not writer_kind:
         wtxt = "未在运行"
     else:
         w = readers.get(writer_kind, lambda: ("?", "?"))()
         wtxt = f"{esc(writer_kind)} · {esc(w[0])} · {esc(w[1])}"
+    if plan_kind:
+        pl = override(readers.get(plan_kind, lambda: ("?", "?"))(), plan_args)
+        ptxt = f"{esc(plan_kind)} · {esc(pl[0])} · {esc(pl[1])}"
+    else:
+        ptxt = '<span class="off">未配置</span>'
     return (f'<span class="ag wr"><b>写手</b> {wtxt}</span>'
+            f'<span class="ag pl"><b>规划者</b> {ptxt}</span>'
             f'<span class="ag rv"><b>评审方</b> {esc(kind)} · {esc(r[0])} · {esc(r[1])}</span><span class="mute">按配置文件</span>')
 
 
 def state_badge(p):
     """状态标签按"谁在等"配色：红 = 等你，蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等。"""
-    cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr"}.get(p["waiting"], "none")
+    cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr", "等规划者": "pl"}.get(p["waiting"], "none")
     return f'<span class="badge {cls}">{esc(p["state"])}</span>'
 
 
@@ -2567,7 +2773,7 @@ def render_cycle(p):
         kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
                   f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
                   f'<pre class="block">{esc(stat)}\n{"".join(body)}{esc(trunc)}</pre></details></div>')
-    scls = "s-me" if p["needs_me"] else {"等评审方": "s-rv", "等写手": "s-wr"}.get(p["waiting"], "")
+    scls = "s-me" if p["needs_me"] else {"等评审方": "s-rv", "等写手": "s-wr", "等规划者": "s-pl"}.get(p["waiting"], "")
     return f'<div class="cycle {scls}">{title}<div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
@@ -2579,7 +2785,7 @@ def render_panel(p, archives, self_closed):
     ag = p.get("agents") or {}
     if ag:
         chips = []
-        for role, label in (("writer", "写手"), ("reviewer", "评审方")):
+        for role, label in (("writer", "写手"), ("planner", "规划者"), ("reviewer", "评审方")):
             a = ag.get(role)
             if not a:
                 continue
@@ -2591,9 +2797,13 @@ def render_panel(p, archives, self_closed):
                 bits.append(f'<span class="act">{esc(a["activity"])}</span>')
             chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
         parts.append(f'<div class="crew">{"".join(chips)}</div>')
+    pl = p.get("planning")
+    if pl:
+        parts.append(f'<div class="planning"><b>规划中</b><span class="age">{ago(pl["since"])}</span>'
+                     f'<span class="task">{esc(pl["task"])}</span><span class="dim">规划者决定要不要计划；它提交的计划会作为一个评审周期出现在下面</span></div>')
     lr = p.get("last_run")
     if lr:
-        parts.append(f'<details class="lastrun"><summary><span class="tri">▶</span><b>写手上次运行 exit {esc(lr["code"])}</b>'
+        parts.append(f'<details class="lastrun"><summary><span class="tri">▶</span><b>上次运行 request-review：exit {esc(lr["code"])}</b>'
                      f'<span class="age">{ago(lr["ts"])} 前</span><span class="msg">{esc(lr["head"])}</span></summary>'
                      f'<pre>{esc(lr["out"])}</pre></details>')
     b = p.get("brief")
@@ -2721,7 +2931,10 @@ def render(projects, archives, self_closed):
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     kinds = sorted({p["kind"] for p in projects}) or ["claude"]
     writer_kinds = [((p.get("agents") or {}).get("writer") or {}).get("kind") for p in projects]
-    agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""))
+    p0 = next((p for p in projects if p["kind"] == kinds[0]), projects[0] if projects else {})
+    agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""), p0.get("review_args", ""),
+                         next((p["plan_kind"] for p in projects if p.get("plan_kind")), ""),
+                         next((p["plan_args"] for p in projects if p.get("plan_kind")), ""))
     mast = (f'<div class="mast"><span class="brand">Review board</span><span class="agents">{agents}</span>'
             f'<span class="gen">生成于 {gen[11:]}</span></div>')
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>Review board</title><style>{CSS}</style></head><body>'
@@ -2882,6 +3095,84 @@ lint/typecheck 等确定性检查命令。若全量测试当前无法通过，�
 ### 简报与 worktree 的同步
 
 不会不同步，有两道保险：脚本强制工作区干净才允许评审；每轮 `reset --hard` 到 target sha。所以评审方读到的简报**正是被评审那个提交里的版本** —— 这正是想要的，它评审 commit X 就该看 commit X 时的项目描述。
+
+---
+
+## 第 6b 部分：规划者（可选角色）
+
+写手这个槽位可以放任意便宜的模型，规划者和评审方锁定前沿模型。写手收到没有已批准计划覆盖的
+任务时，把任务原话和已知约束写进 `$REVIEW_DIR/plan-request.md`，运行 `request-review plan`：
+
+- 脚本在仓库目录里定位或拉起规划者（`PLAN_KIND`，参数 `PLAN_AGENT_ARGS`），按名字 `pl-<仓库名>` 认，
+  因为它和写手同目录。注入提示指向 `~/.config/review/planner-prompt.md` 和 plan-request。
+- 规划者先读简报，决定「直接做 / 短计划 / 完整计划」。要计划就写进 docs/plans、单独提交、
+  自己跑 request-review 走完计划评审（这段它就是写手），闭合后把答复写进 `plan.md`：首行
+  `PLAN: <路径>` / `DIRECT` / `STOP: <原因>`，末行 `PLAN-COMPLETE`。
+- 写手每 10 秒续等（exit 3）；交付时脚本核对工作区干净，并核对派发以来的提交去掉脚本记录后只碰了计划/规则
+  路径（规划者 yolo 模式下也不能动代码），才 exit 0。
+  规划者 blocked、空闲没交活、答 STOP，都是 exit 4，人去看它的 pane。
+- plan-request 内容变了就是新请求，旧答复作废。
+- 派发前先过简报门：简报缺失或过期时 exit 7 给写手，写手按正常流程重写简报后再请规划者。规划者读的就是
+  这份简报，它送审的计划评审也要过同一道门，所以不能让它带着过期简报开工。
+
+不配 `PLAN_KIND` 时 `request-review plan` exit 2，写手自己写计划。规划者不给写手派活、不盯进度、
+不改简报；派活仍由人。规划者的规则原文：
+
+````markdown
+# 规划者工作规则
+
+你是这个仓库的规划者。写手（一个可能很便宜的模型）收到了一个任务，还没有计划覆盖它，
+于是把任务交给你。你的产出只有一样：一个答复文件，必要时外加一份计划文档。你不写代码。
+
+AGENTS.md §16 里「计划由规划者写」那一节是写给写手的：你就是规划者，不要再运行
+`request-review plan`，也不要写 plan-request。§16 其余部分（评审周期、退出码、你不得做的事）
+在你提交计划并送审时同样适用于你。
+
+## 先读什么
+
+1. 注入提示里给的 plan-request.md：任务原话和写手已知的约束。
+2. Reviewer brief（docs/reviewer-brief.md）：项目地图。先读它，再只深入任务真正碰到的路径，
+   不要从零爬仓库。
+3. docs/plans/ 里已有的计划：看它们的格式、章节和验收写法，你写的要和它们一个样子；
+   也看有没有已经覆盖这个任务的计划，有就在答复里指出来，不要重复写。
+
+## 三种答复，你来定
+
+- **直接做**：任务小、边界清楚、不需要设计判断。答复里写清楚边界、不能碰的东西、
+  完成时应该核对什么。写手照做。
+- **短计划**：几条步骤加验收标准就够，但值得留档。写进 docs/plans/。
+- **完整计划**：新子项目或新阶段，按仓库里现有计划的完整格式写。
+
+判断标准是「写手照着做会不会走偏」，不是任务大小。宁可多写一份短计划，也不要让写手
+在没有边界的情况下开工。
+
+## 写计划时
+
+1. 只新建或修改 docs/plans/ 下的文件，不碰代码、测试、简报、AGENTS.md。
+2. 单独提交，提交信息以 `docs: plan` 开头。工作区里评审脚本写的记录（docs/reviews/、
+   .review-map 的自动升级行）随这次提交一起带上即可。
+3. 提交后运行 `request-review`，按 AGENTS.md §16 的退出码办：它会把这份计划送去评审。
+   评审方的 findings 由你回应、你修订、你开下一轮，直到周期闭合。这一段你就是「写手」。
+4. 周期闭合后再写答复文件。
+
+## 答复文件（注入提示里给的 plan.md 路径）
+
+第一行三选一：
+
+    PLAN: docs/plans/<文件名>.md      计划已提交并评审闭合
+    DIRECT                            不需要计划
+    STOP: <一句话原因>                无法规划：任务和已有计划冲突、需要人先做决定、
+                                      或评审方给了你无法处理的阻断
+
+后面几行给写手：边界、不能碰的东西、完成时核对什么。DIRECT 时这几行就是全部指令。
+最后一行单独写 PLAN-COMPLETE。写完只回复这个文件的路径，不要把内容贴进终端。
+
+## 你不做的事
+
+- 不给写手派活，不看写手的进度，不修改写手的代码。
+- 不改 reviewer brief。它过期了脚本会让写手重写。
+- 不在答复里放计划正文。计划在仓库里，答复只是指路。
+````
 
 ---
 

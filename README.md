@@ -54,6 +54,7 @@ config/
 templates/
   agents-section.md   常驻指令，追加到项目的 AGENTS.md / CLAUDE.md
   brief-prompt.md     生成项目简报的提示词
+  planner-prompt.md   规划者的工作规则（可选角色：前沿模型起草计划，写手只实施）
   request.md          请求文件示例
   review-board.plist  看板定时生成的 launchd 任务，install.sh 装
   pre-push.sample     可选的确定性触发 hook
@@ -77,6 +78,20 @@ install.sh
   accept 且改了 artifact → round 2，回到上面
   全部 defer（仅 should/nit）→ 结束
   有 reject / defer 了 blocking → exit 5，交给你裁决
+```
+
+## 可选：规划者
+
+写手可以是很便宜的模型，所以设计判断不该依赖它。`.review.conf` 里配了 `PLAN_KIND`
+之后，写手收到没有计划覆盖的任务时不自己起草，而是把任务写进 `plan-request.md` 运行
+`request-review plan`。脚本在仓库目录里拉起规划者（前沿模型），它决定直接做、短计划还是
+完整计划，起草计划、单独提交、自己跑 request-review 走完计划评审，再把答复写进 `plan.md`。
+写手等待期间不碰工作区；醒来后照评审过的计划实施。评审方仍是另一个会话，独立性不变。
+不配 `PLAN_KIND` 就没有这个角色。规划者和评审方来自两家模型时独立性最好，例如：
+
+```
+PLAN_KIND=codex
+PLAN_AGENT_ARGS='--dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="high"'
 ```
 
 ## herdr 耦合面

@@ -118,7 +118,9 @@ def agents_of(repo, wt, reviewer_pane):
     for a in herdr_agents():
         cwd = real(a.get("cwd"))
         role = None
-        if reviewer_pane and a.get("pane_id") == reviewer_pane or (wt and cwd == real(wt)):
+        if (a.get("name") or "").startswith("pl-") and cwd == real(repo):
+            role = "planner"
+        elif reviewer_pane and a.get("pane_id") == reviewer_pane or (wt and cwd == real(wt)):
             role = "reviewer"
         elif cwd == real(repo):
             role = "writer"
@@ -292,18 +294,18 @@ def pending_decisions(rnd):
 
 
 # ============================================================ 项目状态
-def watch_reviewer(p, pane, expecting):
-    """评审中 / triage 中时问一下评审方在干什么。blocked 和 idle 都是它停了而没交付，等人去看 pane。"""
+def watch_reviewer(p, pane, expecting, who="评审方"):
+    """评审中 / triage 中 / 规划中时问一下对方在干什么。blocked 和 idle 都是它停了而没交付，等人去看 pane。"""
     st = reviewer_status(pane)
     p["reviewer"] = st
     if st == "blocked":
-        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 blocked")
-        p["human"].append(("stop", "", "blocked", "", f"评审方停在审批或提问对话框，去看 pane {pane}"))
+        p.update(needs_me=True, waiting="等你", state=p["state"] + f" · {who} blocked")
+        p["human"].append(("stop", "", "blocked", "", f"{who}停在审批或提问对话框，去看 pane {pane}"))
     elif st in ("idle", "done"):
-        p.update(needs_me=True, waiting="等你", state=p["state"] + " · 评审方 idle")
-        p["human"].append(("stop", "", "idle", "", f"评审方已空闲但 {expecting} 没交付，去看 pane {pane}"))
+        p.update(needs_me=True, waiting="等你", state=p["state"] + f" · {who} idle")
+        p["human"].append(("stop", "", "idle", "", f"{who}已空闲但 {expecting} 没交付，去看 pane {pane}"))
     elif st == "working":
-        p["cycle_note"] += "；评审方 working"
+        p["cycle_note"] += f"；{who} working"
 
 
 EV_LOC_RE = re.compile(r'((?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]+):(\d+)')
@@ -338,7 +340,8 @@ def project_state(repo, conf):
     cyc_req = parse_request(read(f"{d}/.cycle-request.md")) if os.path.exists(f"{d}/.cycle-request.md") else req
     rounds = load_rounds(d)
     p = {"name": os.path.basename(repo), "repo": repo, "dir": d, "head": head, "req": req, "cycle_req": cyc_req,
-         "kind": conf.get("REVIEW_KIND", "claude"),
+         "kind": conf.get("REVIEW_KIND", "claude"), "review_args": conf.get("REVIEW_AGENT_ARGS", ""),
+         "plan_kind": conf.get("PLAN_KIND", ""), "plan_args": conf.get("PLAN_AGENT_ARGS", ""),
          "rounds": rounds, "state": "空闲", "since": None, "waiting": "", "needs_me": False,
          "human": [], "cycle_note": "", "closed": False, "reviewer": ""}
     cur = req.get("_round", 1)
@@ -388,6 +391,15 @@ def project_state(repo, conf):
         if rounds:
             p["closed"] = True
             p["cycle_note"] = "已闭合；下面的 Round 是它的最终结果"
+    # 规划者：plan-request 已发出、plan.md 还没写完 → 规划中。规划者自己走的计划评审会以 explicit 周期出现在上面，
+    # 这一行让人知道那个周期是规划的一部分。
+    psent = parse_sent(read(f"{d}/.plan.sent"))
+    if psent and not sentinel_ok(read(f"{d}/plan.md"), "PLAN-COMPLETE"):
+        task = next((l.strip() for l in (read(f"{d}/plan-request.md") or "").splitlines() if l.strip()), "")
+        p["planning"] = {"task": task, "since": psent["start"], "pane": psent.get("pane")}
+        if not explicit:
+            p.update(state="规划中", waiting="等规划者", since=psent["start"], cycle_note="任务已交规划者，等它决定要不要计划")
+            watch_reviewer(p, psent.get("pane"), "plan.md", "规划者")
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     p["last_run"] = last_run(d)
@@ -591,7 +603,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .mast{display:flex;align-items:baseline;gap:28px;padding:10px 24px 9px;background:#0f0f0f;color:#e8e6e1;border-bottom:4px solid #c8375a;position:sticky;top:0;z-index:5}
 .mast .brand{font-weight:700;font-size:14px;letter-spacing:.02em;color:#fff}
 .mast .agents{display:flex;gap:22px;font-size:13px}.mast .ag b{font-weight:600;margin-right:6px}
-.mast .ag.wr{color:#e5b866}.mast .ag.rv{color:#8fb8ee}
+.mast .ag.wr{color:#e5b866}.mast .ag.rv{color:#8fb8ee}.mast .ag.pl{color:#c4a6f0}.mast .ag .off{color:#6a6866}
 .mast .agents .mute{color:#8b8985}
 .mast .gen{margin-left:auto;font-size:12px;color:#8b8985;font-variant-numeric:tabular-nums}
 .banner{background:#3a1a22;border-bottom:2px solid #c8375a;padding:9px 24px;display:flex;gap:28px;align-items:baseline}
@@ -615,6 +627,7 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:0 6px;border-radius:2px;line-height:18px}
 .badge.me{background:#c8375a;color:#fff}
 .badge.rv{background:#1e3350;color:#8fb8ee}
+.badge.pl{background:#2a2140;color:#c4a6f0}
 .badge.wr{background:#3d2e12;color:#e5b866}
 .badge.none{background:#262626;color:#a3a19b;font-weight:500}
 .main{padding:18px 28px 60px;min-width:0}
@@ -633,6 +646,8 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .crew .ttl{color:#d6d3cc}.crew .act{color:#a3a19b}
 .crew .ttl::before,.crew .act::before{content:"·";color:#5a5955;margin-right:10px}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#5a5955;flex:none}
+.planning{margin:10px 0 0;border:1px solid #4a3a72;background:#231c33;border-radius:4px;padding:8px 12px;font-size:13.5px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.planning b{color:#c4a6f0}.planning .age{color:#a3a19b;font-size:12px}.planning .task{color:#e6e4df}.planning .dim{color:#8b8985;font-size:12px}
 details.lastrun{margin:10px 0 0;border:1px solid #7a2f26;background:#2b1a17;border-radius:4px;padding:8px 12px}
 details.lastrun>summary{display:flex;gap:12px;align-items:baseline;cursor:pointer;font-size:13.5px;color:#f0776a}
 details.lastrun .age{color:#a3a19b;font-size:12px}details.lastrun .msg{color:#e6e4df;font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
@@ -645,7 +660,7 @@ details.proc pre{margin:6px 0 0;padding:8px 10px;background:#1c1c1c;border:1px s
 .accum{font-size:12px;margin-top:8px}
 details.mapsug{margin-top:8px;font-size:12px}details.mapsug>summary{color:#e5b866;cursor:pointer}details.mapsug li{margin:3px 0 3px 16px}.accum.warn{color:#e5b866}.accum b{font-weight:700}
 .cycle{margin-top:20px;border:1px solid #2e2e2e;background:#1f1f1f;padding:14px 18px 14px 20px;border-left:4px solid #4a4a4a}
-.cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
+.cycle.s-pl{border-left-color:#8f6ccf}.cycle.s-rv{border-left-color:#4a7fc1}.cycle.s-wr{border-left-color:#d9a83a}.cycle.s-me{border-left-color:#c8375a}
 .cycle .title{font-size:16px;font-weight:700;letter-spacing:-.01em;margin-bottom:2px}
 .cycle .subtitle{font-size:13px;color:#4a4a4a;margin-bottom:2px}
 .cycle .body-msg{white-space:pre-wrap;color:#4a4a4a;font-size:12.5px;margin:4px 0 6px;max-width:900px}
@@ -793,10 +808,15 @@ def cycle_subject(p):
     return out
 
 
-def agents_line(kind, writer_kind):
-    """写手与评审方各是哪个 agent、什么 model、什么 effort。写手是谁看 herdr 在仓库里见到的 agent，
-    评审方是谁看 .review.conf 的 REVIEW_KIND。model 只能读配置文件：herdr 不报 model，
-    会话里临时切换的看不到，所以页面上标"按配置文件"。"""
+def agents_line(kind, writer_kind, review_args="", plan_kind="", plan_args=""):
+    """三个角色各是哪个 agent、什么 model、什么 effort。写手是谁看 herdr 在仓库里见到的 agent；
+    规划者和评审方看 .review.conf。model 只能读配置文件：herdr 不报 model，会话里临时切换的看不到，
+    所以页面上标"按配置文件"；拉起参数里指定的 model / effort 覆盖配置文件。"""
+    def override(base, args):
+        model, eff = base
+        m = re.search(r'(?:--model[= ]|\bmodel=)"?([^\s"]+)', args or "")
+        e = re.search(r'model_reasoning_effort=\\?"?([A-Za-z]+)', args or "")
+        return (m.group(1) if m else model, e.group(1) if e else eff)
     def codex():
         t = read(os.path.expanduser("~/.codex/config.toml")) or ""
         m = re.search(r'^model\s*=\s*"([^"]+)"', t, re.M); e = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', t, re.M)
@@ -811,19 +831,25 @@ def agents_line(kind, writer_kind):
         eff = (d.get("modelSettings", {}).get(base, {}) or {}).get("effortLevel") or d.get("effortLevel", "?")
         return (model, eff)
     readers = {"codex": codex, "claude": claude}
-    r = readers.get(kind, lambda: ("?", "?"))()
+    r = override(readers.get(kind, lambda: ("?", "?"))(), review_args)
     if not writer_kind:
         wtxt = "未在运行"
     else:
         w = readers.get(writer_kind, lambda: ("?", "?"))()
         wtxt = f"{esc(writer_kind)} · {esc(w[0])} · {esc(w[1])}"
+    if plan_kind:
+        pl = override(readers.get(plan_kind, lambda: ("?", "?"))(), plan_args)
+        ptxt = f"{esc(plan_kind)} · {esc(pl[0])} · {esc(pl[1])}"
+    else:
+        ptxt = '<span class="off">未配置</span>'
     return (f'<span class="ag wr"><b>写手</b> {wtxt}</span>'
+            f'<span class="ag pl"><b>规划者</b> {ptxt}</span>'
             f'<span class="ag rv"><b>评审方</b> {esc(kind)} · {esc(r[0])} · {esc(r[1])}</span><span class="mute">按配置文件</span>')
 
 
 def state_badge(p):
     """状态标签按"谁在等"配色：红 = 等你，蓝 = 等评审方，琥珀 = 等写手，灰 = 没人在等。"""
-    cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr"}.get(p["waiting"], "none")
+    cls = "me" if p["needs_me"] else {"等评审方": "rv", "等写手": "wr", "等规划者": "pl"}.get(p["waiting"], "none")
     return f'<span class="badge {cls}">{esc(p["state"])}</span>'
 
 
@@ -969,7 +995,7 @@ def render_cycle(p):
         kv.append(f'<div class="k">diff</div><div><details class="diff"><summary><span class="tri">▶</span><code>{esc(last)}</code>'
                   f'<span class="mute" style="font-size:11.5px">展开完整 diff</span></summary>'
                   f'<pre class="block">{esc(stat)}\n{"".join(body)}{esc(trunc)}</pre></details></div>')
-    scls = "s-me" if p["needs_me"] else {"等评审方": "s-rv", "等写手": "s-wr"}.get(p["waiting"], "")
+    scls = "s-me" if p["needs_me"] else {"等评审方": "s-rv", "等写手": "s-wr", "等规划者": "s-pl"}.get(p["waiting"], "")
     return f'<div class="cycle {scls}">{title}<div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
@@ -981,7 +1007,7 @@ def render_panel(p, archives, self_closed):
     ag = p.get("agents") or {}
     if ag:
         chips = []
-        for role, label in (("writer", "写手"), ("reviewer", "评审方")):
+        for role, label in (("writer", "写手"), ("planner", "规划者"), ("reviewer", "评审方")):
             a = ag.get(role)
             if not a:
                 continue
@@ -993,9 +1019,13 @@ def render_panel(p, archives, self_closed):
                 bits.append(f'<span class="act">{esc(a["activity"])}</span>')
             chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
         parts.append(f'<div class="crew">{"".join(chips)}</div>')
+    pl = p.get("planning")
+    if pl:
+        parts.append(f'<div class="planning"><b>规划中</b><span class="age">{ago(pl["since"])}</span>'
+                     f'<span class="task">{esc(pl["task"])}</span><span class="dim">规划者决定要不要计划；它提交的计划会作为一个评审周期出现在下面</span></div>')
     lr = p.get("last_run")
     if lr:
-        parts.append(f'<details class="lastrun"><summary><span class="tri">▶</span><b>写手上次运行 exit {esc(lr["code"])}</b>'
+        parts.append(f'<details class="lastrun"><summary><span class="tri">▶</span><b>上次运行 request-review：exit {esc(lr["code"])}</b>'
                      f'<span class="age">{ago(lr["ts"])} 前</span><span class="msg">{esc(lr["head"])}</span></summary>'
                      f'<pre>{esc(lr["out"])}</pre></details>')
     b = p.get("brief")
@@ -1123,7 +1153,10 @@ def render(projects, archives, self_closed):
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     kinds = sorted({p["kind"] for p in projects}) or ["claude"]
     writer_kinds = [((p.get("agents") or {}).get("writer") or {}).get("kind") for p in projects]
-    agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""))
+    p0 = next((p for p in projects if p["kind"] == kinds[0]), projects[0] if projects else {})
+    agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""), p0.get("review_args", ""),
+                         next((p["plan_kind"] for p in projects if p.get("plan_kind")), ""),
+                         next((p["plan_args"] for p in projects if p.get("plan_kind")), ""))
     mast = (f'<div class="mast"><span class="brand">Review board</span><span class="agents">{agents}</span>'
             f'<span class="gen">生成于 {gen[11:]}</span></div>')
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>Review board</title><style>{CSS}</style></head><body>'

@@ -38,6 +38,8 @@ install -m 0644 "${SRC}/templates/agents-section.md" "${CFG}/agents-section.md"
 echo "  ✓ ${CFG}/agents-section.md"
 install -m 0644 "${SRC}/templates/brief-prompt.md" "${CFG}/brief-prompt.md"
 echo "  ✓ ${CFG}/brief-prompt.md"
+install -m 0644 "${SRC}/templates/planner-prompt.md" "${CFG}/planner-prompt.md"
+echo "  ✓ ${CFG}/planner-prompt.md"
 
 # 看板定时生成（macOS launchd，每 30 秒）；非 macOS 跳过
 if [ "$(uname)" = Darwin ]; then

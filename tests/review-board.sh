@@ -22,7 +22,7 @@ mk() {   # <name>：两个提交的仓库 + .review.conf + 交接目录
   printf 'a\nb = 1\n' > "$r/a.py"; git -C "$r" add .; git -C "$r" commit -qm change
   printf 'REVIEW_KIND=claude\nREVIEW_WT=%s\nREVIEW_DIR=%s\n' "$r" "${TMP}/$n/review" > "$r/.review.conf"
 }
-mk alpha; mk beta; mk gamma; mk delta
+mk alpha; mk beta; mk gamma; mk delta; mk epsilon
 now=$(date +%s)
 
 # 假 herdr：beta 的评审方 blocked，gamma 的在 working，其余 pane 不存在
@@ -31,16 +31,20 @@ cat > "${TMP}/herdr" <<'MOCK'
 case "$1 $2 $3" in
   'agent get beta-pane')  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n';;
   'agent get gamma-pane') printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
-  'agent list ') printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","cwd":"%s","pane_id":"alpha-writer","terminal_title_stripped":"repo"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"gamma-pane","terminal_title_stripped":"Triage request"}]}}\n' "${MOCK_ALPHA}" "${MOCK_GAMMA}";;
+  'agent get eps-plan')   printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
+  'agent list ') printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","cwd":"%s","pane_id":"alpha-writer","terminal_title_stripped":"repo"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"gamma-pane","terminal_title_stripped":"Triage request"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"eps-plan","name":"pl-repo-","terminal_title_stripped":"Plan request"}]}}\n' "${MOCK_ALPHA}" "${MOCK_GAMMA}" "${MOCK_EPS}";;
+  'agent read eps-plan') printf '✻ Drafting… (2m 01s · esc to interrupt)\n';;
   'agent read alpha-writer') printf 'some output\n• Working (12m 03s • esc to interrupt)\n\n› Ask Codex\n';;
   'agent read gamma-pane') printf '✻ Reviewing diff… (3m 10s · esc to interrupt)\n\n❯\n';;
   *) printf '{"error":{"code":"agent_not_found"}}\n' >&2; exit 1;;
 esac
 MOCK
 chmod +x "${TMP}/herdr"
-export MOCK_ALPHA="${TMP}/alpha/repo" MOCK_GAMMA="${TMP}/gamma/repo"
+export MOCK_ALPHA="${TMP}/alpha/repo" MOCK_GAMMA="${TMP}/gamma/repo" MOCK_EPS="${TMP}/epsilon/repo"
 # alpha 的评审 worktree 另在别处，这样 cwd 是仓库的 agent 才算写手
 sed -i '' "s|^REVIEW_WT=.*|REVIEW_WT=${TMP}/alpha/wt|" "${TMP}/alpha/repo/.review.conf"
+printf 'REVIEW_AGENT_ARGS="--model claude-opus-5"\n' >> "${TMP}/alpha/repo/.review.conf"
+printf 'PLAN_KIND=codex\nPLAN_AGENT_ARGS='"'"'--dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="high"'"'"'\n' >> "${TMP}/epsilon/repo/.review.conf"
 
 # alpha：round 2 的 request 指向 HEAD，r1 里 F2 reject、F3(blocking) defer，无裁决 → 待人裁决
 H=$(git -C "${TMP}/alpha/repo" rev-parse HEAD); B=$(git -C "${TMP}/alpha/repo" rev-parse HEAD~1)
@@ -89,6 +93,11 @@ cp "$D/request.md" "$D/.cycle-request.md"
 printf '%s\n%s\ndelta-pane\n' "$((now - 600))" "$H" > "$D/.r1.sent"
 printf 'F1 | nit\nclaim:    命名\nevidence: a.py:1\n\nREVIEW-COMPLETE\n' > "$D/r1-findings.md"
 printf 'F1 defer — 以后\n' > "$D/r1-responses.md"
+# epsilon：plan-request 已发给规划者，plan.md 还没写完 → 规划中
+D="${TMP}/epsilon/review"
+printf 'task: 做 M5，把矢量整饰产品化\nconstraints: 不改 WorldProposal\n' > "$D/plan-request.md"
+printf '%s\nfingerprint\neps-plan\n' "$((now - 121))" > "$D/.plan.sent"
+
 # delta 有简报，核实于 HEAD~1，上限 50 → 之后 1 个提交
 mkdir -p "${TMP}/delta/repo/docs"
 printf '<!-- verified at: %s -->\n# brief\n' "$(git -C "${TMP}/delta/repo" rev-parse HEAD~1)" > "${TMP}/delta/repo/docs/reviewer-brief.md"
@@ -134,14 +143,16 @@ EOF
 printf '2026-09-01 | abc1234 | round 1/3 | 95s\n' > "${TMP}/gamma/repo/docs/reviews/timing.md"
 printf '# 自行闭合记录\n\n2026-09-02 | def5678 | 纯文本 | 只改了 .md\n' > "${TMP}/gamma/repo/docs/reviews/self-closed.md"
 
-printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
+printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n%s/epsilon/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
 HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null
 
 # 项目发现与去重命名（三个 checkout 都叫 repo，用上级目录区分）
-for n in alpha beta gamma delta; do has "data-p=\"$n/repo\"" "project $n listed"; done
-has '项目 · 4' 'project count'
+for n in alpha beta gamma delta epsilon; do has "data-p=\"$n/repo\"" "project $n listed"; done
+has '项目 · 5' 'project count'
 has '<div class="mast"><span class="brand">Review board</span>' 'masthead'
 has '<b>写手</b> codex ·' 'writer agent line'
+grep -qE '<b>规划者</b> codex · [^<]+ · high</span>' "${OUT}" || fail 'planner agent line with effort override'
+has '<b>评审方</b> claude · claude-opus-5 ·' 'reviewer agent line with model override'
 has '<b>评审方</b> claude ·' 'reviewer agent line'
 has 'class="cycle s-me"' 'cycle card bar coloured by state'
 
@@ -162,10 +173,15 @@ has 'href="#p-beta/repo"' 'stop item links to project'
 has '<span class="dot st-working"></span><b>写手</b><span class="st st-working">working</span><span class="act">Working (12m 03s)</span>' 'alpha writer chip with activity'
 has '<b>评审方</b><span class="st st-working">working</span><span class="ttl">Triage request</span><span class="act">Reviewing diff… (3m 10s)</span>' 'gamma reviewer chip with title and activity'
 # 写手上次停下的运行：退出码、多久前、ERROR 那行；exit 0/3 不显示
-has '<b>写手上次运行 exit 2</b>' 'last run shown'
+has '<b>上次运行 request-review：exit 2</b>' 'last run shown'
 has 'ERROR: request 的 kind 是 plan' 'last run headline'
 # evidence 的 path:line 链到 zed
 has 'href="zed://file' 'evidence zed link'
+# 规划中：状态、等规划者、任务一行、规划者芯片
+has '<span class="badge pl">规划中</span>' 'epsilon planning badge'
+has '<b>规划中</b>' 'planning line'
+has '做 M5，把矢量整饰产品化' 'planning task shown'
+has '<b>规划者</b><span class="st st-working">working</span><span class="ttl">Plan request</span><span class="act">Drafting… (2m 01s)</span>' 'planner chip'
 # 「过程」一节折叠显示
 has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'
