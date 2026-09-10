@@ -62,6 +62,10 @@ planner() {
 writer() {  # 写手和规划者同目录、没有名字：按目录找会撞上它
   printf '{"agent":"codex","agent_status":"working","pane_id":"writer-pane","terminal_id":"term-writer","cwd":"%s","foreground_cwd":"%s","interactive_ready":true}' "${MOCK_REPO}" "${MOCK_REPO}"
 }
+writer_at() {  # $1=状态 $2=terminal_id（省略即 term-writer）
+  printf '{"agent":"codex","agent_status":"%s","pane_id":"writer-pane","terminal_id":"%s","cwd":"%s","foreground_cwd":"%s","interactive_ready":true}' \
+    "$1" "${2:-term-writer}" "${MOCK_REPO}" "${MOCK_REPO}"
+}
 
 case "$1 $2" in
   'agent list')
@@ -104,6 +108,14 @@ case "$1 $2" in
         fi;;
       plan-live:new-pane)
         printf '{"result":{"agent":'; planner new-pane working; printf '}}\n';;
+      wake:writer-pane)        # 写手闲着，可以叫醒
+        printf '{"result":{"agent":'; writer_at idle; printf '}}\n';;
+      wake-drift:writer-pane)  # pane 还在，但已换了别的 terminal
+        printf '{"result":{"agent":'; writer_at idle term-other; printf '}}\n';;
+      wake:reviewer-pane|wake-drift:reviewer-pane)
+        printf '{"result":{"agent":'; reviewer reviewer-pane idle; printf '}}\n';;
+      *:writer-pane)
+        printf '{"result":{"agent":'; writer; printf '}}\n';;
       *)
         printf '{"error":{"code":"agent_not_found"}}\n' >&2
         exit 1;;
@@ -996,3 +1008,76 @@ grep -q "^base sha: ${B}" "${TMP}/stdout" || fail 'routed base should stay at th
 grep -q "NOTE: base 之后.*豁免.*$(git -C "${REPO}" rev-parse --short "${W}")" "${TMP}/stderr" \
   || fail 'no NOTE naming the waived prefix and the base it suggests'
 echo 'PASS a fully waived prefix is flagged when the base is printed'
+
+# ---- 唤醒模式：派发完就把回合交回给人，由一个只盯这次的进程叫醒写手。----
+printf 'REVIEW_WAKE=1\nREVIEW_WAKE_FORK=0\n' >> "${REPO}/.review.conf"
+clear_cycle() { rm -f "${REVIEW_DIR}"/.r*.sent "${REVIEW_DIR}"/r*-findings.md \
+  "${REVIEW_DIR}"/r*-responses.md "${REVIEW_DIR}/.wake"; }
+
+clear_cycle
+write_request code "${B}" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 3 'wake dispatch status'
+grep -q '已派发' "${TMP}/stdout" || fail 'wake dispatch should tell the writer to stop, not to re-run'
+[ -f "${REVIEW_DIR}/.wake" ] || fail 'wake marker not written'
+assert_eq "$(sed -n '2p' "${REVIEW_DIR}/.wake")" REVIEW-COMPLETE 'wake marker sentinel word'
+assert_eq "$(sed -n '3p' "${REVIEW_DIR}/.wake")" reviewer-pane 'wake marker watched pane'
+assert_eq "$(sed -n '4p' "${REVIEW_DIR}/.wake")" writer-pane 'wake marker writer pane'
+assert_eq "$(sed -n '5p' "${REVIEW_DIR}/.wake")" term-writer 'wake marker writer terminal'
+assert_eq "$(call_count '^agent prompt reviewer-pane')" 1 'wake dispatch still sends the review prompt'
+echo 'PASS wake mode dispatches then hands the turn back'
+
+# Outside herdr nobody can wake the writer, so it must keep waiting in the foreground.
+clear_cycle
+write_request code "${B}" 1/3
+set +e
+( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new \
+    MOCK_REVIEW_WT="${REVIEW_WT}" MOCK_REPO="$(cd "${REPO}" && pwd -P)" "${REQUEST_REVIEW}" \
+) > "${TMP}/stdout" 2> "${TMP}/stderr"
+NOPANE_STATUS=$?
+set -e
+assert_eq "${NOPANE_STATUS}" 3 'no-pane fallback status'
+[ -f "${REVIEW_DIR}/.wake" ] && fail 'without HERDR_PANE_ID no waker may be armed'
+grep -q '再次运行' "${TMP}/stdout" || fail 'no-pane fallback should keep the old PENDING message'
+echo 'PASS without a pane of its own the script still waits in the foreground'
+
+# The waker itself: sentinel is in, writer is idle → prompt it once and clear the marker.
+arm_wake() {   # $1=writer terminal
+  printf 'REVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${REVIEW_DIR}/r1-findings.md" REVIEW-COMPLETE \
+    reviewer-pane writer-pane "$1" '' '评审已完成，再次运行 request-review 领取结果。' 0 \
+    > "${REVIEW_DIR}/.wake"
+  : > "${MOCK_LOG}"
+}
+run_wake() {   # $1=scenario
+  set +e
+  ( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO="$1" \
+      MOCK_REVIEW_WT="${REVIEW_WT}" MOCK_REPO="$(cd "${REPO}" && pwd -P)" \
+      "${REQUEST_REVIEW}" --wake "${REVIEW_DIR}/.wake" ) > "${TMP}/stdout" 2> "${TMP}/stderr"
+  set -e
+}
+arm_wake term-writer
+run_wake wake
+assert_eq "$(call_count '^agent prompt writer-pane')" 1 'waker should wake the writer exactly once'
+[ -f "${REVIEW_DIR}/.wake" ] && fail 'waker should clear its marker after waking'
+echo 'PASS the waker wakes an idle writer and clears its marker'
+
+# The pane still exists but now hosts a different terminal → never type into it.
+arm_wake term-writer
+run_wake wake-drift
+assert_eq "$(call_count '^agent prompt ')" 0 'waker must not type into a drifted pane'
+[ -f "${REVIEW_DIR}/.wake" ] || fail 'a drifted wake should leave its marker for the human'
+echo 'PASS the waker fails closed when the writer pane drifted'
+
+# A real fork must leave the writer's .last / .last.out alone — the board reads those.
+clear_cycle
+grep -v '^REVIEW_WAKE_FORK=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+write_request code "${B}" 1/3
+run_review new
+assert_eq "${RUN_STATUS}" 3 'real fork status'
+WPID=$(sed -n '8p' "${REVIEW_DIR}/.wake")
+case "${WPID}" in [1-9]*) ;; *) fail "real fork should record a pid, got '${WPID}'";; esac
+grep -q '已派发' "${REVIEW_DIR}/.last.out" || fail 'the waker clobbered the writer .last.out'
+assert_eq "$(cut -d' ' -f1 "${REVIEW_DIR}/.last")" 3 'the waker clobbered the writer .last'
+kill "${WPID}" 2>/dev/null || true
+echo 'PASS a real fork leaves the writer records the board reads untouched'

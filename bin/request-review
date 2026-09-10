@@ -12,7 +12,8 @@
 #   0 = 评审完成，stdout 为 findings 文件路径；或 triage 判定跳过，stdout 为 SKIP: <理由>
 #   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
 #       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / kind 与路由判定不符 / 上轮 responses 格式不合规范）
-#   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
+#   3 = 尚未完成。输出写「已派发」时本回合就该结束：停下等人叫，别重跑（见 REVIEW_WAKE）；
+#       否则再次运行本命令续等（两种都不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
@@ -44,6 +45,9 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_MAP=.review-map}"                      # 风险图（仓库内，规则文件）；置空或不存在则所有代码路径交评审方 triage
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
 : "${REVIEW_ACCUM_LINES:=2000}"                    # 同上，按改动行数
+: "${REVIEW_WAKE:=0}"              # 1 = 派发后不在前台等：fork 一个只盯这次的进程，把回合交回给人
+: "${REVIEW_WAKE_MAX:=3600}"       # 那个进程最长活多久（秒）；到点自杀，不留孤儿
+: "${REVIEW_WAKE_FORK:=1}"         # 0 = 只写标记不真的 fork；测试用，一般不改
 : "${REVIEW_BOARD=review-board}"   # 退出时重新生成看板的命令；置空则不生成（测试用）
 : "${REVIEW_AGENT_ARGS=}"          # 拉起评审方时透传给 agent 的参数，如 "--model claude-opus-5"
 : "${PLAN_KIND=}"                  # 规划者 agent 类型；空则没有规划者，写手自己写计划
@@ -58,9 +62,13 @@ DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
 # `plan` 模式（写手每 10 秒续等规划者）和规划者自己的 request-review 会同时跑：续等的输出单独放
 # .last-plan.out，只在真的停下（不是 0/3）时才覆盖 .last，免得把规划者那次运行的记录冲掉。
 LAST_OUT="${DIR}/.last.out"; [ "${1:-}" = plan ] && LAST_OUT="${DIR}/.last-plan.out"
+# 唤醒进程（--wake）只是后台助手：不接管输出、不写 .last、不刷看板。那三样记的是写手
+# 那一次运行说了什么，被后台进程覆盖的话看板会显示错的东西。
+if [ "${1:-}" != --wake ]; then
 : > "${LAST_OUT}"
 exec > >(tee -a "${LAST_OUT}"); TEE_OUT=$!
 exec 2> >(tee -a "${LAST_OUT}" >&2); TEE_ERR=$!
+fi
 on_exit() {
   local code=$?
   if [ "${LAST_OUT}" = "${DIR}/.last.out" ]; then
@@ -72,7 +80,9 @@ on_exit() {
   [ -n "${REVIEW_BOARD}" ] && command -v "${REVIEW_BOARD}" >/dev/null && "${REVIEW_BOARD}" --quiet >/dev/null 2>&1
   true
 }
-trap on_exit EXIT
+[ "${1:-}" = --wake ] || trap on_exit EXIT
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+WAKE_MARK="${DIR}/.wake"
 REQ="${DIR}/request.md"
 PANE_CACHE="${DIR}/.pane"
 CYCLE_SHA="${DIR}/.cycle"
@@ -116,6 +126,7 @@ sentinel_ok() {
 # ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
 finish() {
   local elapsed sha nb
+  rm -f "${WAKE_MARK}"     # 已经领到结果了，还在盯的进程下一轮自己退出
   elapsed=$(( $(date +%s) - START ))
   sha=$(git rev-parse --short "${TARGET:-HEAD}")
   # 同一 sha 同一轮只记一次：写手在写 responses 之前再跑一遍，只是再领一次路径
@@ -385,12 +396,82 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
   return 1
 }
 
+# ---- 唤醒：派发之后不占着写手的前台 ----
+# 写手的回合必须真的结束，人才能跟它说话。派发时 fork 一个只盯这一次的进程，它在哨兵齐了
+# （或被盯的 agent 卡住、空转、超时）时把写手叫醒，叫完就退出 —— 没有常驻的东西。
+# 它不做任何判断：判断全在写手重跑时的 request-review 里，这里只负责"该回去看了"。
+
+# 记下写手自己的身份并 fork。认不出自己在哪个 pane（不在 herdr 里跑）就返回 1，退回前台等待。
+fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
+  local payload term sess pid
+  [ "${REVIEW_WAKE}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 1
+  if [ -f "${WAKE_MARK}" ]; then       # 已经有一个活着的，不重复 fork
+    pid=$(sed -n '8p' "${WAKE_MARK}")
+    case "${pid}" in [1-9]*) kill -0 "${pid}" 2>/dev/null && return 1;; esac
+  fi
+  payload=$(herdr agent get "${HERDR_PANE_ID}" 2>/dev/null) || return 1
+  term=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
+  sess=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+  [ -n "${term}" ] || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${HERDR_PANE_ID}" "${term}" "${sess}" \
+    "${ROLE_LABEL}那边完成了或需要你查看：再次运行${RERUN_HINT:- request-review}。" > "${WAKE_MARK}"
+  if [ "${REVIEW_WAKE_FORK}" = "1" ]; then
+    nohup "${SELF}" --wake "${WAKE_MARK}" >/dev/null 2>&1 &
+    printf '%s\n' "$!" >> "${WAKE_MARK}"
+  else
+    printf -- '-\n' >> "${WAKE_MARK}"
+  fi
+  return 0
+}
+
+# 只往身份核对通过、且已经闲下来的写手 pane 注入。核不准就什么都不做 —— 宁可让人自己跑一次，
+# 也不能往一个不确定是谁的 agent 里打字。成功注入返回 0。
+wake_writer() {          # $1=pane $2=terminal $3=session $4=话
+  local payload term sess deadline
+  deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
+  while :; do
+    payload=$(herdr agent get "$1" 2>/dev/null) || return 1
+    term=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
+    sess=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+    [ -n "${term}" ] && [ "${term}" = "$2" ] || return 1
+    [ -z "$3" ] || [ "${sess}" = "$3" ] || return 1
+    case "$(transport_state "$1")" in idle|done) transport_dispatch "$1" "$4" >/dev/null 2>&1; return 0;; esac
+    [ "$(date +%s)" -lt "${deadline}" ] || return 1
+    sleep "${REVIEW_POLL}"
+  done
+}
+
+# 只盯这一次派发。标记没了（周期被放弃、或写手自己跑了一次领走了）就静默退出。
+wake_loop() {            # $1=标记文件
+  local mark="$1" file word watched deadline st idle=0
+  file=$(sed -n '1p' "${mark}"); word=$(sed -n '2p' "${mark}"); watched=$(sed -n '3p' "${mark}")
+  deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
+  while :; do
+    [ -f "${mark}" ] || return 0
+    sentinel_ok "${file}" "${word}" && break
+    st=$(transport_state "${watched}")
+    case "${st}" in
+      blocked) break;;
+      idle|done) idle=$((idle + 1)); [ "${idle}" -ge 2 ] && break;;
+      *) idle=0;;
+    esac
+    [ "$(date +%s)" -lt "${deadline}" ] || break
+    sleep "${REVIEW_POLL}"
+  done
+  wake_writer "$(sed -n '4p' "${mark}")" "$(sed -n '5p' "${mark}")" "$(sed -n '6p' "${mark}")" \
+    "$(sed -n '7p' "${mark}")" && rm -f "${mark}"
+}
+
 # 等哨兵；期间评审方 blocked 则退出 4，超时退出 3。
 # 评审方回到 idle 而哨兵还没出现，说明它这个回合已经结束却没交付（忘写结尾行、只回了
 # 一句话、或根本没开始）：等满 REVIEW_WAIT 只会让写手反复续等。连续两次看到 idle 即退出 4。
 wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   local deadline st idle=0
   sentinel_ok "$1" "$2" && return 0
+  if fork_waker "$1" "$2" "$3"; then
+    echo "PENDING: 已派发给${ROLE_LABEL}，本回合到此为止。停下把话交回给人；那边完成时会有人叫你继续，不要反复重跑。"
+    exit 3
+  fi
   deadline=$(( $(date +%s) + REVIEW_WAIT ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     sleep "${REVIEW_POLL}"
@@ -817,6 +898,12 @@ if [ "${1:-}" = plan ]; then
   wait_sentinel "${POUT}" PLAN-COMPLETE "${pane}"
   plan_deliver
   exit 3
+fi
+
+# ---- 唤醒进程：由派发那次运行 fork 出来，只盯一次哨兵，叫醒写手后退出 ----
+if [ "${1:-}" = --wake ]; then
+  [ -f "${2:-}" ] || exit 0
+  wake_loop "$2"; exit 0
 fi
 
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----

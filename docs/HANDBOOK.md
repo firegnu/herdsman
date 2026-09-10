@@ -154,6 +154,17 @@ herdsman-init <短名>
 
 可选的 `REVIEW_PLAN_PATHS` 是计划/设计文档的路径模式（空格分隔，按 shell `case` 匹配，`*` 可跨 `/`，如 `"docs/plans/*"`）。配了以后，范围里碰到这些路径的改动会先以 `kind: plan` 送审，代码范围随后单独送审；不再校验单个提交是否混装。不配就只靠 `.review-map` 的 plan 行和规则文件。
 
+可选的 `REVIEW_WAKE=1` 打开唤醒模式。默认（`0`）写手派发之后在前台等满 `REVIEW_WAIT` 秒才返回，
+这段时间它的回合没结束，**人插不进话**。打开后，派发那次运行会 fork 一个只盯这一次的进程，然后立刻
+返回 exit 3 并让写手停下；等哨兵齐了（或被盯的 agent blocked、连续两次空转、超过 `REVIEW_WAKE_MAX` 秒），
+那个进程用 `herdr agent prompt` 把写手叫醒，叫完就退出——不是常驻的东西，没有评审在跑时一个都没有。
+三个等待点（triage / 规划者 / 评审方）共用同一个 `wait_sentinel`，所以一次打开全部生效。
+
+它只往身份核对通过（`terminal_id` 与 `agent_session` 都对得上）且已经 idle 的写手 pane 注入；核不准
+就什么都不做，宁可让你自己跑一次也不往不确定的 agent 里打字。脚本不在 herdr 里跑（没有 `HERDR_PANE_ID`）
+时没人能叫醒它，自动退回前台等待。唤醒进程不写 `.last`／`.last.out`、不刷看板——那三样是写手那次运行的
+记录，被后台进程覆盖会让看板显示错的东西。
+
 没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
 评审 worktree 建一次就一直在，跟评审 agent 的死活无关；每轮脚本把它 `reset --hard` 到本次要审的 sha，目录内容变、目录本身不动。
@@ -337,7 +348,8 @@ review（常规）、light（一轮、只找阻断、不跑测试）、plan（�
 #   0 = 评审完成，stdout 为 findings 文件路径；或 triage 判定跳过，stdout 为 SKIP: <理由>
 #   2 = 前置条件不满足（未提交 / 缺配置 / 缺 request / 缺依赖 /
 #       request 缺 kind 或 base sha / base 不是 HEAD 祖先 / kind 与路由判定不符 / 上轮 responses 格式不合规范）
-#   3 = 尚未完成，再次运行本命令续等（不会重发 prompt）
+#   3 = 尚未完成。输出写「已派发」时本回合就该结束：停下等人叫，别重跑（见 REVIEW_WAKE）；
+#       否则再次运行本命令续等（两种都不会重发 prompt）
 #   4 = 需要人介入（reviewer blocked / 回合结束却没交付 / 无法拉起 / 注入失败 / worktree 里有多个 agent）
 #   5 = 流程到界（轮次上限 / 上轮存在未裁决的 reject 或 blocking defer；人裁决记入 r<n>-decision.md 后可继续）
 #   6 = 判定需要评审，stdout 为 REVIEW: <理由> 加 kind / level / base sha 三行；照抄进 request.md 后再次运行
@@ -369,6 +381,9 @@ CONF="${REPO}/.review.conf"
 : "${REVIEW_MAP=.review-map}"                      # 风险图（仓库内，规则文件）；置空或不存在则所有代码路径交评审方 triage
 : "${REVIEW_ACCUM_COMMITS:=20}"                    # 上次评审以来累计超过这么多提交，不问评审方直接 REVIEW
 : "${REVIEW_ACCUM_LINES:=2000}"                    # 同上，按改动行数
+: "${REVIEW_WAKE:=0}"              # 1 = 派发后不在前台等：fork 一个只盯这次的进程，把回合交回给人
+: "${REVIEW_WAKE_MAX:=3600}"       # 那个进程最长活多久（秒）；到点自杀，不留孤儿
+: "${REVIEW_WAKE_FORK:=1}"         # 0 = 只写标记不真的 fork；测试用，一般不改
 : "${REVIEW_BOARD=review-board}"   # 退出时重新生成看板的命令；置空则不生成（测试用）
 : "${REVIEW_AGENT_ARGS=}"          # 拉起评审方时透传给 agent 的参数，如 "--model claude-opus-5"
 : "${PLAN_KIND=}"                  # 规划者 agent 类型；空则没有规划者，写手自己写计划
@@ -383,9 +398,13 @@ DIR="${REVIEW_DIR}"; mkdir -p "${DIR}"
 # `plan` 模式（写手每 10 秒续等规划者）和规划者自己的 request-review 会同时跑：续等的输出单独放
 # .last-plan.out，只在真的停下（不是 0/3）时才覆盖 .last，免得把规划者那次运行的记录冲掉。
 LAST_OUT="${DIR}/.last.out"; [ "${1:-}" = plan ] && LAST_OUT="${DIR}/.last-plan.out"
+# 唤醒进程（--wake）只是后台助手：不接管输出、不写 .last、不刷看板。那三样记的是写手
+# 那一次运行说了什么，被后台进程覆盖的话看板会显示错的东西。
+if [ "${1:-}" != --wake ]; then
 : > "${LAST_OUT}"
 exec > >(tee -a "${LAST_OUT}"); TEE_OUT=$!
 exec 2> >(tee -a "${LAST_OUT}" >&2); TEE_ERR=$!
+fi
 on_exit() {
   local code=$?
   if [ "${LAST_OUT}" = "${DIR}/.last.out" ]; then
@@ -397,7 +416,9 @@ on_exit() {
   [ -n "${REVIEW_BOARD}" ] && command -v "${REVIEW_BOARD}" >/dev/null && "${REVIEW_BOARD}" --quiet >/dev/null 2>&1
   true
 }
-trap on_exit EXIT
+[ "${1:-}" = --wake ] || trap on_exit EXIT
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+WAKE_MARK="${DIR}/.wake"
 REQ="${DIR}/request.md"
 PANE_CACHE="${DIR}/.pane"
 CYCLE_SHA="${DIR}/.cycle"
@@ -441,6 +462,7 @@ sentinel_ok() {
 # ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
 finish() {
   local elapsed sha nb
+  rm -f "${WAKE_MARK}"     # 已经领到结果了，还在盯的进程下一轮自己退出
   elapsed=$(( $(date +%s) - START ))
   sha=$(git rev-parse --short "${TARGET:-HEAD}")
   # 同一 sha 同一轮只记一次：写手在写 responses 之前再跑一遍，只是再领一次路径
@@ -710,12 +732,82 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
   return 1
 }
 
+# ---- 唤醒：派发之后不占着写手的前台 ----
+# 写手的回合必须真的结束，人才能跟它说话。派发时 fork 一个只盯这一次的进程，它在哨兵齐了
+# （或被盯的 agent 卡住、空转、超时）时把写手叫醒，叫完就退出 —— 没有常驻的东西。
+# 它不做任何判断：判断全在写手重跑时的 request-review 里，这里只负责"该回去看了"。
+
+# 记下写手自己的身份并 fork。认不出自己在哪个 pane（不在 herdr 里跑）就返回 1，退回前台等待。
+fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
+  local payload term sess pid
+  [ "${REVIEW_WAKE}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 1
+  if [ -f "${WAKE_MARK}" ]; then       # 已经有一个活着的，不重复 fork
+    pid=$(sed -n '8p' "${WAKE_MARK}")
+    case "${pid}" in [1-9]*) kill -0 "${pid}" 2>/dev/null && return 1;; esac
+  fi
+  payload=$(herdr agent get "${HERDR_PANE_ID}" 2>/dev/null) || return 1
+  term=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
+  sess=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+  [ -n "${term}" ] || return 1
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${HERDR_PANE_ID}" "${term}" "${sess}" \
+    "${ROLE_LABEL}那边完成了或需要你查看：再次运行${RERUN_HINT:- request-review}。" > "${WAKE_MARK}"
+  if [ "${REVIEW_WAKE_FORK}" = "1" ]; then
+    nohup "${SELF}" --wake "${WAKE_MARK}" >/dev/null 2>&1 &
+    printf '%s\n' "$!" >> "${WAKE_MARK}"
+  else
+    printf -- '-\n' >> "${WAKE_MARK}"
+  fi
+  return 0
+}
+
+# 只往身份核对通过、且已经闲下来的写手 pane 注入。核不准就什么都不做 —— 宁可让人自己跑一次，
+# 也不能往一个不确定是谁的 agent 里打字。成功注入返回 0。
+wake_writer() {          # $1=pane $2=terminal $3=session $4=话
+  local payload term sess deadline
+  deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
+  while :; do
+    payload=$(herdr agent get "$1" 2>/dev/null) || return 1
+    term=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
+    sess=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
+    [ -n "${term}" ] && [ "${term}" = "$2" ] || return 1
+    [ -z "$3" ] || [ "${sess}" = "$3" ] || return 1
+    case "$(transport_state "$1")" in idle|done) transport_dispatch "$1" "$4" >/dev/null 2>&1; return 0;; esac
+    [ "$(date +%s)" -lt "${deadline}" ] || return 1
+    sleep "${REVIEW_POLL}"
+  done
+}
+
+# 只盯这一次派发。标记没了（周期被放弃、或写手自己跑了一次领走了）就静默退出。
+wake_loop() {            # $1=标记文件
+  local mark="$1" file word watched deadline st idle=0
+  file=$(sed -n '1p' "${mark}"); word=$(sed -n '2p' "${mark}"); watched=$(sed -n '3p' "${mark}")
+  deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
+  while :; do
+    [ -f "${mark}" ] || return 0
+    sentinel_ok "${file}" "${word}" && break
+    st=$(transport_state "${watched}")
+    case "${st}" in
+      blocked) break;;
+      idle|done) idle=$((idle + 1)); [ "${idle}" -ge 2 ] && break;;
+      *) idle=0;;
+    esac
+    [ "$(date +%s)" -lt "${deadline}" ] || break
+    sleep "${REVIEW_POLL}"
+  done
+  wake_writer "$(sed -n '4p' "${mark}")" "$(sed -n '5p' "${mark}")" "$(sed -n '6p' "${mark}")" \
+    "$(sed -n '7p' "${mark}")" && rm -f "${mark}"
+}
+
 # 等哨兵；期间评审方 blocked 则退出 4，超时退出 3。
 # 评审方回到 idle 而哨兵还没出现，说明它这个回合已经结束却没交付（忘写结尾行、只回了
 # 一句话、或根本没开始）：等满 REVIEW_WAIT 只会让写手反复续等。连续两次看到 idle 即退出 4。
 wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   local deadline st idle=0
   sentinel_ok "$1" "$2" && return 0
+  if fork_waker "$1" "$2" "$3"; then
+    echo "PENDING: 已派发给${ROLE_LABEL}，本回合到此为止。停下把话交回给人；那边完成时会有人叫你继续，不要反复重跑。"
+    exit 3
+  fi
   deadline=$(( $(date +%s) + REVIEW_WAIT ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     sleep "${REVIEW_POLL}"
@@ -1142,6 +1234,12 @@ if [ "${1:-}" = plan ]; then
   wait_sentinel "${POUT}" PLAN-COMPLETE "${pane}"
   plan_deliver
   exit 3
+fi
+
+# ---- 唤醒进程：由派发那次运行 fork 出来，只盯一次哨兵，叫醒写手后退出 ----
+if [ "${1:-}" = --wake ]; then
+  [ -f "${2:-}" ] || exit 0
+  wake_loop "$2"; exit 0
 fi
 
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----
@@ -1619,7 +1717,9 @@ Required sections:
 收到任务先查 docs/plans/ 里有没有已批准的计划覆盖它。有，照计划做。没有或不确定，
 不要自己起草：把任务原话和你知道的约束写进 $REVIEW_DIR/plan-request.md，运行
 `request-review plan`，按退出码办：
-- 3 → 规划中，再次运行续等。等待期间不改任何文件、不提交、不运行别的 request-review
+- 3 → 看输出第一行：写着「已派发」就停下，把那句原样报告给人，**不要重跑** —— 规划者
+      交活时会有人叫你继续，被叫醒后再运行一次即可。没写「已派发」就是还在等，
+      再次运行续等。两种情况都不改任何文件、不提交、不运行别的 request-review
 - 0 → 读它输出的 plan.md：首行 `PLAN: <路径>` 就照那份计划做（它已评审闭合）；
       `DIRECT` 就按后面几行的边界直接做
 - 2 / 4 → 停下，把输出原样报告给人
@@ -1651,7 +1751,9 @@ kind 也照抄，脚本会核对它与自己的判定一致，不符则 exit 2�
        全部 defer 即一轮结束。
        should / nit 仍留在本轮 findings，随 docs/reviews/<sha>.md 归档，
        不单独立文件。
-   3 → 再次运行 request-review 继续等待。
+   3 → 看输出第一行：写着「已派发」就停下，把那句原样报告给人，**不要重跑** ——
+       评审方交活时会有人叫你继续，被叫醒后再运行一次就能领到 findings。
+       没写「已派发」就是还在等，再次运行 request-review 继续等待。
    2 / 4 / 5 → 停下，把输出原样报告给人。
        5 因 reject 或 blocking defer 停下时：人裁决后，把裁决逐字记入同目录
        r<n>-decision.md（每行 `F<n> uphold — 理由` 或 `F<n> overrule — 理由`，
@@ -1691,80 +1793,6 @@ F3 reject — 一句理由
 - 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
   严重度由评审方定 —— 这是轮次机制成立的前提。
 - 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane 或规划者 pane
-- 不要替评审方回答审批或提问对话框
-- 不要关闭不是自己创建的 pane，不要运行 herdr server stop
-- 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
-  追加升级行，随下次提交带上即可；不要 checkout 或 stash 掉脚本写进 docs/reviews 或 .review-map 的内容
-- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
-  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
-
-### 上限
-计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
-```
-artifact:      <被评审的路径或路径集合，不写清单式描述>
-kind:          <code 或 plan>
-level:         <deep、review 或 light；照抄 request-review 的输出>
-base sha:      <照抄 request-review 的输出：上次评审的 target>
-target sha:    <本次提交>
-round:         1/3
-out of scope:  <本次明确不做的>
-risk areas:    <自我声明的风险点>
-test paths:    <相关测试目录，填了能显著缩短评审时间>
-checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
-```
-只放事实与自我声明的风险点，不放辩解。
-
-### responses 文件格式
-一行一条，行首顶格，不加标题、列表符号或粗体：
-
-F1 accept — 一句理由
-F2 defer — 一句理由
-F3 reject — 一句理由
-
-脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
-并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
-
-### 你不得做的事
-- 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
-  严重度由评审方定 —— 这是轮次机制成立的前提。
-- 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane 或规划者 pane
-- 不要替评审方回答审批或提问对话框
-- 不要关闭不是自己创建的 pane，不要运行 herdr server stop
-- 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
-  追加升级行，随下次提交带上即可；不要 checkout 或 stash 掉脚本写进 docs/reviews 或 .review-map 的内容
-- 不要手写或提前创建 docs/reviews/<sha>.md —— 归档由脚本在下一周期开始时自动生成，
-  手写的会被视为已有文件，脚本改写到 <sha>-2.md，留下两份
-
-### 上限
-计划与文档 2 轮，代码 3 轮；若最后一轮报出 regressed，允许为验证该修复再加一轮。
-```
-artifact:      <被评审的路径或路径集合，不写清单式描述>
-kind:          <code 或 plan>
-level:         <deep、review 或 light；照抄 request-review 的输出>
-base sha:      <照抄 request-review 的输出：上次评审的 target>
-target sha:    <本次提交>
-round:         1/3
-out of scope:  <本次明确不做的>
-risk areas:    <自我声明的风险点>
-test paths:    <相关测试目录，填了能显著缩短评审时间>
-checks:        <确定性检查命令，如 npm run lint && npm run typecheck>
-```
-只放事实与自我声明的风险点，不放辩解。
-
-### responses 文件格式
-一行一条，行首顶格，不加标题、列表符号或粗体：
-
-F1 accept — 一句理由
-F2 defer — 一句理由
-F3 reject — 一句理由
-
-脚本只认 `^F<n> accept|defer|reject`；写成列表、粗体或冒号分隔的回应行会被拦下（exit 2
-并列出那些行），改成上面的格式后再次运行即可，不必报告给人。
-
-### 你不得做的事
-- 不得修改任何 finding 的严重度。不同意就写 reject，交给人裁决。
-  严重度由评审方定 —— 这是轮次机制成立的前提。
-- 不要重试退出码 4 的注入，也不要用任何其它方式操作评审 pane
 - 不要替评审方回答审批或提问对话框
 - 不要关闭不是自己创建的 pane，不要运行 herdr server stop
 - 不要修改 rubric、.review.conf、.review-map、或本文件中的评审规则。脚本自己会往 .review-map
