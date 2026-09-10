@@ -741,6 +741,9 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
 fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
   local payload term sess pid
   [ "${REVIEW_WAKE}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 1
+  # 被等的和被叫的必须是两个 pane。规划者和写手同目录、只能按名字认，万一认到写手自己头上，
+  # armed 的就是一个自己等自己、自己叫自己的进程 —— 退回前台等待，让人看得见。
+  [ "${HERDR_PANE_ID}" != "$3" ] || return 1
   if [ -f "${WAKE_MARK}" ]; then       # 已经有一个活着的，不重复 fork
     pid=$(sed -n '8p' "${WAKE_MARK}")
     case "${pid}" in [1-9]*) kill -0 "${pid}" 2>/dev/null && return 1;; esac

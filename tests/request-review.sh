@@ -1081,3 +1081,25 @@ grep -q '已派发' "${REVIEW_DIR}/.last.out" || fail 'the waker clobbered the w
 assert_eq "$(cut -d' ' -f1 "${REVIEW_DIR}/.last")" 3 'the waker clobbered the writer .last'
 kill "${WPID}" 2>/dev/null || true
 echo 'PASS a real fork leaves the writer records the board reads untouched'
+
+# The waker must never type into the agent it is watching — only into the writer.
+printf 'REVIEW_WAKE_FORK=0\n' >> "${REPO}/.review.conf"
+arm_wake term-writer
+run_wake wake
+assert_eq "$(call_count '^agent prompt reviewer-pane')" 0 'waker must never prompt the watched agent'
+assert_eq "$(call_count '^agent prompt writer-pane')" 1 'waker still wakes the writer'
+echo 'PASS the waker never confuses the watched agent with the writer'
+
+# Planner and writer share a directory; if discovery ever returned our own pane, refuse to arm.
+clear_cycle
+write_request code "${B}" 1/3
+set +e
+( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new \
+    MOCK_REVIEW_WT="${REVIEW_WT}" MOCK_REPO="$(cd "${REPO}" && pwd -P)" \
+    HERDR_PANE_ID=reviewer-pane "${REQUEST_REVIEW}" ) > "${TMP}/stdout" 2> "${TMP}/stderr"
+SELFWATCH_STATUS=$?
+set -e
+assert_eq "${SELFWATCH_STATUS}" 3 'self-watch fallback status'
+[ -f "${REVIEW_DIR}/.wake" ] && fail 'must not arm a waker that watches and wakes the same pane'
+grep -q '再次运行' "${TMP}/stdout" || fail 'self-watch should fall back to foreground waiting'
+echo 'PASS arming is refused when the watched pane is our own'
