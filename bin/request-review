@@ -601,11 +601,32 @@ triage_conclude() {      # $1=sha  $2=REVIEW|SKIP  $3=谁判的  $4=理由  $5=k
   fi
   triage_print_review "$4" "${5:-code}" "${6:-}" "${7:-review}"
 }
+# base 之后紧跟的、连续整段已豁免的提交里的最后一笔；没有则输出空。
+# 豁免只让这些提交不再把范围推去评审，它们的改动仍在 base..target 的 diff 里 —— 脚本据此提示，
+# 但不替人前移 base：往严自动、往松要人点头。
+waived_prefix() {        # $1=base → 短 sha 或空
+  local c last="" skipped
+  [ -n "$1" ] || return 0
+  skipped=$(awk -F' [|] ' '{print $2}' "${ARCHIVE_DIR}/skipped.md" 2>/dev/null | tr -d ' ' | tr '\n' ' ')
+  [ -n "${skipped}" ] || return 0
+  for c in $(git rev-list --reverse "$1..HEAD" 2>/dev/null); do
+    case " ${skipped} " in
+      *" $(git rev-parse --short "${c}") "*) last="${c}";;
+      *) break;;
+    esac
+  done
+  [ -n "${last}" ] && git rev-parse --short "${last}"
+}
+
 triage_print_review() {  # $1=理由 $2=kind $3=base $4=level
+  local base adv
+  base="${3:-$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)}"
   echo "REVIEW: $1"
   echo "kind: $2"
   echo "level: $4"
-  echo "base sha: ${3:-$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)}   ← request.md 的 base sha 用这个"
+  echo "base sha: ${base}   ← request.md 的 base sha 用这个"
+  adv=$(waived_prefix "${base}")
+  [ -z "${adv}" ] || echo "NOTE: base 之后紧跟的 $(git rev-list --count "${base}..${adv}") 笔已在 skipped.md 中豁免；要把它们排除在 diff 之外，base sha 改用 ${adv}" >&2
   exit 6
 }
 
@@ -799,10 +820,25 @@ if [ "${1:-}" = plan ]; then
 fi
 
 # ---- 豁免路径：SKIP_REVIEW 只能由人设置，写手不得自行设置 ----
-if [ "${SKIP_REVIEW:-0}" = "1" ]; then
-  printf '%s | %s | %s\n' "$(date +%F)" "$(git rev-parse --short HEAD)" "${1:-未填写原因}" \
-    >> "${ARCHIVE_DIR}/skipped.md"
-  echo "SKIPPED: 已记入 docs/reviews/skipped.md"; exit 0
+# SKIP_REVIEW=1 免当前 HEAD 一笔；SKIP_REVIEW=<base>..<tip> 免该范围内的每一笔（git 规矩，不含 base）。
+# 只往 skipped.md 追加，不派发、不归档、不过任何门 —— 工作区脏或简报过期时也能用。
+# 只认这两种写法：裸 rev（如 SKIP_REVIEW=HEAD）会被 rev-list 展开成全部历史，不接受。
+if [ "${SKIP_REVIEW:-0}" != "0" ]; then
+  case "${SKIP_REVIEW}" in
+    1)     skip_commits=$(git rev-parse HEAD);;
+    *..*)  skip_commits=$(git rev-list "${SKIP_REVIEW}" 2>/dev/null) \
+             || { echo "ERROR: SKIP_REVIEW=${SKIP_REVIEW} 不是本仓库的提交范围"; exit 2; }
+           [ -n "${skip_commits}" ] \
+             || { echo "ERROR: SKIP_REVIEW=${SKIP_REVIEW} 没匹配到提交（A..B 不含 A）"; exit 2; };;
+    *)     echo "ERROR: SKIP_REVIEW 只能是 1（当前 HEAD 一笔）或 <base>..<tip>（一段范围），现在是 ${SKIP_REVIEW}"; exit 2;;
+  esac
+  n=0
+  for c in ${skip_commits}; do
+    printf '%s | %s | %s\n' "$(date +%F)" "$(git rev-parse --short "${c}")" "${1:-未填写原因}" \
+      >> "${ARCHIVE_DIR}/skipped.md"
+    n=$((n + 1))
+  done
+  echo "SKIPPED: ${n} 笔已记入 docs/reviews/skipped.md"; exit 0
 fi
 
 # ---- 路由：只有针对 HEAD 的 request，或仍未答复的第 2 轮之后，才是明确的评审请求 ----

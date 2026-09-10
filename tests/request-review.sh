@@ -961,3 +961,38 @@ rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.triage*
 run_review new
 [ "${RUN_STATUS}" -ne 2 ] || fail "review path broken by planner files: $(cat "${TMP}/stdout")"
 echo 'PASS request-review plan dispatches, waits, delivers and stops like a review'
+
+# ---- SKIP_REVIEW takes a commit range: one call registers every commit in it. ----
+rm -f "${REVIEW_DIR}/request.md" "${REVIEW_DIR}"/.triage* "${TRIAGE_OUT}"
+B=$(git -C "${REPO}" rev-parse HEAD)
+SB=$(git -C "${REPO}" rev-parse --short HEAD)
+printf '2026-09-10 | %s | round 1/2 | 30s | plan\n2026-09-10 | %s | round 1/3 | 60s | code\n' "${SB}" "${SB}" >> "${REPO}/docs/reviews/timing.md"
+commit_file src/core/x1.py 'waived 1'
+commit_file src/core/x2.py 'waived 2'
+commit_file src/core/x3.py 'waived 3'
+W=$(git -C "${REPO}" rev-parse HEAD)
+( cd "${REPO}" && PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new MOCK_REVIEW_WT="${REVIEW_WT}" \
+    SKIP_REVIEW="${B}..${W}" "${REQUEST_REVIEW}" "range waiver" ) > "${TMP}/stdout" 2> "${TMP}/stderr" \
+  || fail 'range waiver should exit 0'
+for c in $(git -C "${REPO}" rev-list "${B}..${W}"); do
+  grep -q " $(git -C "${REPO}" rev-parse --short "${c}") " "${REPO}/docs/reviews/skipped.md" \
+    || fail "range waiver did not register $(git -C "${REPO}" rev-parse --short "${c}")"
+done
+assert_eq "$(grep -c 'range waiver' "${REPO}/docs/reviews/skipped.md")" 3 'range waiver row count'
+grep -q "^${B}\b" "${REPO}/docs/reviews/skipped.md" && fail 'range waiver must not register the base itself'
+# The waived commits no longer push the range into review.
+commit_file docs/note9.md 'note after waiver'
+run_review new
+assert_eq "${RUN_STATUS}" 0 'waived range routing status'
+assert_eq "$(call_count '^agent ')" 0 'waived range must not wake the reviewer'
+echo 'PASS SKIP_REVIEW registers a whole commit range in one call'
+
+# ---- A fully waived prefix is named when the base is printed, so the human can advance it. ----
+rm -f "${REVIEW_DIR}"/.triage* "${TRIAGE_OUT}"
+commit_file src/core/y.py 'new work after the waived range'
+run_review new
+assert_eq "${RUN_STATUS}" 6 'post-waiver review status'
+grep -q "^base sha: ${B}" "${TMP}/stdout" || fail 'routed base should stay at the last real review'
+grep -q "NOTE: base 之后.*豁免.*$(git -C "${REPO}" rev-parse --short "${W}")" "${TMP}/stderr" \
+  || fail 'no NOTE naming the waived prefix and the base it suggests'
+echo 'PASS a fully waived prefix is flagged when the base is printed'
