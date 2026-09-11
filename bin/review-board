@@ -382,7 +382,7 @@ def add_waits(p):
     tv = p.get("tasks")
     if tv and tv["awaiting"] and tv["card"]:
         new.append(("release", "", "", "", f"{tv['awaiting']} {tv['card']['title']} 做完了，核对已通过。运行 review-task go 放行，"
-                    "再对写手说「继续」；想换个新写手，就开一个新的，对它说「开始循环」"))
+                    "再对写手说「继续」；想换个新写手，就开一个新的，对它说「运行 review-task next，按它的输出办」"))
         p["state"] = "等你放行"
     if new:
         p["human"].extend(new)

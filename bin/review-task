@@ -258,7 +258,7 @@ def cmd_go():
     if not awaiting:
         die(2, "ERROR: 没有在等放行的任务")
     append({"ev": "go", "id": awaiting})
-    print(f"已放行（{awaiting} 之后）。对写手说「继续」，它会运行 review-task next；想换个新写手，就开一个新的，对它说「开始循环」。")
+    print(f"已放行（{awaiting} 之后）。对写手说「继续」，它会运行 review-task next；想换个新写手，就开一个新的，对它说「运行 review-task next，按它的输出办」——AGENTS.md 里没写队列，新写手只能从这句话知道。")
     return 0
 
 

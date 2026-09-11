@@ -48,6 +48,7 @@ rt done T1; code 2 'done for a task that is not in progress'
 rt done T3; code 8 'done in release mode stops the writer'; has '等人放行' 'release mode says wait for release'
 rt next; code 8 'next before release'; has '等人放行' 'next refuses until released'
 rt go; code 0 'go'
+has '运行 review-task next，按它的输出办' 'go says the sentence a fresh writer needs'
 rt go; code 2 'go when nothing waits for release'
 rt next; code 0 'next after release'; has 'TASK T1: 给导出加进度条' 'the finished hand-written block is not issued again'
 
