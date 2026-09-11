@@ -165,6 +165,12 @@ herdsman-init <短名>
 时没人能叫醒它，自动退回前台等待。唤醒进程不写 `.last`／`.last.out`、不刷看板——那三样是写手那次运行的
 记录，被后台进程覆盖会让看板显示错的东西。
 
+唤醒进程用 perl 两次 fork + `setsid` 启动（新会话、新进程组，孙进程过继给 launchd），关掉继承的 fd 3 及以上，
+stdio 接 `/dev/null` 和 `$REVIEW_DIR/.wake.log`。各家 harness 在命令返回时清理后台进程的方式不同：codex 会连
+进程组一起清（2026-09-11 实测，`nohup` 挡不住），Claude Code 实测不清，也有的等管道 EOF、顺着父子关系清——
+这样启动，哪种都碰不到它。它启动后自己把 pid 写进标记，派发方两秒内看不到就当没起来、退回前台等待：换成没见过
+的 harness，最坏也只是回到老样子。叫不醒时看 `.wake.log`，开始、为什么跳出、身份核对、注入结果各有一行。
+
 没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
 评审 worktree 建一次就一直在，跟评审 agent 的死活无关；每轮脚本把它 `reset --hard` 到本次要审的 sha，目录内容变、目录本身不动。
@@ -737,6 +743,9 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
 # （或被盯的 agent 卡住、空转、超时）时把写手叫醒，叫完就退出 —— 没有常驻的东西。
 # 它不做任何判断：判断全在写手重跑时的 request-review 里，这里只负责"该回去看了"。
 
+# 唤醒进程的日志：它的 stdout 接在 ${DIR}/.wake.log。叫不醒时人来这里看它停在哪一步。
+wlog() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*"; }
+
 # 标记按哨兵文件认领：只有等的正是这个哨兵的那次运行才清它。规划者自己送审时，它那轮评审
 # 结束不能把写手等规划者的标记一起删掉 —— 删了，写手就再也没人叫。
 clear_wake_for() {       # $1=哨兵文件
@@ -746,7 +755,7 @@ clear_wake_for() {       # $1=哨兵文件
 
 # 记下写手自己的身份并 fork。认不出自己在哪个 pane（不在 herdr 里跑）就返回 1，退回前台等待。
 fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
-  local payload term sess pid
+  local payload term sess pid i
   [ "${REVIEW_WAKE}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ] || return 1
   # 被等的和被叫的必须是两个 pane。规划者和写手同目录、只能按名字认，万一认到写手自己头上，
   # armed 的就是一个自己等自己、自己叫自己的进程 —— 退回前台等待，让人看得见。
@@ -762,50 +771,73 @@ fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
   printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$1" "$2" "$3" "${HERDR_PANE_ID}" "${term}" "${sess}" \
     "${ROLE_LABEL}那边完成了或需要你查看：再次运行${RERUN_HINT:- request-review}。" > "${WAKE_MARK}"
   if [ "${REVIEW_WAKE_FORK}" = "1" ]; then
-    nohup "${SELF}" --wake "${WAKE_MARK}" >/dev/null 2>&1 &
-    printf '%s\n' "$!" >> "${WAKE_MARK}"
-  else
-    printf -- '-\n' >> "${WAKE_MARK}"
+    command -v perl >/dev/null || { rm -f "${WAKE_MARK}"; return 1; }
+    # 彻底脱离写手的 harness。harness 在命令返回时怎么清理后台进程因家而异：清进程组（codex 实测
+    # 如此，nohup 只挡 SIGHUP）、清会话、顺着父子关系清、或一直等管道 EOF。两次 fork + setsid
+    # （新会话、新进程组，孙进程过继给 launchd），关掉继承的 fd 3+，stdio 接 /dev/null 和日志，
+    # 这几种都碰不到它。macOS 没有 setsid 命令，用 perl。
+    perl -MPOSIX -e 'exit if fork; POSIX::setsid(); exit if fork;
+      my $m = POSIX::sysconf(POSIX::_SC_OPEN_MAX); $m = 4096 if !$m || $m > 4096;
+      POSIX::close($_) for 3 .. $m - 1; exec @ARGV or exit 127' \
+      "${SELF}" --wake "${WAKE_MARK}" </dev/null >>"${DIR}/.wake.log" 2>&1
+    # 它自报 pid 才算 armed。两秒内没报上来就当没起来，退回前台等待 —— 换什么 harness 最坏也是老样子。
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      case "$(sed -n '8p' "${WAKE_MARK}" 2>/dev/null)" in [1-9]*) return 0;; esac
+      sleep 0.2
+    done
+    rm -f "${WAKE_MARK}"; return 1
   fi
+  printf -- '-\n' >> "${WAKE_MARK}"
   return 0
 }
 
 # 只往身份核对通过、且已经闲下来的写手 pane 注入。核不准就什么都不做 —— 宁可让人自己跑一次，
 # 也不能往一个不确定是谁的 agent 里打字。成功注入返回 0。
 wake_writer() {          # $1=pane $2=terminal $3=session $4=话
-  local payload term sess deadline
+  local payload term sess deadline err
   deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
   while :; do
-    payload=$(herdr agent get "$1" 2>/dev/null) || return 1
+    payload=$(herdr agent get "$1" 2>/dev/null) || { wlog "写手 pane $1 查不到"; return 1; }
     term=$(printf '%s' "${payload}" | jq -r '.result.agent.terminal_id // empty' 2>/dev/null)
     sess=$(printf '%s' "${payload}" | jq -r '.result.agent.agent_session.value // empty' 2>/dev/null)
-    [ -n "${term}" ] && [ "${term}" = "$2" ] || return 1
-    [ -z "$3" ] || [ "${sess}" = "$3" ] || return 1
-    case "$(transport_state "$1")" in idle|done) transport_dispatch "$1" "$4" >/dev/null 2>&1; return 0;; esac
-    [ "$(date +%s)" -lt "${deadline}" ] || return 1
+    [ -n "${term}" ] && [ "${term}" = "$2" ] || { wlog "写手 pane $1 换了 terminal（记的 $2，现在 ${term:-空}）"; return 1; }
+    [ -z "$3" ] || [ "${sess}" = "$3" ] || { wlog "写手 pane $1 换了 session"; return 1; }
+    case "$(transport_state "$1")" in
+      idle|done)
+        err=$(transport_dispatch "$1" "$4") && return 0
+        # herdr 有过 stalled 误报（见 send_prompt）：写手已经动起来就算叫醒了
+        case "$(transport_state "$1")" in working|blocked) return 0;; esac
+        wlog "往写手 pane $1 注入失败：${err}"; return 1;;
+    esac
+    [ "$(date +%s)" -lt "${deadline}" ] || { wlog "等写手空闲超过 ${REVIEW_WAKE_MAX}s"; return 1; }
     sleep "${REVIEW_POLL}"
   done
 }
 
 # 只盯这一次派发。标记没了（周期被放弃、或写手自己跑了一次领走了）就静默退出。
 wake_loop() {            # $1=标记文件
-  local mark="$1" file word watched deadline st idle=0
+  local mark="$1" file word watched writer deadline st idle=0
   file=$(sed -n '1p' "${mark}"); word=$(sed -n '2p' "${mark}"); watched=$(sed -n '3p' "${mark}")
+  writer=$(sed -n '4p' "${mark}")
   deadline=$(( $(date +%s) + REVIEW_WAKE_MAX ))
+  wlog "开始：等 ${file##*/} 出现 ${word}，盯 ${watched}，完了叫 ${writer}"
   while :; do
-    [ -f "${mark}" ] || return 0
-    sentinel_ok "${file}" "${word}" && break
+    [ -f "${mark}" ] || { wlog "标记已被领走，退出"; return 0; }
+    sentinel_ok "${file}" "${word}" && { wlog "哨兵齐了"; break; }
     st=$(transport_state "${watched}")
     case "${st}" in
-      blocked) break;;
-      idle|done) idle=$((idle + 1)); [ "${idle}" -ge 2 ] && break;;
+      blocked) wlog "${watched} blocked"; break;;
+      idle|done) idle=$((idle + 1)); [ "${idle}" -ge 2 ] && { wlog "${watched} 连续两次 ${st} 却没交付"; break; };;
       *) idle=0;;
     esac
-    [ "$(date +%s)" -lt "${deadline}" ] || break
+    [ "$(date +%s)" -lt "${deadline}" ] || { wlog "等满 ${REVIEW_WAKE_MAX}s"; break; }
     sleep "${REVIEW_POLL}"
   done
-  wake_writer "$(sed -n '4p' "${mark}")" "$(sed -n '5p' "${mark}")" "$(sed -n '6p' "${mark}")" \
-    "$(sed -n '7p' "${mark}")" && rm -f "${mark}"
+  if wake_writer "${writer}" "$(sed -n '5p' "${mark}")" "$(sed -n '6p' "${mark}")" "$(sed -n '7p' "${mark}")"; then
+    rm -f "${mark}"; wlog "已叫醒 ${writer}"
+  else
+    wlog "没叫醒，标记留给人"
+  fi
 }
 
 # 等哨兵；期间评审方 blocked 则退出 4，超时退出 3。
@@ -1250,6 +1282,8 @@ fi
 # ---- 唤醒进程：由派发那次运行 fork 出来，只盯一次哨兵，叫醒写手后退出 ----
 if [ "${1:-}" = --wake ]; then
   [ -f "${2:-}" ] || exit 0
+  # 自报 pid：启动它的 perl 一闪而过，派发方拿不到真 pid；存活守卫靠这一行判断它还在不在。
+  { sed -n '1,7p' "$2"; printf '%s\n' "$$"; } > "$2.$$" && mv -f "$2.$$" "$2"
   wake_loop "$2"; exit 0
 fi
 

@@ -1139,3 +1139,47 @@ run_review plan-live plan
 assert_eq "${RUN_STATUS}" 0 'plan delivery after wake status'
 [ -f "${REVIEW_DIR}/.wake" ] && fail 'delivering the plan should clear the marker waiting on it'
 echo 'PASS writer→planner arms on plan.md and delivery clears it'
+
+# A harness that reads the command's output through a pipe until EOF — or hands it an extra fd —
+# must see EOF when the command returns; a waker still holding that pipe would hang the harness.
+grep -v '^REVIEW_WAKE_FORK=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+clear_cycle
+write_request code "${B}" 1/3
+: > "${MOCK_LOG}"
+( ( cd "${REPO}" && env PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new \
+      MOCK_REVIEW_WT="${REVIEW_WT}" MOCK_REPO="$(cd "${REPO}" && pwd -P)" HERDR_PANE_ID=writer-pane \
+      "${REQUEST_REVIEW}" 3>&1 ) 2>&1 | cat > "${TMP}/piped" ) &
+PIPE_JOB=$!
+for _ in $(seq 1 20); do kill -0 "${PIPE_JOB}" 2>/dev/null || break; sleep 0.25; done
+WPID=$(sed -n '8p' "${REVIEW_DIR}/.wake" 2>/dev/null || true)
+if kill -0 "${PIPE_JOB}" 2>/dev/null; then
+  case "${WPID}" in [1-9]*) kill "${WPID}" 2>/dev/null || true;; esac
+  wait "${PIPE_JOB}" 2>/dev/null || true
+  fail 'a harness reading the command through a pipe would hang: the waker still holds it'
+fi
+grep -q '已派发' "${TMP}/piped" || fail 'piped dispatch output missing'
+case "${WPID}" in [1-9]*) kill "${WPID}" 2>/dev/null || true;; esac
+printf 'REVIEW_WAKE_FORK=0\n' >> "${REPO}/.review.conf"
+echo 'PASS the waker holds no pipe the harness handed the command'
+
+# The waker must outlive the dispatching command's process group: a harness (codex, seen live on
+# 2026-09-11) cleans the whole group up when the command returns, and nohup only survives SIGHUP.
+grep -v '^REVIEW_WAKE_FORK=' "${REPO}/.review.conf" > "${TMP}/conf" && mv "${TMP}/conf" "${REPO}/.review.conf"
+clear_cycle
+write_request code "${B}" 1/3
+: > "${MOCK_LOG}"
+set +e
+( cd "${REPO}" && perl -MPOSIX -e '$p=fork; if(!$p){ setpgid(0,0); exec @ARGV } waitpid($p,0); $s=$?>>8; kill "TERM", -$p; exit $s' \
+    env PATH="${MOCK_BIN}:${PATH}" MOCK_LOG="${MOCK_LOG}" MOCK_SCENARIO=new MOCK_REVIEW_WT="${REVIEW_WT}" \
+    MOCK_REPO="$(cd "${REPO}" && pwd -P)" HERDR_PANE_ID=writer-pane "${REQUEST_REVIEW}" \
+) > "${TMP}/stdout" 2> "${TMP}/stderr"
+PG_STATUS=$?
+set -e
+assert_eq "${PG_STATUS}" 3 'dispatch inside a killed process group status'
+sleep 1
+WPID=$(sed -n '8p' "${REVIEW_DIR}/.wake")
+case "${WPID}" in [1-9]*) ;; *) fail "no waker pid recorded, got '${WPID}'";; esac
+kill -0 "${WPID}" 2>/dev/null || fail 'the waker died with the dispatching command process group'
+kill "${WPID}" 2>/dev/null || true
+printf 'REVIEW_WAKE_FORK=0\n' >> "${REPO}/.review.conf"
+echo 'PASS the waker outlives the dispatching command process group'
