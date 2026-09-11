@@ -333,6 +333,59 @@ def last_run(d):
     return {"code": raw[0], "ts": int(raw[1]), "head": head, "out": out}
 
 
+
+def wake_status(d):
+    """唤醒标记还在、它自报的进程却已经不在：写手不会被自动叫醒，要人去推一下。
+    还没报到（不足 8 行）、测试占位 '-'、进程仍在（包括属于别的用户）都不算。标记坏了只当没有 —— 不能把整页弄崩。"""
+    try:
+        lines = (read(f"{d}/.wake") or "").splitlines()
+        if len(lines) < 8 or not re.fullmatch(r"[1-9]\d*", lines[7].strip()):
+            return None
+        pid = int(lines[7].strip())
+        try:
+            os.kill(pid, 0)
+            return None
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return None
+        why = ""
+        for line in reversed((read(f"{d}/.wake.log") or "").splitlines()):
+            if f"[{pid}]" in line and not line.rstrip().endswith("没叫醒，标记留给人"):
+                why = line.split("] ", 1)[-1].strip()
+                break
+        return {"sentinel": os.path.basename(lines[0].strip()), "writer": lines[3].strip(),
+                "done": sentinel_ok(read(lines[0].strip()), lines[1].strip()), "why": why}
+    except Exception:
+        return None
+
+
+def add_waits(p):
+    """把「等你」补全。上面只收了待裁决、以及正被等着的一方卡住；这里补上写手停下、叫醒失败、任何一方卡在对话框。
+    exit 5 已由待裁决解释、exit 4 已由被等的一方卡住解释的，不再重复列；exit 7 是写手自己重写简报，不等你。"""
+    has_dec = any(k == "decision" for k, *_ in p["human"])
+    has_stop = any(k == "stop" for k, *_ in p["human"])
+    new = []
+    for role, label in (("writer", "写手"), ("planner", "规划者"), ("reviewer", "评审方")):
+        a = (p.get("agents") or {}).get(role)
+        if a and a["status"] == "blocked" and not (a["pane"] and any(a["pane"] in r for k, _, _, _, r in p["human"] if k == "stop")):
+            new.append(("stop", "", "blocked", "", f"{label}停在审批或提问对话框，去看 pane {a['pane']}"))
+    lr = p.get("last_run")
+    if lr and lr["code"] != "7" and not (lr["code"] == "5" and has_dec) and not (lr["code"] == "4" and has_stop):
+        new.append(("stop", "", "exit", "", f"写手停下 · exit {lr['code']} · {lr['head']}"))
+    w = wake_status(p["dir"])
+    if w:
+        cmd = "request-review plan" if w["sentinel"] == "plan.md" else "request-review"
+        text = (f"{w['sentinel']} 已经交了，但叫醒进程已不在，写手 {w['writer']} 没被叫醒——对它说「跑 {cmd}」" if w["done"] else
+                f"叫醒进程已不在：{w['sentinel']} 交出来后写手 {w['writer']} 不会被自动叫醒，到时对它说「跑 {cmd}」")
+        new.append(("stop", "", "wake", "", text + (f"（日志最后一句：{w['why']}）" if w["why"] else "（没留下日志）")))
+    if new:
+        p["human"].extend(new)
+        p["needs_me"] = True
+        if not p["waiting"]:
+            p["waiting"] = "等你"
+
+
 def project_state(repo, conf):
     d = conf["REVIEW_DIR"]
     head = git(repo, "rev-parse", "HEAD").strip()
@@ -403,6 +456,7 @@ def project_state(repo, conf):
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     p["last_run"] = last_run(d)
+    add_waits(p)
     return p
 
 
@@ -612,6 +666,10 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .banner a{display:flex;gap:10px;align-items:baseline;color:#f0a3b3}
 .banner a b{font-weight:600}.banner a .age{color:#d98aa0}.banner a .arr{color:#c8375a}
 .nowait{padding:7px 24px;color:#8b8985;border-bottom:1px solid #2e2e2e;font-size:12px}
+.wait{margin:10px 0 0;border:1px solid #7a2f3f;background:#2a171c;border-radius:4px;padding:8px 12px;font-size:13px}
+.wait.calm{border-color:#5a4a2a;background:#231e15}.wait .wh{font-weight:700;color:#f0a3b3;margin-bottom:4px}
+.wait ul{margin:0;padding-left:18px}.wait li{margin:3px 0;color:#e6e4df}.wait li .dim{color:#a3a19b}.wait a{color:#f0a3b3}
+.wait details.mapsug{margin-top:6px}
 .grid{display:grid;grid-template-columns:232px minmax(0,1fr);flex:1;align-items:start}
 .side{border-right:1px solid #2e2e2e;position:sticky;top:44px;align-self:start;padding:14px 0;max-height:calc(100vh - 44px);overflow:auto}
 .side .cap{padding:0 16px 8px;font-size:11px;color:#8b8985;letter-spacing:.04em}
@@ -1019,6 +1077,23 @@ def render_panel(p, archives, self_closed):
                 bits.append(f'<span class="act">{esc(a["activity"])}</span>')
             chips.append(f'<span class="agent st-{st}" title="pane {esc(a["pane"])}">{"".join(bits)}</span>')
         parts.append(f'<div class="crew">{"".join(chips)}</div>')
+    # 「等你」栏：这个项目里卡在你身上的事一处看全；横幅是跨项目的汇总，点一下跳到这里。风险图建议放「不急」档。
+    sug = p.get("map")
+    if p["human"] or sug:
+        items = []
+        for kind, fid, verb, sev, reason in p["human"]:
+            if kind == "stop":
+                items.append(f'<li>{esc(reason)}</li>')
+                continue
+            what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
+            a = f"f-{p['name']}-{fid}"
+            items.append(f'<li><a href="#{esc(a)}" onclick="return rbGo(\'{esc(p["name"])}\',\'{esc(a)}\')">{esc(what)}</a>'
+                         + (f'<span class="dim"> · {esc(reason)}</span>' if reason else "") + '</li>')
+        body = f'<div class="wh">等你 · {len(items)}</div><ul>{"".join(items)}</ul>' if items else ""
+        if sug:
+            rows = "".join(f'<li><span class="mute">{"建议降级" if k == "lower" else "建议加入"}</span> <code>{esc(g)}</code> {esc(lv)} <span class="dim">· {esc(why)}</span></li>' for k, g, lv, why in sug)
+            body += f'<details class="mapsug"><summary>不急 · 风险图有 {len(sug)} 条建议，等你点头</summary><ul>{rows}</ul></details>'
+        parts.append(f'<div class="wait{"" if items else " calm"}" id="w-{esc(p["name"])}">{body}</div>')
     pl = p.get("planning")
     if pl:
         parts.append(f'<div class="planning"><b>规划中</b><span class="age">{ago(pl["since"])}</span>'
@@ -1039,9 +1114,6 @@ def render_panel(p, archives, self_closed):
     ms = p.get("map")
     if ms is None:
         parts.append('<div class="accum mute">没有 .review-map，代码路径全部由评审方 triage</div>')
-    elif ms:
-        items = "".join(f'<li><span class="mute">{"建议降级" if k == "lower" else "建议加入"}</span> <code>{esc(g)}</code> {esc(lv)} <span class="dim">· {esc(why)}</span></li>' for k, g, lv, why in ms)
-        parts.append(f'<details class="mapsug"><summary>风险图有 {len(ms)} 条建议，等你点头</summary><ul>{items}</ul></details>')
     acc = p.get("accum")
     if acc is None:
         parts.append('<div class="accum mute">尚无已完成的代码评审，无法计算累积</div>')
@@ -1134,7 +1206,7 @@ def render(projects, archives, self_closed):
     for p in projects:
         for kind, fid, verb, sev, reason in p["human"]:
             if kind == "stop":
-                waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"p-{p['name']}"))
+                waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"w-{p['name']}"))
                 continue
             what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
@@ -1153,7 +1225,10 @@ def render(projects, archives, self_closed):
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     kinds = sorted({p["kind"] for p in projects}) or ["claude"]
     writer_kinds = [((p.get("agents") or {}).get("writer") or {}).get("kind") for p in projects]
-    p0 = next((p for p in projects if p["kind"] == kinds[0]), projects[0] if projects else {})
+    # 评审参数和规划者参数一样，取第一个配了覆盖的项目。原先取排序后第一个项目，而需要你的项目排在前面，
+    # 顶栏就会随「谁在等你」来回变。
+    p0 = next((p for p in projects if p["kind"] == kinds[0] and p.get("review_args")),
+              next((p for p in projects if p["kind"] == kinds[0]), projects[0] if projects else {}))
     agents = agents_line(kinds[0], next((k for k in writer_kinds if k), ""), p0.get("review_args", ""),
                          next((p["plan_kind"] for p in projects if p.get("plan_kind")), ""),
                          next((p["plan_args"] for p in projects if p.get("plan_kind")), ""))

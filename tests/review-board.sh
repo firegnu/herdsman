@@ -22,7 +22,7 @@ mk() {   # <name>：两个提交的仓库 + .review.conf + 交接目录
   printf 'a\nb = 1\n' > "$r/a.py"; git -C "$r" add .; git -C "$r" commit -qm change
   printf 'REVIEW_KIND=claude\nREVIEW_WT=%s\nREVIEW_DIR=%s\n' "$r" "${TMP}/$n/review" > "$r/.review.conf"
 }
-mk alpha; mk beta; mk gamma; mk delta; mk epsilon
+mk alpha; mk beta; mk gamma; mk delta; mk epsilon; mk zeta
 now=$(date +%s)
 
 # 假 herdr：beta 的评审方 blocked，gamma 的在 working，其余 pane 不存在
@@ -32,7 +32,7 @@ case "$1 $2 $3" in
   'agent get beta-pane')  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n';;
   'agent get gamma-pane') printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
   'agent get eps-plan')   printf '{"result":{"agent":{"agent_status":"working"}}}\n';;
-  'agent list ') printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","cwd":"%s","pane_id":"alpha-writer","terminal_title_stripped":"repo"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"gamma-pane","terminal_title_stripped":"Triage request"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"eps-plan","name":"pl-repo-","terminal_title_stripped":"Plan request"}]}}\n' "${MOCK_ALPHA}" "${MOCK_GAMMA}" "${MOCK_EPS}";;
+  'agent list ') printf '{"result":{"agents":[{"agent":"codex","agent_status":"working","cwd":"%s","pane_id":"alpha-writer","terminal_title_stripped":"repo"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"gamma-pane","terminal_title_stripped":"Triage request"},{"agent":"claude","agent_status":"working","cwd":"%s","pane_id":"eps-plan","name":"pl-repo-","terminal_title_stripped":"Plan request"},{"agent":"codex","agent_status":"blocked","cwd":"%s","pane_id":"zeta-writer","terminal_title_stripped":"repo"}]}}\n' "${MOCK_ALPHA}" "${MOCK_GAMMA}" "${MOCK_EPS}" "${MOCK_ZETA}";;
   'agent read eps-plan') printf '✻ Drafting… (2m 01s · esc to interrupt)\n';;
   'agent read alpha-writer') printf 'some output\n• Working (12m 03s • esc to interrupt)\n\n› Ask Codex\n';;
   'agent read gamma-pane') printf '✻ Reviewing diff… (3m 10s · esc to interrupt)\n\n❯\n';;
@@ -40,9 +40,10 @@ case "$1 $2 $3" in
 esac
 MOCK
 chmod +x "${TMP}/herdr"
-export MOCK_ALPHA="${TMP}/alpha/repo" MOCK_GAMMA="${TMP}/gamma/repo" MOCK_EPS="${TMP}/epsilon/repo"
+export MOCK_ALPHA="${TMP}/alpha/repo" MOCK_GAMMA="${TMP}/gamma/repo" MOCK_EPS="${TMP}/epsilon/repo" MOCK_ZETA="${TMP}/zeta/repo"
 # alpha 的评审 worktree 另在别处，这样 cwd 是仓库的 agent 才算写手
 sed -i '' "s|^REVIEW_WT=.*|REVIEW_WT=${TMP}/alpha/wt|" "${TMP}/alpha/repo/.review.conf"
+sed -i '' "s|^REVIEW_WT=.*|REVIEW_WT=${TMP}/zeta/wt|" "${TMP}/zeta/repo/.review.conf"
 printf 'REVIEW_AGENT_ARGS="--model claude-opus-5"\n' >> "${TMP}/alpha/repo/.review.conf"
 printf 'PLAN_KIND=codex\nPLAN_AGENT_ARGS='"'"'--dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort="high"'"'"'\n' >> "${TMP}/epsilon/repo/.review.conf"
 
@@ -143,12 +144,26 @@ EOF
 printf '2026-09-01 | abc1234 | round 1/3 | 95s\n' > "${TMP}/gamma/repo/docs/reviews/timing.md"
 printf '# 自行闭合记录\n\n2026-09-02 | def5678 | 纯文本 | 只改了 .md\n' > "${TMP}/gamma/repo/docs/reviews/self-closed.md"
 
-printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n%s/epsilon/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
+# 「等你」栏的新信号 —— alpha：写手 exit 5 已由待裁决解释，不重复列；.wake 坏了（pid 不是数字），不能把整页弄崩
+printf '5 %s\n' "$((now - 30))" > "${TMP}/alpha/review/.last"
+printf 'STOP: round 1 有待人工裁决的 finding\n' > "${TMP}/alpha/review/.last.out"
+printf 'x\nREVIEW-COMPLETE\nr\nalpha-bad\nt\ns\nm\nabc\n' > "${TMP}/alpha/review/.wake"
+# epsilon：唤醒进程还活着（pid 是测试 shell 自己）→ 不报
+printf '%s\nPLAN-COMPLETE\neps-plan\neps-writer\nt\ns\nm\n%s\n' "${TMP}/epsilon/review/plan.md" "$$" > "${TMP}/epsilon/review/.wake"
+# zeta：写手卡在审批对话框（假 herdr 里 blocked）；唤醒进程已死，.wake.log 留下了原因；写手上次 exit 4
+D="${TMP}/zeta/review"
+sleep 0 & DEAD=$!; wait "${DEAD}" || true
+printf '%s\nREVIEW-COMPLETE\nzeta-rv\nzeta-writer\nt\ns\nm\n%s\n' "$D/r1-findings.md" "${DEAD}" > "$D/.wake"
+printf '2026-09-11 10:00:00 [%s] 开始：等 r1-findings.md 出现 REVIEW-COMPLETE\n2026-09-11 10:05:00 [%s] 写手 pane zeta-writer 换了 terminal（记的 t，现在 u）\n2026-09-11 10:05:00 [%s] 没叫醒，标记留给人\n' "${DEAD}" "${DEAD}" "${DEAD}" > "$D/.wake.log"
+printf '4 %s\n' "$((now - 45))" > "$D/.last"
+printf 'STOP: 无法确认 pane zeta-rv 的评审方身份\n' > "$D/.last.out"
+
+printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n%s/epsilon/repo\n%s/zeta/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
 HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null
 
 # 项目发现与去重命名（三个 checkout 都叫 repo，用上级目录区分）
-for n in alpha beta gamma delta epsilon; do has "data-p=\"$n/repo\"" "project $n listed"; done
-has '项目 · 5' 'project count'
+for n in alpha beta gamma delta epsilon zeta; do has "data-p=\"$n/repo\"" "project $n listed"; done
+has '项目 · 6' 'project count'
 has '<div class="mast"><span class="brand">Review board</span>' 'masthead'
 has '<b>写手</b> codex ·' 'writer agent line'
 grep -qE '<b>规划者</b> codex · [^<]+ · high</span>' "${OUT}" || fail 'planner agent line with effort override'
@@ -168,7 +183,7 @@ has '<span class="badge me">评审中 · 评审方 blocked</span>' 'beta blocked
 has '<span class="badge rv">triage 中</span>' 'gamma waiting on reviewer blue'
 has '<span class="badge none">已闭合</span>' 'delta closed grey'
 has 'STOP · 评审方停在审批或提问对话框，去看 pane beta-pane' 'banner stop item'
-has 'href="#p-beta/repo"' 'stop item links to project'
+has 'href="#w-beta/repo"' 'stop item jumps to the project 等你 section'
 # 活动条：写手/评审方在干什么，来自 herdr agent list 的状态与标题，working 时再读 pane 最后那句
 has '<span class="dot st-working"></span><b>写手</b><span class="st st-working">working</span><span class="act">Working (12m 03s)</span>' 'alpha writer chip with activity'
 has '<b>评审方</b><span class="st st-working">working</span><span class="ttl">Triage request</span><span class="act">Reviewing diff… (3m 10s)</span>' 'gamma reviewer chip with title and activity'
@@ -187,11 +202,14 @@ has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'
 
 # 横幅：两条裁决 + 一条 STOP；alpha 排在最前
-has '等你 · 3' 'banner count'
+has '等你 · 7' 'banner count: alpha 2 + beta 2 + zeta 3'
 has 'F2 细节 · 写手拒绝' 'banner reject item'
 has 'F3 阻断 · 写手暂缓' 'banner blocking-defer item'
 has 'id="f-alpha/repo-F2"' 'finding anchor'
-[ "$(grep -o 'class="proj[^"]*" data-p="[^"]*"' "${OUT}" | head -1)" = 'class="proj needs" data-p="alpha/repo"' ] || fail 'alpha not first in sidebar'
+seen_plain=0
+for c in $(grep -o 'class="proj[^"]*" data-p' "${OUT}" | sed 's/class="proj needs" data-p/needs/;s/class="proj" data-p/plain/'); do
+  if [ "$c" = plain ]; then seen_plain=1; elif [ "${seen_plain}" = 1 ]; then fail 'a project that needs you sorted after a quiet one'; fi
+done
 
 # finding 表：三种回应、待裁决标记、evidence
 has '<span class="verb accept" title="accept">接受</span>' 'accept verb translated with tooltip'
@@ -233,6 +251,19 @@ has 'class="filter" type="search"' 'backlog filter box'
 has '<code>def5678</code>' 'self-closed row'
 has '最近 1 条：1 条纯文本' 'self-closed summary line'
 has '只改了 .md' 'self-closed reason'
+
+# 「等你」栏：每个项目一栏，横幅只是汇总
+has 'id="w-beta/repo"' 'beta has its own 等你 section'
+has '写手停下 · exit 2 · ERROR: request 的 kind 是 plan' 'writer exit 2 listed as waiting on you'
+lacks '写手停下 · exit 5' 'exit 5 already explained by pending decisions is not repeated'
+has '写手停在审批或提问对话框，去看 pane zeta-writer' 'blocked writer listed'
+has '写手停下 · exit 4 · STOP: 无法确认 pane zeta-rv 的评审方身份' 'writer exit 4 listed'
+has '叫醒进程已不在' 'dead waker listed'
+has '写手 zeta-writer 不会被自动叫醒' 'dead waker names the writer'
+has '写手 pane zeta-writer 换了 terminal' 'dead waker shows its last reason from .wake.log'
+lacks '写手 eps-writer' 'a live waker is not reported'
+lacks 'alpha-bad' 'a malformed marker is ignored, not rendered'
+has 'class="proj needs" data-p="zeta/repo"' 'zeta highlighted in the sidebar'
 
 # 不接触真实项目
 lacks 'jb-finetune' 'real project leaked into fixture board'
