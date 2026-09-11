@@ -21,6 +21,7 @@ echo "  ✓ ${BIN}/review-archive"
 echo "  ✓ ${BIN}/herdsman-init"
 echo "  ✓ ${BIN}/review-board"
 echo "  ✓ ${BIN}/review-map"
+echo "  ✓ ${BIN}/review-task"
 
 if [ -f "${CFG}/rubric.md" ]; then
   if cmp -s "${SRC}/config/rubric.md" "${CFG}/rubric.md"; then
