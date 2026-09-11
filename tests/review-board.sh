@@ -271,3 +271,20 @@ lacks '~/Developer' 'default discovery used'
 
 # 默认输出路径：--out 未给时写到 ~/.review/board.html —— 不在测试里跑，避免碰真实目录
 echo 'PASS review-board renders states, banner, findings, backlog, archives, self-closed'
+
+# 并发刷新：launchd 每 30 秒一次，request-review 退出时也刷一次，两者会同时跑。临时文件共用一个名字时，
+# 后到的那个改名会扑空（2026-09-11 board.err 里有 3 次）。先用一个被占住的 board.html.tmp 把「共用固定名字」
+# 确定地暴露出来，再真并发跑几次。
+mkdir "${OUT}.tmp"
+HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null 2>"${TMP}/board.err" \
+  || fail "board writes through a shared fixed temp name: $(tail -1 "${TMP}/board.err")"
+rmdir "${OUT}.tmp"
+pids=""
+for i in 1 2 3 4; do
+  HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null 2>>"${TMP}/board.err" &
+  pids="${pids} $!"
+done
+for p in ${pids}; do wait "$p" || fail "a concurrent board run failed: $(tail -1 "${TMP}/board.err")"; done
+ls "${OUT}".*tmp >/dev/null 2>&1 && fail 'board left a temp file behind'
+has 'Review board' 'page still written after concurrent runs'
+echo 'PASS concurrent board runs never collide on the temp file'

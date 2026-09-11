@@ -3170,11 +3170,16 @@ def main():
     self_closed = {p["name"]: self_closed[p["repo"]] for p in projects}
     projects.sort(key=lambda p: (not p["needs_me"], -(p["since"] or p["last_activity"] or 0), p["name"]))
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    # 先写临时文件再改名：浏览器 30 秒一刷，直接覆盖会有一瞬读到空文件
-    tmp = out_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(render(projects, archives, self_closed))
-    os.replace(tmp, out_path)
+    # 先写临时文件再改名：浏览器 30 秒一刷，直接覆盖会有一瞬读到空文件。临时文件名带进程号：launchd 的定时刷新
+    # 和 request-review 退出时的刷新会同时跑，共用一个名字时后到的那个改名会扑空。写失败就删掉自己的，不留残留。
+    tmp = f"{out_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(render(projects, archives, self_closed))
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     if "--quiet" not in args:
         print(out_path)
     if "--open" in args:
