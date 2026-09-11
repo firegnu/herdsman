@@ -15,6 +15,7 @@
 - 第 5 部分：所有模板原文
 - 第 6 部分：生成项目简报的提示词
 - 第 6b 部分：规划者（可选角色）
+- 第 6c 部分：任务队列（可选）
 - 第 7 部分：轮次控制
 - 第 8 部分：度量
 - 第 9 部分：失效模式与警戒线
@@ -170,6 +171,8 @@ stdio 接 `/dev/null` 和 `$REVIEW_DIR/.wake.log`。各家 harness 在命令返�
 进程组一起清（2026-09-11 实测，`nohup` 挡不住），Claude Code 实测不清，也有的等管道 EOF、顺着父子关系清——
 这样启动，哪种都碰不到它。它启动后自己把 pid 写进标记，派发方两秒内看不到就当没起来、退回前台等待：换成没见过
 的 harness，最坏也只是回到老样子。叫不醒时看 `.wake.log`，开始、为什么跳出、身份核对、注入结果各有一行。
+
+可选的 `TASK_GATE` 只对任务队列（`review-task`，见第 6c 部分）起作用：`1`（默认）是放行模式，每个任务做完等你运行 `review-task go`；`0` 是自动模式，做完直接发下一个。
 
 没有 `REVIEWER` 这一项。脚本按 `REVIEW_WT` 的 cwd 找评审方，不依赖 agent 名字，因为名字需要人维护、进程一退就没，cwd 是进程自带属性。
 
@@ -2272,11 +2275,158 @@ def add_waits(p):
         text = (f"{w['sentinel']} 已经交了，但叫醒进程已不在，写手 {w['writer']} 没被叫醒——对它说「跑 {cmd}」" if w["done"] else
                 f"叫醒进程已不在：{w['sentinel']} 交出来后写手 {w['writer']} 不会被自动叫醒，到时对它说「跑 {cmd}」")
         new.append(("stop", "", "wake", "", text + (f"（日志最后一句：{w['why']}）" if w["why"] else "（没留下日志）")))
+    tv = p.get("tasks")
+    if tv and tv["awaiting"] and tv["card"]:
+        new.append(("release", "", "", "", f"{tv['awaiting']} {tv['card']['title']} 做完了，核对已通过。运行 review-task go 放行，"
+                    "再对写手说「继续」；想换个新写手，就开一个新的，对它说「开始循环」"))
+        p["state"] = "等你放行"
     if new:
         p["human"].extend(new)
         p["needs_me"] = True
         if not p["waiting"]:
             p["waiting"] = "等你"
+
+
+
+# ============================================================ 任务队列（review-task 与看板共用这份解析）
+TASK_HDR = re.compile(r'^##\s+(?:(T\d+)\s+)?(.+?)\s*$')
+
+
+def task_blocks(text):
+    """queue.md → [{id 或 None, title, body}]，按文件顺序。「## T7 标题」或「## 标题」开一块，第一块之前的行忽略。"""
+    blocks, cur = [], None
+    for line in (text or "").splitlines():
+        m = TASK_HDR.match(line)
+        if m:
+            cur = {"id": m.group(1), "title": m.group(2), "body": []}
+            blocks.append(cur)
+        elif cur is not None:
+            cur["body"].append(line)
+    for b in blocks:
+        b["body"] = "\n".join(b["body"]).strip("\n")
+    return blocks
+
+
+def task_events(text):
+    out = []
+    for line in (text or "").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def task_fold(evs):
+    """tasks.state 的事件 → ({id: task}（按开始顺序）, 进行中的那个, 在等放行的 id)。"""
+    tasks, awaiting = {}, None
+    for e in evs:
+        tid, ev = e.get("id"), e.get("ev")
+        if ev == "start":
+            tasks[tid] = {"id": tid, "title": e.get("title", ""), "body": e.get("body", ""), "key": e.get("key", ""),
+                          "start": e.get("sha", ""), "t0": e.get("t"), "status": "doing"}
+            awaiting = None
+        elif ev == "done" and tid in tasks:
+            tasks[tid].update(status="done", end=e.get("sha", ""), t1=e.get("t"))
+            awaiting = tid if e.get("gate") else None
+        elif ev == "drop":
+            t = tasks.setdefault(tid, {"id": tid, "title": e.get("title", ""), "body": "", "key": e.get("key", ""), "start": ""})
+            t.update(status="dropped", reason=e.get("reason", ""), t1=e.get("t"))
+        elif ev == "go":
+            awaiting = None
+    current = next((t for t in tasks.values() if t["status"] == "doing"), None)
+    return tasks, current, awaiting
+
+
+def task_pending(blocks, tasks):
+    """队列里还没开始的块，按文件顺序。有编号按编号认，没编号按标题认（所以开始过的任务别改标题）。"""
+    keys = {t["key"] for t in tasks.values() if t.get("key")}
+    return [b for b in blocks if not (b["id"] in tasks if b["id"] else b["title"] in keys)]
+
+
+def timing_rounds(repo):
+    """timing.md → [(短 sha, kind)]，每完成一轮一行；旧行没有 kind 当作 code。"""
+    out = []
+    for line in (read(f"{repo}/docs/reviews/timing.md") or "").splitlines():
+        m = re.match(r'\S+ \| (\w+) \| round \d+/\d+ \| \d+s(?: \| (\w+))?', line)
+        if m:
+            out.append((m.group(1), m.group(2) or "code"))
+    return out
+
+
+def task_commits(repo, a, b):
+    return git(repo, "rev-list", f"{a}..{b}").split() if a and b and a != b else []
+
+
+def task_rounds(commits, timing):
+    """这个任务的提交里，各有几轮计划评审、几轮代码评审（按每一轮的 target sha 落在不落在里面算）。"""
+    hit = lambda s: any(c.startswith(s) for c in commits)
+    return sum(1 for s, k in timing if k == "plan" and hit(s)), sum(1 for s, k in timing if k != "plan" and hit(s))
+
+
+def task_span(a, b):
+    if not a or not b:
+        return ""
+    m = max(0, int(b - a)) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def task_view(repo, conf, p):
+    """任务区要显示的东西。项目没有 queue.md（没用队列）就返回 None，页面上不出现任务区。
+    阶段条靠现有的交接文件推：规划者的派发晚于任务开始才算它的规划；两种评审的轮数取 timing.md 里 target 落在
+    这个任务的提交中的那些；当前在哪一格看交接目录里正开着的周期是计划还是代码。"""
+    d = conf["REVIEW_DIR"]
+    qtext = read(f"{d}/queue.md")
+    if qtext is None:
+        return None
+    tasks, current, awaiting = task_fold(task_events(read(f"{d}/tasks.state")))
+    timing = timing_rounds(repo)
+    t = current or tasks.get(awaiting)
+    card = None
+    if t:
+        commits = task_commits(repo, t["start"], t.get("end") or p["head"])
+        plan_n, code_n = task_rounds(commits, timing)
+        psent = parse_sent(read(f"{d}/.plan.sent"))
+        pmd = read(f"{d}/plan.md")
+        mine = bool(psent and t.get("t0") and psent["start"] >= t["t0"])
+        planning = mine and not sentinel_ok(pmd, "PLAN-COMPLETE")
+        decision = ((pmd or "").splitlines() or [""])[0].split(":")[0].strip() if mine and not planning else ""
+        kind = (p.get("cycle_req") or p["req"]).get("kind", "code")
+        cur = p["req"].get("_round", 1)
+        if t["id"] == awaiting:
+            now = "收尾"
+        elif planning:
+            now = "规划"
+        elif p.get("explicit") and not p["closed"]:
+            now = "计划评审" if kind == "plan" else "代码评审"
+        else:
+            now = "实施"
+        n = len(commits)
+        steps = [
+            ("规划", "now" if now == "规划" else ("ok" if decision or plan_n else ""),
+             "规划中" if now == "规划" else (decision or ("PLAN" if plan_n else "—"))),
+            ("计划评审", "now" if now == "计划评审" else ("ok" if plan_n else ""),
+             f"第 {cur} 轮" if now == "计划评审" else (f"{plan_n} 轮" if plan_n else ("跳过" if decision == "DIRECT" else "—"))),
+            ("实施", "now" if now == "实施" else ("ok" if n else ""), f"{n} 个提交" if n else "—"),
+            ("代码评审", "now" if now == "代码评审" else ("ok" if code_n else ""),
+             f"第 {cur} 轮" if now == "代码评审" else (f"{code_n} 轮" if code_n else "—")),
+            ("收尾", "now release" if now == "收尾" else "", "核对通过 · 等你放行" if now == "收尾" else "review-task done"),
+        ]
+        card = {"id": t["id"], "title": t["title"], "start": t["start"], "commits": n, "steps": steps,
+                "waiting": now == "收尾", "span": task_span(t.get("t0"), t.get("t1") or NOW)}
+    finished = []
+    for f in reversed([x for x in tasks.values() if x["status"] != "doing" and x["id"] != awaiting][-5:]):
+        if f["status"] == "dropped":
+            finished.append({"id": f["id"], "title": f["title"], "dropped": True, "reason": f.get("reason", "")})
+            continue
+        plan_n, code_n = task_rounds(task_commits(repo, f["start"], f.get("end")), timing)
+        finished.append({"id": f["id"], "title": f["title"], "dropped": False, "span": task_span(f.get("t0"), f.get("t1")),
+                         "plan_n": plan_n, "code_n": code_n,
+                         "range": f"{f['start'][:7]}..{f['end'][:7]}" if f.get("end") and f["end"] != f["start"] else ""})
+    return {"dir": d, "todo": task_pending(task_blocks(qtext), tasks), "card": card, "finished": finished,
+            "awaiting": awaiting, "gate": conf.get("TASK_GATE", "1").strip() != "0", "paused": os.path.exists(f"{d}/paused"),
+            "done": sum(x["status"] == "done" for x in tasks.values()),
+            "dropped": sum(x["status"] == "dropped" for x in tasks.values())}
 
 
 def project_state(repo, conf):
@@ -2292,6 +2442,7 @@ def project_state(repo, conf):
          "human": [], "cycle_note": "", "closed": False, "reviewer": ""}
     cur = req.get("_round", 1)
     explicit = bool(req) and (req.get("target sha") == head or (cur > 1 and not os.path.exists(f"{d}/r{cur}-responses.md")))
+    p["explicit"] = explicit
     prev = next((r for r in rounds if r["n"] == cur - 1), None)
     this = next((r for r in rounds if r["n"] == cur), None)
 
@@ -2349,6 +2500,7 @@ def project_state(repo, conf):
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     p["last_run"] = last_run(d)
+    p["tasks"] = task_view(repo, conf, p)
     add_waits(p)
     return p
 
@@ -2563,6 +2715,31 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .wait.calm{border-color:#5a4a2a;background:#231e15}.wait .wh{font-weight:700;color:#f0a3b3;margin-bottom:4px}
 .wait ul{margin:0;padding-left:18px}.wait li{margin:3px 0;color:#e6e4df}.wait li .dim{color:#a3a19b}.wait a{color:#f0a3b3}
 .wait details.mapsug{margin-top:6px}
+.tasks{margin-top:18px}.tasks .th{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px}.tasks .th .src{margin-left:auto;font-size:11.5px;color:#7c7a76}
+.mode{display:inline-block;font-size:11px;font-weight:600;line-height:18px;padding:0 6px;border-radius:2px;border:1px solid #3a3a3a;color:#a3a19b;background:#1f1f1f}
+.mode.gate{border-color:#5a2a36;color:#f0a3b3;background:#241519}.mode.paused{border-color:#6b5325;color:#e5b866;background:#231e15}
+.lanes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.45fr) minmax(0,1.15fr);gap:20px;align-items:start}
+.lane>.lh{display:flex;justify-content:space-between;align-items:baseline;border-top:1px solid #4a4a4a;padding:6px 0;font-size:11px;letter-spacing:.04em;color:#8b8985}.lane>.lh .n{font-variant-numeric:tabular-nums;color:#a3a19b}
+.tid{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11.5px;color:#a3a19b;margin-right:7px}
+ol.q{list-style:none;margin:0;padding:0;counter-reset:q}ol.q li{counter-increment:q;display:grid;grid-template-columns:18px minmax(0,1fr);gap:3px 8px;padding:9px 0;border-bottom:1px solid #262626}
+ol.q li::before{content:counter(q);grid-row:span 2;color:#6a6866;font-size:12px;font-variant-numeric:tabular-nums;padding-top:1px}
+ol.q .t{color:#e6e4df;font-size:13px}ol.q .sub{font-size:11.5px;color:#8b8985;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}
+.next{font-size:10.5px;font-weight:700;color:#161616;background:#e6e4df;border-radius:2px;padding:0 5px;line-height:16px}.next.hold{background:transparent;color:#f0a3b3;border:1px solid #5a2a36;font-weight:600}
+.hand{font-size:10.5px;color:#e5b866;border:1px dashed #6b5325;border-radius:2px;padding:0 5px;line-height:15px}
+.card{background:#1f1f1f;border:1px solid #2e2e2e;border-left:4px solid #4a7fc1;padding:12px 16px}.card.s-me{border-left-color:#c8375a}
+.card .tt{font-size:15px;font-weight:700;letter-spacing:-.01em;color:#f2f0eb}.card .meta{margin-top:3px;font-size:12px;color:#8b8985;display:flex;gap:4px 14px;flex-wrap:wrap;font-variant-numeric:tabular-nums}.card .meta code{color:#a3a19b}
+ol.steps{list-style:none;margin:14px 0 12px;padding:0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+ol.steps li{border-top:3px solid #333;padding-top:6px;font-size:12px;color:#6a6866}ol.steps li .x{display:block;margin-top:1px;font-size:11px;color:#5f5d59}
+ol.steps li.ok{border-top-color:#3f7a49;color:#a3a19b}ol.steps li.ok .x{color:#7c7a76}
+ol.steps li.now{border-top-color:#4a7fc1;color:#8fb8ee;font-weight:700}ol.steps li.now .x{color:#8fb8ee;font-weight:400}
+ol.steps li.now.release{border-top-color:#c8375a;color:#f0a3b3}ol.steps li.now.release .x{color:#f0a3b3}
+.card .nowl{border-top:1px solid #2a2a2a;padding-top:8px;display:grid;gap:3px;font-size:12.5px;color:#d6d3cc}.card .nowl .dim{color:#8b8985;font-size:12px}
+.drow{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:3px 10px;padding:9px 0;border-bottom:1px solid #262626;align-items:baseline}
+.drow .t{color:#d6d3cc;font-size:12.5px}.drow .r{font-size:11.5px;color:#8b8985;font-variant-numeric:tabular-nums;white-space:nowrap}
+.drow .s{grid-column:2 / 4;font-size:11px;color:#7c7a76;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}.drow .s code{font-size:10.5px;color:#7c7a76}
+.drow.dropped .t{color:#8b8985;text-decoration:line-through;text-decoration-color:#5a5955}.drow.dropped .r{color:#e5b866}
+.kind{font-size:10.5px;font-weight:600;padding:0 5px;border-radius:2px;line-height:16px;background:#2a2140;color:#c4a6f0}.kind.direct{background:#262626;color:#a3a19b}
+.tasks .foot-note{margin-top:10px;font-size:11.5px;color:#7c7a76}.tasks .foot-note code{color:#a3a19b}
 .grid{display:grid;grid-template-columns:232px minmax(0,1fr);flex:1;align-items:start}
 .side{border-right:1px solid #2e2e2e;position:sticky;top:44px;align-self:start;padding:14px 0;max-height:calc(100vh - 44px);overflow:auto}
 .side .cap{padding:0 16px 8px;font-size:11px;color:#8b8985;letter-spacing:.04em}
@@ -2950,6 +3127,67 @@ def render_cycle(p):
     return f'<div class="cycle {scls}">{title}<div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
+def render_tasks(p):
+    """任务区：队列 / 进行中（阶段条）/ 已完成。只读 —— 加任务、调顺序在 queue.md 里，放行、暂停用 review-task。"""
+    tv = p.get("tasks")
+    if not tv:
+        return ""
+    mode = ('<span class="mode paused">暂停中</span>' if tv["paused"] else
+            '<span class="mode gate">放行模式</span>' if tv["gate"] else '<span class="mode">自动模式</span>')
+    c = tv["card"]
+    doing_n = 1 if c and not c["waiting"] else 0
+    counts = f'队列 {len(tv["todo"])} · 进行中 {doing_n} · 已完成 {tv["done"]}' + (f' · 放弃 {tv["dropped"]}' if tv["dropped"] else "")
+    q = []
+    for i, b in enumerate(tv["todo"]):
+        chips = []
+        if i == 0:
+            chips.append('<span class="next hold">下一个 · 等放行</span>' if tv["awaiting"] else
+                         '<span class="next hold">下一个 · 暂停中</span>' if tv["paused"] else '<span class="next">下一个</span>')
+        if not b["id"]:
+            chips.append('<span class="hand">手写 · 发出时编号</span>')
+        note = next((l.strip() for l in b["body"].splitlines() if l.strip()), "")
+        if note:
+            chips.append(f'<span>{esc(note)}</span>')
+        tid = f'<span class="tid">{esc(b["id"])}</span>' if b["id"] else ""
+        q.append(f'<li><span class="t">{tid}{esc(b["title"])}</span>' + (f'<span class="sub">{"".join(chips)}</span>' if chips else "") + '</li>')
+    queue = f'<ol class="q">{"".join(q)}</ol>' if q else '<div class="empty">空</div>'
+    if c:
+        rows = []
+        for name, cls, x in c["steps"]:
+            attr = f' class="{cls}"' if cls else ""
+            rows.append(f'<li{attr}>{name}<span class="x">{esc(x)}</span></li>')
+        if c["waiting"]:
+            nxt = tv["todo"][0]["title"] if tv["todo"] else ""
+            line = '<span>核对通过，等你放行</span>' + (f'<span class="dim">放行后发出：{esc(nxt)}</span>' if nxt else '<span class="dim">放行后队列就空了</span>')
+        else:
+            line = f'<span>{esc(p["state"])}</span>' + (f'<span class="dim">{esc(p["cycle_note"])}</span>' if p.get("cycle_note") else "")
+        label = "用时" if c["waiting"] else "已进行"
+        doing = (f'<div class="card{" s-me" if c["waiting"] else ""}"><div class="tt"><span class="tid">{esc(c["id"])}</span>{esc(c["title"])}</div>'
+                 f'<div class="meta"><span>开始于 <code>{esc(c["start"][:7])}</code></span><span>{label} {esc(c["span"])}</span><span>{c["commits"]} 个提交</span></div>'
+                 f'<ol class="steps">{"".join(rows)}</ol><div class="nowl">{line}</div></div>')
+    else:
+        doing = f'<div class="empty">{"队列空了，写手会停下" if not tv["todo"] else "没有进行中的任务"}</div>'
+    fin = []
+    for f in tv["finished"]:
+        if f["dropped"]:
+            fin.append(f'<div class="drow dropped"><span class="tid">{esc(f["id"])}</span><span class="t">{esc(f["title"])}</span>'
+                       f'<span class="r">放弃</span><span class="s"><span>{esc(f["reason"] or "没写原因")}</span></span></div>')
+            continue
+        rounds = " · ".join(x for x in (f'计划评审 {f["plan_n"]}' if f["plan_n"] else "", f'代码评审 {f["code_n"]}' if f["code_n"] else "") if x) or "无评审"
+        kind = '<span class="kind">PLAN</span>' if f["plan_n"] else '<span class="kind direct">DIRECT</span>'
+        rng = f'<code>{esc(f["range"])}</code>' if f["range"] else ""
+        fin.append(f'<div class="drow"><span class="tid">{esc(f["id"])}</span><span class="t">{esc(f["title"])}</span>'
+                   f'<span class="r">{esc(f["span"])}</span><span class="s">{kind}<span>{rounds}</span>{rng}</span></div>')
+    fin_n = f'{tv["done"] - (1 if tv["awaiting"] else 0)}' + (f' · 放弃 {tv["dropped"]}' if tv["dropped"] else "")
+    return (f'<section class="tasks"><div class="th"><h2>任务<span class="sub">{counts}</span></h2>{mode}'
+            f'<span class="src">queue.md · tasks.state</span></div><div class="lanes">'
+            f'<div class="lane"><div class="lh"><span>队列</span><span class="n">{len(tv["todo"])}</span></div>{queue}</div>'
+            f'<div class="lane"><div class="lh"><span>{"刚做完" if c and c["waiting"] else "进行中"}</span><span class="n">{1 if c else 0}</span></div>{doing}</div>'
+            f'<div class="lane"><div class="lh"><span>已完成</span><span class="n">{fin_n}</span></div>{"".join(fin) or "<div class=\"empty\">还没有</div>"}</div>'
+            f'</div><div class="foot-note">只读。加任务：编辑 <code>{esc(tv["dir"])}/queue.md</code>，或 <code>review-task add "…"</code>；'
+            f'写在最上面的，就是当前任务之后的下一个。</div></section>')
+
+
 def render_panel(p, archives, self_closed):
     parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
     badge = state_badge(p)
@@ -2975,7 +3213,7 @@ def render_panel(p, archives, self_closed):
     if p["human"] or sug:
         items = []
         for kind, fid, verb, sev, reason in p["human"]:
-            if kind == "stop":
+            if kind != "decision":
                 items.append(f'<li>{esc(reason)}</li>')
                 continue
             what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
@@ -2987,6 +3225,7 @@ def render_panel(p, archives, self_closed):
             rows = "".join(f'<li><span class="mute">{"建议降级" if k == "lower" else "建议加入"}</span> <code>{esc(g)}</code> {esc(lv)} <span class="dim">· {esc(why)}</span></li>' for k, g, lv, why in sug)
             body += f'<details class="mapsug"><summary>不急 · 风险图有 {len(sug)} 条建议，等你点头</summary><ul>{rows}</ul></details>'
         parts.append(f'<div class="wait{"" if items else " calm"}" id="w-{esc(p["name"])}">{body}</div>')
+    parts.append(render_tasks(p))
     pl = p.get("planning")
     if pl:
         parts.append(f'<div class="planning"><b>规划中</b><span class="age">{ago(pl["since"])}</span>'
@@ -3098,8 +3337,8 @@ def render(projects, archives, self_closed):
     waits = []
     for p in projects:
         for kind, fid, verb, sev, reason in p["human"]:
-            if kind == "stop":
-                waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"w-{p['name']}"))
+            if kind != "decision":
+                waits.append((p["name"], f"STOP · {reason}" if kind == "stop" else reason, ago(p["since"]), f"w-{p['name']}"))
                 continue
             what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))
@@ -3188,6 +3427,359 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+
+---
+
+### 5.8 `~/.local/bin/review-task`
+
+```python
+#!/usr/bin/env python3
+"""review-task —— 任务队列：人往 queue.md 里写任务，写手用 next / done 一个接一个地做。
+
+和评审流程并行、互不相碰：不改 request-review，不启动也不注入任何 agent。
+  queue.md    交接目录里，只归人。「## T7 标题」或「## 标题」开一块，下面随意写约束和验收；
+              编号可省（发出时补上），文件里的先后就是执行顺序。
+  tasks.state 交接目录里，只归本工具。每行一个 JSON 事件（start / done / go / drop），只追加。
+「做完了」由本工具只读核对 git 和交接目录，不听写手一句话。交接文件的解析复用看板（review-board）里的
+函数，和看板、request-review 用同一套判据。
+
+在仓库目录里运行：
+  review-task add "标题" [说明行 …]   人：加到队列末尾，自动编号
+  review-task list                    看进行中、队列、已完成
+  review-task next                    写手：有进行中的就重发它（换写手接手时用）；否则发下一个
+  review-task done T5                 写手：核对是否真的收尾；通过后停下等放行，或直接发下一个
+  review-task go                      人：放行（放行模式）
+  review-task drop T5 "原因"          人：放弃一个任务（进行中的，或队列里还没开始的）
+  review-task pause | resume          人：暂停 / 恢复发新任务，正在做的照常做完
+退出码：0 发出任务或操作成功；8 停下，把输出报告给人（队列空、暂停、等放行）；9 还没收尾；2 用法或前置条件不满足。
+.review.conf 的 TASK_GATE：1（默认）放行模式，每个任务做完等人 go；0 自动模式，做完直接发下一个。
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True   # 下面按文件路径加载看板；别在 bin/ 里留下 __pycache__
+
+
+def die(code, msg):
+    print(msg)
+    sys.exit(code)
+
+
+def stop(msg):
+    print(msg)
+    return 8
+
+
+def load_board():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review-board")
+    if not os.path.exists(path):
+        die(2, f"ERROR: 找不到 {path}。review-task 用看板的函数读交接文件，两者要装在一起（install.sh 会一起装）。")
+    loader = importlib.machinery.SourceFileLoader("review_board", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("review_board", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+B = load_board()
+REPO = D = Q = S = PAUSED = ""
+GATE = True
+
+
+def setup():
+    global REPO, D, Q, S, PAUSED, GATE
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if r.returncode:
+        die(2, "ERROR: 不在 git 仓库里。到项目目录里运行 review-task。")
+    REPO = r.stdout.strip()
+    conf = B.parse_conf(f"{REPO}/.review.conf")
+    if not conf.get("REVIEW_DIR"):
+        die(2, f"ERROR: {REPO}/.review.conf 缺失或没有 REVIEW_DIR，这个仓库还没接入评审流程。")
+    D = conf["REVIEW_DIR"]
+    os.makedirs(D, exist_ok=True)
+    Q, S, PAUSED = f"{D}/queue.md", f"{D}/tasks.state", f"{D}/paused"
+    GATE = conf.get("TASK_GATE", "1").strip() != "0"
+
+
+def sh(*args):
+    return subprocess.run(["git", "-c", "core.quotepath=false", "-C", REPO, *args], capture_output=True, text=True)
+
+
+def git(*args):
+    return sh(*args).stdout
+
+
+def head():
+    return git("rev-parse", "HEAD").strip()
+
+
+# ============================================================ 队列（人的）与进度（本工具的）
+# 解析放在看板里（task_blocks / task_events / task_fold / task_pending），看板显示的和这里发出去的是同一个队列。
+def parse_queue():
+    return B.task_blocks(B.read(Q))
+
+
+def append(ev):
+    with open(S, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": int(time.time()), **ev}, ensure_ascii=False) + "\n")
+
+
+def fold():
+    """→ ({id: task}（按开始顺序）, 进行中的那个, 在等放行的 id)"""
+    return B.task_fold(B.task_events(B.read(S)))
+
+
+def pending(tasks):
+    return B.task_pending(parse_queue(), tasks)
+
+
+def next_num():
+    ids = [b["id"] for b in parse_queue() if b["id"]] + list(fold()[0])
+    return max([int(i[1:]) for i in ids if re.fullmatch(r"T\d+", i or "")], default=0) + 1
+
+
+def issue(t, again=False):
+    out = [f"TASK {t['id']}: {t['title']}"]
+    if t.get("body"):
+        out += ["", t["body"]]
+    out += ["", "这是进行中的任务，接着做；之前的进度都在 git 和交接目录里。" if again else "这是队列里的下一个任务。",
+            "按 AGENTS.md 里的流程做，和人直接交代给你的任务一样。",
+            f"做完后运行：review-task done {t['id']}  —— 它会核对是否真的收尾，并告诉你下一步。"]
+    print("\n".join(out))
+    return 0
+
+
+# ============================================================ 「做完了」的核对（只读）
+def own_record(paths, map_diff):
+    """去掉脚本自己写的：docs/reviews/ 下全部；.review-map 只新增了「# 自动升级」行时也算。同 request-review 的 drop_own。"""
+    ch = [l for l in map_diff.splitlines() if re.match(r'^[-+][^-+]', l)]
+    map_auto = all(re.match(r'^\+.*# 自动升级', l) for l in ch)
+    return [p for p in paths if not p.startswith("docs/reviews/") and not (p == ".review-map" and map_auto)]
+
+
+def tree_dirty():
+    paths = [l[3:].split(" -> ")[-1] for l in git("status", "--porcelain", "--untracked-files=no").splitlines()]
+    return own_record(paths, git("diff", "HEAD", "--", ".review-map"))
+
+
+def skipped_shas():
+    out = set()
+    for line in (B.read(f"{REPO}/docs/reviews/skipped.md") or "").splitlines():
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-f]{7,40}", parts[1]):
+            out.add(parts[1])
+    return out
+
+
+def unreviewed(base, h, skipped):
+    """base..h 里真正该评审的提交：去掉人用 SKIP_REVIEW 放过的、只动了评审记录的。base 不在 HEAD 历史里返回 None。"""
+    if base == h:
+        return []
+    if sh("merge-base", "--is-ancestor", base, h).returncode:
+        return None
+    out = []
+    for c in git("rev-list", f"{base}..{h}").split():
+        if git("rev-parse", "--short", c).strip() in skipped:
+            continue
+        paths = git("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", c).split()
+        if own_record(paths, git("show", "--format=", c, "--", ".review-map")):
+            out.append(c)
+    return out
+
+
+def cycle_state(h):
+    """评审周期结束了没有。→ (问题列表, 闭合时那一轮的 target sha)。
+    最近一轮的回应里有拒绝、暂缓的阻断、或接受，流程都还要再走一轮（手册第 ⑨ 步），不管人裁决了没有。"""
+    probs = []
+    req = B.parse_request(B.read(f"{D}/request.md"))
+    cur = req.get("_round", 1)
+    if req.get("target sha") == h and not os.path.exists(f"{D}/.r{cur}.sent"):
+        probs.append(f"request.md 已写好第 {cur} 轮，但还没运行 request-review 派发")
+    rounds = [r for r in B.load_rounds(D) if r["sent"]]
+    if not rounds:
+        return probs, None
+    last = rounds[-1]
+    n = last["n"]
+    if last["responses"] is None:
+        probs.append(f"第 {n} 轮评审还没结束：" + ("评审方还在审" if not last["done"] else "findings 还没回应"))
+        return probs, None
+    sev = lambda fid: last["findings"].get(fid, {}).get("sev", "")
+    resp = last["responses"].items()
+    if any(v == "reject" or (v == "defer" and sev(f) == "blocking") for f, (v, _) in resp):
+        probs.append(f"第 {n} 轮有被拒绝、或暂缓的阻断 finding："
+                     + ("要等人裁决，再走一轮" if B.pending_decisions(last) else "人已裁决，还要再走一轮"))
+    elif any(v == "accept" for _, (v, _) in resp):
+        probs.append(f"第 {n} 轮有接受的 finding，改完要再开一轮验证")
+    return probs, (None if probs else last["sent"]["target"])
+
+
+def check_done(task):
+    h = head()
+    probs = []
+    dirty = tree_dirty()
+    if dirty:
+        probs.append("工作区有没提交的改动：" + "、".join(dirty[:5]) + (" 等" if len(dirty) > 5 else ""))
+    psent = B.parse_sent(B.read(f"{D}/.plan.sent"))
+    if psent and not B.sentinel_ok(B.read(f"{D}/plan.md"), "PLAN-COMPLETE"):
+        probs.append("规划者还没交付计划：plan.md 还没写完")
+    cp, cycle_end = cycle_state(h)
+    probs += cp
+    if not cp:
+        # 起点之一到 HEAD 之间没有该审而没审的提交，就算过了路由：这个任务的起点、triage 判 SKIP 的那个 HEAD、刚闭合的那一轮
+        tri = (B.read(f"{D}/.triage") or "").splitlines()
+        bases = [task["start"], tri[0].strip() if len(tri) > 1 and tri[1].strip() == "SKIP" else "", cycle_end or ""]
+        skipped = skipped_shas()
+        if not any(b and unreviewed(b, h, skipped) == [] for b in bases):
+            probs.append("开始以来的改动还没过路由：运行 request-review，让它评审完或判 SKIP")
+    return probs
+
+
+# ============================================================ 命令
+def cmd_add(title, notes):
+    title = title.strip()
+    if not title or "\n" in title:
+        die(2, "ERROR: 标题要是一行非空的文字")
+    tid = f"T{next_num()}"
+    text = B.read(Q) or ""
+    sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    with open(Q, "a", encoding="utf-8") as f:
+        f.write(sep + f"## {tid} {title}\n" + "".join(n.rstrip("\n") + "\n" for n in notes))
+    print(f"已加入队列末尾 {tid}：{title}")
+    return 0
+
+
+def cmd_next():
+    tasks, current, awaiting = fold()
+    if current:
+        return issue(current, again=True)
+    if os.path.exists(PAUSED):
+        return stop("PAUSED: 队列已暂停，不发新任务。停下，把这句报告给人；人运行 review-task resume 之后，再运行 review-task next。")
+    if awaiting:
+        return stop(f"WAIT: {awaiting} 已完成，放行模式下要等人放行。停下，把这句报告给人；人运行 review-task go 之后，再运行 review-task next。")
+    todo = pending(tasks)
+    if not todo:
+        return stop(f"EMPTY: 队列空了，没有新任务。停下，把这句报告给人；人往 {Q} 里加了任务之后，再运行 review-task next。")
+    b = todo[0]
+    t = {"id": b["id"] or f"T{next_num()}", "title": b["title"], "body": b["body"]}
+    append({"ev": "start", "id": t["id"], "title": t["title"], "body": t["body"], "key": t["title"], "sha": head()})
+    return issue(t)
+
+
+def cmd_done(tid):
+    tasks, current, awaiting = fold()
+    if not current or current["id"] != tid:
+        die(2, f"ERROR: {tid} 不是进行中的任务" + (f"，进行中的是 {current['id']}" if current else "，现在没有进行中的任务"))
+    probs = check_done(current)
+    if probs:
+        print(f"NOT DONE: {tid} 还没收尾：")
+        for p in probs:
+            print(f"  - {p}")
+        print(f"处理完再运行 review-task done {tid}。")
+        return 9
+    append({"ev": "done", "id": tid, "sha": head(), "gate": GATE})
+    if GATE:
+        return stop(f"DONE {tid}：核对通过。放行模式：停下，把这句报告给人，等人放行；放行后运行 review-task next。")
+    print(f"DONE {tid}：核对通过。")
+    return cmd_next()
+
+
+def cmd_go():
+    _, _, awaiting = fold()
+    if not awaiting:
+        die(2, "ERROR: 没有在等放行的任务")
+    append({"ev": "go", "id": awaiting})
+    print(f"已放行（{awaiting} 之后）。对写手说「继续」，它会运行 review-task next；想换个新写手，就开一个新的，对它说「开始循环」。")
+    return 0
+
+
+def cmd_drop(tid, reason):
+    tasks, _, _ = fold()
+    t = tasks.get(tid)
+    if t and t["status"] != "doing":
+        die(2, f"ERROR: {tid} 已经{'完成' if t['status'] == 'done' else '放弃'}了")
+    if not t:
+        b = next((b for b in parse_queue() if b["id"] == tid), None)
+        if not b:
+            die(2, f"ERROR: 找不到 {tid}：它不在进行中，队列里也没有这个编号")
+        t = {"title": b["title"], "key": b["title"]}
+    append({"ev": "drop", "id": tid, "title": t["title"], "key": t.get("key") or t["title"], "reason": reason})
+    print(f"已放弃 {tid}：{t['title']}" + (f"（{reason}）" if reason else ""))
+    return 0
+
+
+def cmd_pause(on):
+    if on:
+        open(PAUSED, "a").close()
+        print("已暂停：不再发新任务，正在做的会做完。运行 review-task resume 恢复。")
+    else:
+        if os.path.exists(PAUSED):
+            os.remove(PAUSED)
+        print("已恢复：写手下次运行 review-task next 会拿到新任务。")
+    return 0
+
+
+def span(a, b):
+    if not a or not b:
+        return ""
+    m = max(0, int(b - a)) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def cmd_list():
+    tasks, current, awaiting = fold()
+    todo = pending(tasks)
+    print(f"模式：{'放行模式' if GATE else '自动模式'}" + ("（已暂停）" if os.path.exists(PAUSED) else "")
+          + (f"；{awaiting} 已完成，等人放行" if awaiting else ""))
+    print("\n进行中：")
+    print(f"  {current['id']} {current['title']}（开始于 {current['start'][:7]}）" if current else "  （无）")
+    print("\n队列：")
+    for i, b in enumerate(todo, 1):
+        print(f"  {i}. {b['id'] or '（未编号）'} {b['title']}" + ("  ← 下一个" if i == 1 else ""))
+    if not todo:
+        print("  （空）")
+    fin = [t for t in tasks.values() if t["status"] != "doing"]
+    print("\n已完成 / 放弃：")
+    for t in reversed(fin[-10:]):
+        if t["status"] == "done":
+            print(f"  {t['id']} {t['title']} · {span(t.get('t0'), t.get('t1'))} · {t['start'][:7]}..{t['end'][:7]}")
+        else:
+            print(f"  {t['id']} {t['title']} · 放弃" + (f"：{t['reason']}" if t.get("reason") else ""))
+    if not fin:
+        print("  （无）")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    setup()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "add" and rest:
+        return cmd_add(rest[0], rest[1:])
+    if cmd == "list" and not rest:
+        return cmd_list()
+    if cmd == "next" and not rest:
+        return cmd_next()
+    if cmd == "done" and len(rest) == 1:
+        return cmd_done(rest[0].upper())
+    if cmd == "go" and not rest:
+        return cmd_go()
+    if cmd == "drop" and rest:
+        return cmd_drop(rest[0].upper(), " ".join(rest[1:]))
+    if cmd in ("pause", "resume") and not rest:
+        return cmd_pause(cmd == "pause")
+    die(2, f"ERROR: 用法不对：review-task {' '.join(argv)}\n\n{__doc__.strip()}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
 ```
 
 ---
@@ -3368,6 +3960,30 @@ AGENTS.md §16 里「计划由规划者写」那一节是写给写手的：你�
 - 不改 reviewer brief。它过期了脚本会让写手重写。
 - 不在答复里放计划正文。计划在仓库里，答复只是指路。
 ````
+
+---
+
+## 第 6c 部分：任务队列（可选）
+
+想让写手一个接一个地做任务、不用你每次开口，就用 `review-task`。它和评审流程并行：不改 `request-review`，不启动也不注入任何 agent，只是替你在第 ① 步开口。不用队列的项目一切照旧：没有 `queue.md` 就没有任务区，`review-task` 装着也不会被任何东西调用。
+
+**两个文件，各归各主。** 都在交接目录里，不进 git。
+
+- `queue.md` 归你。一块一个任务，以 `## T7 标题` 或 `## 标题` 开头，下面随意写约束和验收；文件里的先后就是执行顺序。随时可以手写插入：写在其他待办上面的，就是当前任务之后的下一个，不会打断正在做的。没编号的任务靠标题认，开始后别改它的标题（要改就删掉重写，或者给它加上编号）。
+- `tasks.state` 归 `review-task`。每行一个 JSON 事件（start / done / go / drop），只追加；任务发出时存下原文快照，之后你改 `queue.md` 不影响正在做的那个。
+
+**循环怎么转。** 你启动写手，对它说「开始循环」。写手运行 `review-task next` 拿到任务，末尾写着做完后运行 `review-task done T5`；它按 AGENTS.md 的流程做完，再运行 `done`。`done` 由工具只读核对，不听写手一句话：
+
+- 已跟踪文件的工作区干净（评审记录除外）
+- 规划者没有没交付的请求
+- 评审周期已经结束：最近一轮的回应里没有接受、拒绝或暂缓的阻断——这些都还要再走一轮（第 ⑨ 步）
+- 过了路由：从任务起点、triage 判 SKIP 的那个 HEAD、或刚闭合那一轮的终点，到 HEAD 之间没有该审而没审的提交；人用 `SKIP_REVIEW` 放过的、只动评审记录的不算
+
+核对通过后，放行模式（`TASK_GATE=1`，默认）让写手停下，看板「等你」栏显示「T5 做完了」；你运行 `review-task go`，再对写手说「继续」，或者换一个新写手说「开始循环」。循环的状态全在文件里，换写手不丢任何东西，这也是控制写手上下文长度的时机。`TASK_GATE=0` 是自动模式，做完直接发下一个。`next` 会重发进行中的任务，所以写手中途换人也能接着做。
+
+**命令**（在仓库目录里运行）：`add "标题" [说明行 …]` 加到队列末尾并自动编号；`list` 看全貌；`go` 放行；`drop T5 "原因"` 放弃；`pause` / `resume` 暂停或恢复发新任务，正在做的照常做完。退出码：0 发出任务或操作成功；8 停下把输出报告给人（队列空、暂停、等放行）；9 还没收尾；2 用法错误。
+
+**看板上。** 接了队列的项目多一个「任务」区：队列（序号就是顺序，第一个标「下一个」，没编号的标「手写」）、进行中（五格阶段条：规划 → 计划评审 → 实施 → 代码评审 → 收尾，当前那一格按正开着的周期着色）、已完成（用时、评审轮数、sha 区间，放弃的划掉并写原因）。它只读：加任务、调顺序在 `queue.md` 里做，放行、暂停用上面的命令。
 
 ---
 

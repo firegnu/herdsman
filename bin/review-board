@@ -379,11 +379,158 @@ def add_waits(p):
         text = (f"{w['sentinel']} 已经交了，但叫醒进程已不在，写手 {w['writer']} 没被叫醒——对它说「跑 {cmd}」" if w["done"] else
                 f"叫醒进程已不在：{w['sentinel']} 交出来后写手 {w['writer']} 不会被自动叫醒，到时对它说「跑 {cmd}」")
         new.append(("stop", "", "wake", "", text + (f"（日志最后一句：{w['why']}）" if w["why"] else "（没留下日志）")))
+    tv = p.get("tasks")
+    if tv and tv["awaiting"] and tv["card"]:
+        new.append(("release", "", "", "", f"{tv['awaiting']} {tv['card']['title']} 做完了，核对已通过。运行 review-task go 放行，"
+                    "再对写手说「继续」；想换个新写手，就开一个新的，对它说「开始循环」"))
+        p["state"] = "等你放行"
     if new:
         p["human"].extend(new)
         p["needs_me"] = True
         if not p["waiting"]:
             p["waiting"] = "等你"
+
+
+
+# ============================================================ 任务队列（review-task 与看板共用这份解析）
+TASK_HDR = re.compile(r'^##\s+(?:(T\d+)\s+)?(.+?)\s*$')
+
+
+def task_blocks(text):
+    """queue.md → [{id 或 None, title, body}]，按文件顺序。「## T7 标题」或「## 标题」开一块，第一块之前的行忽略。"""
+    blocks, cur = [], None
+    for line in (text or "").splitlines():
+        m = TASK_HDR.match(line)
+        if m:
+            cur = {"id": m.group(1), "title": m.group(2), "body": []}
+            blocks.append(cur)
+        elif cur is not None:
+            cur["body"].append(line)
+    for b in blocks:
+        b["body"] = "\n".join(b["body"]).strip("\n")
+    return blocks
+
+
+def task_events(text):
+    out = []
+    for line in (text or "").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def task_fold(evs):
+    """tasks.state 的事件 → ({id: task}（按开始顺序）, 进行中的那个, 在等放行的 id)。"""
+    tasks, awaiting = {}, None
+    for e in evs:
+        tid, ev = e.get("id"), e.get("ev")
+        if ev == "start":
+            tasks[tid] = {"id": tid, "title": e.get("title", ""), "body": e.get("body", ""), "key": e.get("key", ""),
+                          "start": e.get("sha", ""), "t0": e.get("t"), "status": "doing"}
+            awaiting = None
+        elif ev == "done" and tid in tasks:
+            tasks[tid].update(status="done", end=e.get("sha", ""), t1=e.get("t"))
+            awaiting = tid if e.get("gate") else None
+        elif ev == "drop":
+            t = tasks.setdefault(tid, {"id": tid, "title": e.get("title", ""), "body": "", "key": e.get("key", ""), "start": ""})
+            t.update(status="dropped", reason=e.get("reason", ""), t1=e.get("t"))
+        elif ev == "go":
+            awaiting = None
+    current = next((t for t in tasks.values() if t["status"] == "doing"), None)
+    return tasks, current, awaiting
+
+
+def task_pending(blocks, tasks):
+    """队列里还没开始的块，按文件顺序。有编号按编号认，没编号按标题认（所以开始过的任务别改标题）。"""
+    keys = {t["key"] for t in tasks.values() if t.get("key")}
+    return [b for b in blocks if not (b["id"] in tasks if b["id"] else b["title"] in keys)]
+
+
+def timing_rounds(repo):
+    """timing.md → [(短 sha, kind)]，每完成一轮一行；旧行没有 kind 当作 code。"""
+    out = []
+    for line in (read(f"{repo}/docs/reviews/timing.md") or "").splitlines():
+        m = re.match(r'\S+ \| (\w+) \| round \d+/\d+ \| \d+s(?: \| (\w+))?', line)
+        if m:
+            out.append((m.group(1), m.group(2) or "code"))
+    return out
+
+
+def task_commits(repo, a, b):
+    return git(repo, "rev-list", f"{a}..{b}").split() if a and b and a != b else []
+
+
+def task_rounds(commits, timing):
+    """这个任务的提交里，各有几轮计划评审、几轮代码评审（按每一轮的 target sha 落在不落在里面算）。"""
+    hit = lambda s: any(c.startswith(s) for c in commits)
+    return sum(1 for s, k in timing if k == "plan" and hit(s)), sum(1 for s, k in timing if k != "plan" and hit(s))
+
+
+def task_span(a, b):
+    if not a or not b:
+        return ""
+    m = max(0, int(b - a)) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def task_view(repo, conf, p):
+    """任务区要显示的东西。项目没有 queue.md（没用队列）就返回 None，页面上不出现任务区。
+    阶段条靠现有的交接文件推：规划者的派发晚于任务开始才算它的规划；两种评审的轮数取 timing.md 里 target 落在
+    这个任务的提交中的那些；当前在哪一格看交接目录里正开着的周期是计划还是代码。"""
+    d = conf["REVIEW_DIR"]
+    qtext = read(f"{d}/queue.md")
+    if qtext is None:
+        return None
+    tasks, current, awaiting = task_fold(task_events(read(f"{d}/tasks.state")))
+    timing = timing_rounds(repo)
+    t = current or tasks.get(awaiting)
+    card = None
+    if t:
+        commits = task_commits(repo, t["start"], t.get("end") or p["head"])
+        plan_n, code_n = task_rounds(commits, timing)
+        psent = parse_sent(read(f"{d}/.plan.sent"))
+        pmd = read(f"{d}/plan.md")
+        mine = bool(psent and t.get("t0") and psent["start"] >= t["t0"])
+        planning = mine and not sentinel_ok(pmd, "PLAN-COMPLETE")
+        decision = ((pmd or "").splitlines() or [""])[0].split(":")[0].strip() if mine and not planning else ""
+        kind = (p.get("cycle_req") or p["req"]).get("kind", "code")
+        cur = p["req"].get("_round", 1)
+        if t["id"] == awaiting:
+            now = "收尾"
+        elif planning:
+            now = "规划"
+        elif p.get("explicit") and not p["closed"]:
+            now = "计划评审" if kind == "plan" else "代码评审"
+        else:
+            now = "实施"
+        n = len(commits)
+        steps = [
+            ("规划", "now" if now == "规划" else ("ok" if decision or plan_n else ""),
+             "规划中" if now == "规划" else (decision or ("PLAN" if plan_n else "—"))),
+            ("计划评审", "now" if now == "计划评审" else ("ok" if plan_n else ""),
+             f"第 {cur} 轮" if now == "计划评审" else (f"{plan_n} 轮" if plan_n else ("跳过" if decision == "DIRECT" else "—"))),
+            ("实施", "now" if now == "实施" else ("ok" if n else ""), f"{n} 个提交" if n else "—"),
+            ("代码评审", "now" if now == "代码评审" else ("ok" if code_n else ""),
+             f"第 {cur} 轮" if now == "代码评审" else (f"{code_n} 轮" if code_n else "—")),
+            ("收尾", "now release" if now == "收尾" else "", "核对通过 · 等你放行" if now == "收尾" else "review-task done"),
+        ]
+        card = {"id": t["id"], "title": t["title"], "start": t["start"], "commits": n, "steps": steps,
+                "waiting": now == "收尾", "span": task_span(t.get("t0"), t.get("t1") or NOW)}
+    finished = []
+    for f in reversed([x for x in tasks.values() if x["status"] != "doing" and x["id"] != awaiting][-5:]):
+        if f["status"] == "dropped":
+            finished.append({"id": f["id"], "title": f["title"], "dropped": True, "reason": f.get("reason", "")})
+            continue
+        plan_n, code_n = task_rounds(task_commits(repo, f["start"], f.get("end")), timing)
+        finished.append({"id": f["id"], "title": f["title"], "dropped": False, "span": task_span(f.get("t0"), f.get("t1")),
+                         "plan_n": plan_n, "code_n": code_n,
+                         "range": f"{f['start'][:7]}..{f['end'][:7]}" if f.get("end") and f["end"] != f["start"] else ""})
+    return {"dir": d, "todo": task_pending(task_blocks(qtext), tasks), "card": card, "finished": finished,
+            "awaiting": awaiting, "gate": conf.get("TASK_GATE", "1").strip() != "0", "paused": os.path.exists(f"{d}/paused"),
+            "done": sum(x["status"] == "done" for x in tasks.values()),
+            "dropped": sum(x["status"] == "dropped" for x in tasks.values())}
 
 
 def project_state(repo, conf):
@@ -399,6 +546,7 @@ def project_state(repo, conf):
          "human": [], "cycle_note": "", "closed": False, "reviewer": ""}
     cur = req.get("_round", 1)
     explicit = bool(req) and (req.get("target sha") == head or (cur > 1 and not os.path.exists(f"{d}/r{cur}-responses.md")))
+    p["explicit"] = explicit
     prev = next((r for r in rounds if r["n"] == cur - 1), None)
     this = next((r for r in rounds if r["n"] == cur), None)
 
@@ -456,6 +604,7 @@ def project_state(repo, conf):
     pane = ((this or {}).get("sent") or {}).get("pane") if explicit else (parse_sent(read(f"{d}/.triage.sent")) or {}).get("pane")
     p["agents"] = agents_of(repo, conf.get("REVIEW_WT"), pane)
     p["last_run"] = last_run(d)
+    p["tasks"] = task_view(repo, conf, p)
     add_waits(p)
     return p
 
@@ -670,6 +819,31 @@ details[open]>summary .tri{transform:rotate(90deg)}
 .wait.calm{border-color:#5a4a2a;background:#231e15}.wait .wh{font-weight:700;color:#f0a3b3;margin-bottom:4px}
 .wait ul{margin:0;padding-left:18px}.wait li{margin:3px 0;color:#e6e4df}.wait li .dim{color:#a3a19b}.wait a{color:#f0a3b3}
 .wait details.mapsug{margin-top:6px}
+.tasks{margin-top:18px}.tasks .th{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px}.tasks .th .src{margin-left:auto;font-size:11.5px;color:#7c7a76}
+.mode{display:inline-block;font-size:11px;font-weight:600;line-height:18px;padding:0 6px;border-radius:2px;border:1px solid #3a3a3a;color:#a3a19b;background:#1f1f1f}
+.mode.gate{border-color:#5a2a36;color:#f0a3b3;background:#241519}.mode.paused{border-color:#6b5325;color:#e5b866;background:#231e15}
+.lanes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.45fr) minmax(0,1.15fr);gap:20px;align-items:start}
+.lane>.lh{display:flex;justify-content:space-between;align-items:baseline;border-top:1px solid #4a4a4a;padding:6px 0;font-size:11px;letter-spacing:.04em;color:#8b8985}.lane>.lh .n{font-variant-numeric:tabular-nums;color:#a3a19b}
+.tid{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11.5px;color:#a3a19b;margin-right:7px}
+ol.q{list-style:none;margin:0;padding:0;counter-reset:q}ol.q li{counter-increment:q;display:grid;grid-template-columns:18px minmax(0,1fr);gap:3px 8px;padding:9px 0;border-bottom:1px solid #262626}
+ol.q li::before{content:counter(q);grid-row:span 2;color:#6a6866;font-size:12px;font-variant-numeric:tabular-nums;padding-top:1px}
+ol.q .t{color:#e6e4df;font-size:13px}ol.q .sub{font-size:11.5px;color:#8b8985;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}
+.next{font-size:10.5px;font-weight:700;color:#161616;background:#e6e4df;border-radius:2px;padding:0 5px;line-height:16px}.next.hold{background:transparent;color:#f0a3b3;border:1px solid #5a2a36;font-weight:600}
+.hand{font-size:10.5px;color:#e5b866;border:1px dashed #6b5325;border-radius:2px;padding:0 5px;line-height:15px}
+.card{background:#1f1f1f;border:1px solid #2e2e2e;border-left:4px solid #4a7fc1;padding:12px 16px}.card.s-me{border-left-color:#c8375a}
+.card .tt{font-size:15px;font-weight:700;letter-spacing:-.01em;color:#f2f0eb}.card .meta{margin-top:3px;font-size:12px;color:#8b8985;display:flex;gap:4px 14px;flex-wrap:wrap;font-variant-numeric:tabular-nums}.card .meta code{color:#a3a19b}
+ol.steps{list-style:none;margin:14px 0 12px;padding:0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+ol.steps li{border-top:3px solid #333;padding-top:6px;font-size:12px;color:#6a6866}ol.steps li .x{display:block;margin-top:1px;font-size:11px;color:#5f5d59}
+ol.steps li.ok{border-top-color:#3f7a49;color:#a3a19b}ol.steps li.ok .x{color:#7c7a76}
+ol.steps li.now{border-top-color:#4a7fc1;color:#8fb8ee;font-weight:700}ol.steps li.now .x{color:#8fb8ee;font-weight:400}
+ol.steps li.now.release{border-top-color:#c8375a;color:#f0a3b3}ol.steps li.now.release .x{color:#f0a3b3}
+.card .nowl{border-top:1px solid #2a2a2a;padding-top:8px;display:grid;gap:3px;font-size:12.5px;color:#d6d3cc}.card .nowl .dim{color:#8b8985;font-size:12px}
+.drow{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:3px 10px;padding:9px 0;border-bottom:1px solid #262626;align-items:baseline}
+.drow .t{color:#d6d3cc;font-size:12.5px}.drow .r{font-size:11.5px;color:#8b8985;font-variant-numeric:tabular-nums;white-space:nowrap}
+.drow .s{grid-column:2 / 4;font-size:11px;color:#7c7a76;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}.drow .s code{font-size:10.5px;color:#7c7a76}
+.drow.dropped .t{color:#8b8985;text-decoration:line-through;text-decoration-color:#5a5955}.drow.dropped .r{color:#e5b866}
+.kind{font-size:10.5px;font-weight:600;padding:0 5px;border-radius:2px;line-height:16px;background:#2a2140;color:#c4a6f0}.kind.direct{background:#262626;color:#a3a19b}
+.tasks .foot-note{margin-top:10px;font-size:11.5px;color:#7c7a76}.tasks .foot-note code{color:#a3a19b}
 .grid{display:grid;grid-template-columns:232px minmax(0,1fr);flex:1;align-items:start}
 .side{border-right:1px solid #2e2e2e;position:sticky;top:44px;align-self:start;padding:14px 0;max-height:calc(100vh - 44px);overflow:auto}
 .side .cap{padding:0 16px 8px;font-size:11px;color:#8b8985;letter-spacing:.04em}
@@ -1057,6 +1231,67 @@ def render_cycle(p):
     return f'<div class="cycle {scls}">{title}<div class="top">{top}</div><div class="kv">{"".join(kv)}</div></div>'
 
 
+def render_tasks(p):
+    """任务区：队列 / 进行中（阶段条）/ 已完成。只读 —— 加任务、调顺序在 queue.md 里，放行、暂停用 review-task。"""
+    tv = p.get("tasks")
+    if not tv:
+        return ""
+    mode = ('<span class="mode paused">暂停中</span>' if tv["paused"] else
+            '<span class="mode gate">放行模式</span>' if tv["gate"] else '<span class="mode">自动模式</span>')
+    c = tv["card"]
+    doing_n = 1 if c and not c["waiting"] else 0
+    counts = f'队列 {len(tv["todo"])} · 进行中 {doing_n} · 已完成 {tv["done"]}' + (f' · 放弃 {tv["dropped"]}' if tv["dropped"] else "")
+    q = []
+    for i, b in enumerate(tv["todo"]):
+        chips = []
+        if i == 0:
+            chips.append('<span class="next hold">下一个 · 等放行</span>' if tv["awaiting"] else
+                         '<span class="next hold">下一个 · 暂停中</span>' if tv["paused"] else '<span class="next">下一个</span>')
+        if not b["id"]:
+            chips.append('<span class="hand">手写 · 发出时编号</span>')
+        note = next((l.strip() for l in b["body"].splitlines() if l.strip()), "")
+        if note:
+            chips.append(f'<span>{esc(note)}</span>')
+        tid = f'<span class="tid">{esc(b["id"])}</span>' if b["id"] else ""
+        q.append(f'<li><span class="t">{tid}{esc(b["title"])}</span>' + (f'<span class="sub">{"".join(chips)}</span>' if chips else "") + '</li>')
+    queue = f'<ol class="q">{"".join(q)}</ol>' if q else '<div class="empty">空</div>'
+    if c:
+        rows = []
+        for name, cls, x in c["steps"]:
+            attr = f' class="{cls}"' if cls else ""
+            rows.append(f'<li{attr}>{name}<span class="x">{esc(x)}</span></li>')
+        if c["waiting"]:
+            nxt = tv["todo"][0]["title"] if tv["todo"] else ""
+            line = '<span>核对通过，等你放行</span>' + (f'<span class="dim">放行后发出：{esc(nxt)}</span>' if nxt else '<span class="dim">放行后队列就空了</span>')
+        else:
+            line = f'<span>{esc(p["state"])}</span>' + (f'<span class="dim">{esc(p["cycle_note"])}</span>' if p.get("cycle_note") else "")
+        label = "用时" if c["waiting"] else "已进行"
+        doing = (f'<div class="card{" s-me" if c["waiting"] else ""}"><div class="tt"><span class="tid">{esc(c["id"])}</span>{esc(c["title"])}</div>'
+                 f'<div class="meta"><span>开始于 <code>{esc(c["start"][:7])}</code></span><span>{label} {esc(c["span"])}</span><span>{c["commits"]} 个提交</span></div>'
+                 f'<ol class="steps">{"".join(rows)}</ol><div class="nowl">{line}</div></div>')
+    else:
+        doing = f'<div class="empty">{"队列空了，写手会停下" if not tv["todo"] else "没有进行中的任务"}</div>'
+    fin = []
+    for f in tv["finished"]:
+        if f["dropped"]:
+            fin.append(f'<div class="drow dropped"><span class="tid">{esc(f["id"])}</span><span class="t">{esc(f["title"])}</span>'
+                       f'<span class="r">放弃</span><span class="s"><span>{esc(f["reason"] or "没写原因")}</span></span></div>')
+            continue
+        rounds = " · ".join(x for x in (f'计划评审 {f["plan_n"]}' if f["plan_n"] else "", f'代码评审 {f["code_n"]}' if f["code_n"] else "") if x) or "无评审"
+        kind = '<span class="kind">PLAN</span>' if f["plan_n"] else '<span class="kind direct">DIRECT</span>'
+        rng = f'<code>{esc(f["range"])}</code>' if f["range"] else ""
+        fin.append(f'<div class="drow"><span class="tid">{esc(f["id"])}</span><span class="t">{esc(f["title"])}</span>'
+                   f'<span class="r">{esc(f["span"])}</span><span class="s">{kind}<span>{rounds}</span>{rng}</span></div>')
+    fin_n = f'{tv["done"] - (1 if tv["awaiting"] else 0)}' + (f' · 放弃 {tv["dropped"]}' if tv["dropped"] else "")
+    return (f'<section class="tasks"><div class="th"><h2>任务<span class="sub">{counts}</span></h2>{mode}'
+            f'<span class="src">queue.md · tasks.state</span></div><div class="lanes">'
+            f'<div class="lane"><div class="lh"><span>队列</span><span class="n">{len(tv["todo"])}</span></div>{queue}</div>'
+            f'<div class="lane"><div class="lh"><span>{"刚做完" if c and c["waiting"] else "进行中"}</span><span class="n">{1 if c else 0}</span></div>{doing}</div>'
+            f'<div class="lane"><div class="lh"><span>已完成</span><span class="n">{fin_n}</span></div>{"".join(fin) or "<div class=\"empty\">还没有</div>"}</div>'
+            f'</div><div class="foot-note">只读。加任务：编辑 <code>{esc(tv["dir"])}/queue.md</code>，或 <code>review-task add "…"</code>；'
+            f'写在最上面的，就是当前任务之后的下一个。</div></section>')
+
+
 def render_panel(p, archives, self_closed):
     parts = [f'<div class="panel" data-p="{esc(p["name"])}" id="p-{esc(p["name"])}">']
     badge = state_badge(p)
@@ -1082,7 +1317,7 @@ def render_panel(p, archives, self_closed):
     if p["human"] or sug:
         items = []
         for kind, fid, verb, sev, reason in p["human"]:
-            if kind == "stop":
+            if kind != "decision":
                 items.append(f'<li>{esc(reason)}</li>')
                 continue
             what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
@@ -1094,6 +1329,7 @@ def render_panel(p, archives, self_closed):
             rows = "".join(f'<li><span class="mute">{"建议降级" if k == "lower" else "建议加入"}</span> <code>{esc(g)}</code> {esc(lv)} <span class="dim">· {esc(why)}</span></li>' for k, g, lv, why in sug)
             body += f'<details class="mapsug"><summary>不急 · 风险图有 {len(sug)} 条建议，等你点头</summary><ul>{rows}</ul></details>'
         parts.append(f'<div class="wait{"" if items else " calm"}" id="w-{esc(p["name"])}">{body}</div>')
+    parts.append(render_tasks(p))
     pl = p.get("planning")
     if pl:
         parts.append(f'<div class="planning"><b>规划中</b><span class="age">{ago(pl["since"])}</span>'
@@ -1205,8 +1441,8 @@ def render(projects, archives, self_closed):
     waits = []
     for p in projects:
         for kind, fid, verb, sev, reason in p["human"]:
-            if kind == "stop":
-                waits.append((p["name"], f"STOP · {reason}", ago(p["since"]), f"w-{p['name']}"))
+            if kind != "decision":
+                waits.append((p["name"], f"STOP · {reason}" if kind == "stop" else reason, ago(p["since"]), f"w-{p['name']}"))
                 continue
             what = f"{fid} {ZH.get(sev, sev)} · 写手{ZH.get(verb, verb)}" if sev else f"{fid} · 写手{ZH.get(verb, verb)}"
             waits.append((p["name"], what, ago(p["since"]), f"f-{p['name']}-{fid}"))

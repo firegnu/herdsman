@@ -22,7 +22,7 @@ mk() {   # <name>：两个提交的仓库 + .review.conf + 交接目录
   printf 'a\nb = 1\n' > "$r/a.py"; git -C "$r" add .; git -C "$r" commit -qm change
   printf 'REVIEW_KIND=claude\nREVIEW_WT=%s\nREVIEW_DIR=%s\n' "$r" "${TMP}/$n/review" > "$r/.review.conf"
 }
-mk alpha; mk beta; mk gamma; mk delta; mk epsilon; mk zeta
+mk alpha; mk beta; mk gamma; mk delta; mk epsilon; mk zeta; mk eta; mk theta
 now=$(date +%s)
 
 # 假 herdr：beta 的评审方 blocked，gamma 的在 working，其余 pane 不存在
@@ -158,12 +158,35 @@ printf '2026-09-11 10:00:00 [%s] 开始：等 r1-findings.md 出现 REVIEW-COMPL
 printf '4 %s\n' "$((now - 45))" > "$D/.last"
 printf 'STOP: 无法确认 pane zeta-rv 的评审方身份\n' > "$D/.last.out"
 
-printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n%s/epsilon/repo\n%s/zeta/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
+# 任务区 —— eta：T8 进行中（规划过、计划评审两轮、1 个提交，正在代码评审第 1 轮）；队列里一个手写未编号的排在最前；
+# 已完成 T5（没有提交）、放弃 T6。theta：T3 做完、放行模式下还没放行，并且暂停中。其余项目没有 queue.md，不出现任务区。
+E="${TMP}/eta"; EB=$(git -C "$E/repo" rev-parse HEAD~1); EH=$(git -C "$E/repo" rev-parse HEAD); ES=$(git -C "$E/repo" rev-parse --short HEAD)
+printf '## T8 把 CSV 导入改成流式\n约束：内存不超过 200MB\n\n## 修一下登录页的超时\n\n## T9 订单列表分页\n' > "$E/review/queue.md"
+{ printf '{"t": %s, "ev": "start", "id": "T5", "title": "给导出加进度条", "body": "", "key": "给导出加进度条", "sha": "%s"}\n' "$((now - 9000))" "$EB"
+  printf '{"t": %s, "ev": "done", "id": "T5", "sha": "%s", "gate": false}\n' "$((now - 7800))" "$EB"
+  printf '{"t": %s, "ev": "drop", "id": "T6", "title": "迁移到新日志库", "key": "迁移到新日志库", "reason": "和 T2 冲突"}\n' "$((now - 7700))"
+  printf '{"t": %s, "ev": "start", "id": "T8", "title": "把 CSV 导入改成流式", "body": "约束：内存不超过 200MB", "key": "把 CSV 导入改成流式", "sha": "%s"}\n' "$((now - 3600))" "$EB"
+} > "$E/review/tasks.state"
+printf '%s\nfp\neta-plan\n\n\n%s\n' "$((now - 3500))" "$EB" > "$E/review/.plan.sent"
+printf 'PLAN: docs/plans/csv.md\n边界：只动导入\nPLAN-COMPLETE\n' > "$E/review/plan.md"
+mkdir -p "$E/repo/docs/reviews"
+printf '2026-09-11 | %s | round 1/2 | 30s | plan\n2026-09-11 | %s | round 2/2 | 40s | plan\n' "$ES" "$ES" > "$E/repo/docs/reviews/timing.md"
+printf 'artifact: a.py\nkind: code\nbase sha: %s\ntarget sha: %s\nround: 1/3\n' "$EB" "$EH" > "$E/review/request.md"
+cp "$E/review/request.md" "$E/review/.cycle-request.md"
+printf '%s\n%s\neta-rv\n' "$((now - 300))" "$EH" > "$E/review/.r1.sent"
+TH="${TMP}/theta"; THB=$(git -C "$TH/repo" rev-parse HEAD~1)
+printf '## T3 补登录接口的回归测试\n\n## T4 清理旧的 feature flag\n' > "$TH/review/queue.md"
+{ printf '{"t": %s, "ev": "start", "id": "T3", "title": "补登录接口的回归测试", "body": "", "key": "补登录接口的回归测试", "sha": "%s"}\n' "$((now - 2000))" "$THB"
+  printf '{"t": %s, "ev": "done", "id": "T3", "sha": "%s", "gate": true}\n' "$((now - 100))" "$THB"
+} > "$TH/review/tasks.state"
+: > "$TH/review/paused"
+
+printf '%s/alpha/repo\n%s/beta/repo\n%s/gamma/repo\n%s/delta/repo\n%s/epsilon/repo\n%s/zeta/repo\n%s/eta/repo\n%s/theta/repo\n# comment\n%s/nonexistent\n' "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" "${TMP}" > "${TMP}/projects"
 HERDR_BIN_PATH="${TMP}/herdr" python3 "${BOARD}" --projects "${TMP}/projects" --out "${OUT}" >/dev/null
 
 # 项目发现与去重命名（三个 checkout 都叫 repo，用上级目录区分）
-for n in alpha beta gamma delta epsilon zeta; do has "data-p=\"$n/repo\"" "project $n listed"; done
-has '项目 · 6' 'project count'
+for n in alpha beta gamma delta epsilon zeta eta theta; do has "data-p=\"$n/repo\"" "project $n listed"; done
+has '项目 · 8' 'project count'
 has '<div class="mast"><span class="brand">Review board</span>' 'masthead'
 has '<b>写手</b> codex ·' 'writer agent line'
 grep -qE '<b>规划者</b> codex · [^<]+ · high</span>' "${OUT}" || fail 'planner agent line with effort override'
@@ -202,7 +225,7 @@ has '评审方怎么看的' 'process fold present'
 has '跑了 pytest -q，12 passed' 'process text shown'
 
 # 横幅：两条裁决 + 一条 STOP；alpha 排在最前
-has '等你 · 7' 'banner count: alpha 2 + beta 2 + zeta 3'
+has '等你 · 8' 'banner count: alpha 2 + beta 2 + zeta 3 + theta 1'
 has 'F2 细节 · 写手拒绝' 'banner reject item'
 has 'F3 阻断 · 写手暂缓' 'banner blocking-defer item'
 has 'id="f-alpha/repo-F2"' 'finding anchor'
@@ -264,6 +287,28 @@ has '写手 pane zeta-writer 换了 terminal' 'dead waker shows its last reason 
 lacks '写手 eps-writer' 'a live waker is not reported'
 lacks 'alpha-bad' 'a malformed marker is ignored, not rendered'
 has 'class="proj needs" data-p="zeta/repo"' 'zeta highlighted in the sidebar'
+
+# 任务区：只有接了队列的项目才有；三栏、阶段条、手写未编号、放弃带原因、做完等放行
+[ "$(grep -o 'class="tasks"' "${OUT}" | wc -l | tr -d ' ')" = 2 ] || fail 'task section only on projects with a queue'
+has '<span class="next">下一个</span>' 'next marker on the first pending task'
+has '修一下登录页的超时' 'hand-written task listed'
+has '<span class="hand">手写 · 发出时编号</span>' 'unnumbered task marked'
+has '<span class="tid">T9</span>订单列表分页' 'numbered pending task listed with its ID'
+has '<span class="tid">T8</span>把 CSV 导入改成流式' 'in-progress card title'
+has '<li class="ok">规划<span class="x">PLAN</span></li>' 'planning step done with the planner decision'
+has '<li class="ok">计划评审<span class="x">2 轮</span></li>' 'plan-review rounds counted from timing.md within the task'
+has '<li class="ok">实施<span class="x">1 个提交</span></li>' 'implementation step counts commits since start'
+has '<li class="now">代码评审<span class="x">第 1 轮</span></li>' 'current step from the open code cycle'
+has '<span class="tid">T5</span><span class="t">给导出加进度条</span><span class="r">20m</span>' 'finished row with duration'
+has 'class="drow dropped"' 'dropped row struck through'
+has '和 T2 冲突' 'drop reason shown'
+has '<span class="mode gate">放行模式</span>' 'release-mode chip'
+has '<span class="mode paused">暂停中</span>' 'paused chip replaces the mode chip'
+has 'T3 补登录接口的回归测试 做完了' 'awaiting release listed as waiting on you'
+has 'review-task go' 'the waiting item says how to release'
+has '<span class="badge me">等你放行</span>' 'awaiting release badge'
+has 'class="card s-me"' 'finished card turns crimson while it waits'
+has '<li class="now release">收尾<span class="x">核对通过 · 等你放行</span></li>' 'last step waits for release'
 
 # 不接触真实项目
 lacks 'jb-finetune' 'real project leaked into fixture board'

@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""review-task —— 任务队列：人往 queue.md 里写任务，写手用 next / done 一个接一个地做。
+
+和评审流程并行、互不相碰：不改 request-review，不启动也不注入任何 agent。
+  queue.md    交接目录里，只归人。「## T7 标题」或「## 标题」开一块，下面随意写约束和验收；
+              编号可省（发出时补上），文件里的先后就是执行顺序。
+  tasks.state 交接目录里，只归本工具。每行一个 JSON 事件（start / done / go / drop），只追加。
+「做完了」由本工具只读核对 git 和交接目录，不听写手一句话。交接文件的解析复用看板（review-board）里的
+函数，和看板、request-review 用同一套判据。
+
+在仓库目录里运行：
+  review-task add "标题" [说明行 …]   人：加到队列末尾，自动编号
+  review-task list                    看进行中、队列、已完成
+  review-task next                    写手：有进行中的就重发它（换写手接手时用）；否则发下一个
+  review-task done T5                 写手：核对是否真的收尾；通过后停下等放行，或直接发下一个
+  review-task go                      人：放行（放行模式）
+  review-task drop T5 "原因"          人：放弃一个任务（进行中的，或队列里还没开始的）
+  review-task pause | resume          人：暂停 / 恢复发新任务，正在做的照常做完
+退出码：0 发出任务或操作成功；8 停下，把输出报告给人（队列空、暂停、等放行）；9 还没收尾；2 用法或前置条件不满足。
+.review.conf 的 TASK_GATE：1（默认）放行模式，每个任务做完等人 go；0 自动模式，做完直接发下一个。
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True   # 下面按文件路径加载看板；别在 bin/ 里留下 __pycache__
+
+
+def die(code, msg):
+    print(msg)
+    sys.exit(code)
+
+
+def stop(msg):
+    print(msg)
+    return 8
+
+
+def load_board():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "review-board")
+    if not os.path.exists(path):
+        die(2, f"ERROR: 找不到 {path}。review-task 用看板的函数读交接文件，两者要装在一起（install.sh 会一起装）。")
+    loader = importlib.machinery.SourceFileLoader("review_board", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("review_board", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+B = load_board()
+REPO = D = Q = S = PAUSED = ""
+GATE = True
+
+
+def setup():
+    global REPO, D, Q, S, PAUSED, GATE
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if r.returncode:
+        die(2, "ERROR: 不在 git 仓库里。到项目目录里运行 review-task。")
+    REPO = r.stdout.strip()
+    conf = B.parse_conf(f"{REPO}/.review.conf")
+    if not conf.get("REVIEW_DIR"):
+        die(2, f"ERROR: {REPO}/.review.conf 缺失或没有 REVIEW_DIR，这个仓库还没接入评审流程。")
+    D = conf["REVIEW_DIR"]
+    os.makedirs(D, exist_ok=True)
+    Q, S, PAUSED = f"{D}/queue.md", f"{D}/tasks.state", f"{D}/paused"
+    GATE = conf.get("TASK_GATE", "1").strip() != "0"
+
+
+def sh(*args):
+    return subprocess.run(["git", "-c", "core.quotepath=false", "-C", REPO, *args], capture_output=True, text=True)
+
+
+def git(*args):
+    return sh(*args).stdout
+
+
+def head():
+    return git("rev-parse", "HEAD").strip()
+
+
+# ============================================================ 队列（人的）与进度（本工具的）
+# 解析放在看板里（task_blocks / task_events / task_fold / task_pending），看板显示的和这里发出去的是同一个队列。
+def parse_queue():
+    return B.task_blocks(B.read(Q))
+
+
+def append(ev):
+    with open(S, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": int(time.time()), **ev}, ensure_ascii=False) + "\n")
+
+
+def fold():
+    """→ ({id: task}（按开始顺序）, 进行中的那个, 在等放行的 id)"""
+    return B.task_fold(B.task_events(B.read(S)))
+
+
+def pending(tasks):
+    return B.task_pending(parse_queue(), tasks)
+
+
+def next_num():
+    ids = [b["id"] for b in parse_queue() if b["id"]] + list(fold()[0])
+    return max([int(i[1:]) for i in ids if re.fullmatch(r"T\d+", i or "")], default=0) + 1
+
+
+def issue(t, again=False):
+    out = [f"TASK {t['id']}: {t['title']}"]
+    if t.get("body"):
+        out += ["", t["body"]]
+    out += ["", "这是进行中的任务，接着做；之前的进度都在 git 和交接目录里。" if again else "这是队列里的下一个任务。",
+            "按 AGENTS.md 里的流程做，和人直接交代给你的任务一样。",
+            f"做完后运行：review-task done {t['id']}  —— 它会核对是否真的收尾，并告诉你下一步。"]
+    print("\n".join(out))
+    return 0
+
+
+# ============================================================ 「做完了」的核对（只读）
+def own_record(paths, map_diff):
+    """去掉脚本自己写的：docs/reviews/ 下全部；.review-map 只新增了「# 自动升级」行时也算。同 request-review 的 drop_own。"""
+    ch = [l for l in map_diff.splitlines() if re.match(r'^[-+][^-+]', l)]
+    map_auto = all(re.match(r'^\+.*# 自动升级', l) for l in ch)
+    return [p for p in paths if not p.startswith("docs/reviews/") and not (p == ".review-map" and map_auto)]
+
+
+def tree_dirty():
+    paths = [l[3:].split(" -> ")[-1] for l in git("status", "--porcelain", "--untracked-files=no").splitlines()]
+    return own_record(paths, git("diff", "HEAD", "--", ".review-map"))
+
+
+def skipped_shas():
+    out = set()
+    for line in (B.read(f"{REPO}/docs/reviews/skipped.md") or "").splitlines():
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-f]{7,40}", parts[1]):
+            out.add(parts[1])
+    return out
+
+
+def unreviewed(base, h, skipped):
+    """base..h 里真正该评审的提交：去掉人用 SKIP_REVIEW 放过的、只动了评审记录的。base 不在 HEAD 历史里返回 None。"""
+    if base == h:
+        return []
+    if sh("merge-base", "--is-ancestor", base, h).returncode:
+        return None
+    out = []
+    for c in git("rev-list", f"{base}..{h}").split():
+        if git("rev-parse", "--short", c).strip() in skipped:
+            continue
+        paths = git("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", c).split()
+        if own_record(paths, git("show", "--format=", c, "--", ".review-map")):
+            out.append(c)
+    return out
+
+
+def cycle_state(h):
+    """评审周期结束了没有。→ (问题列表, 闭合时那一轮的 target sha)。
+    最近一轮的回应里有拒绝、暂缓的阻断、或接受，流程都还要再走一轮（手册第 ⑨ 步），不管人裁决了没有。"""
+    probs = []
+    req = B.parse_request(B.read(f"{D}/request.md"))
+    cur = req.get("_round", 1)
+    if req.get("target sha") == h and not os.path.exists(f"{D}/.r{cur}.sent"):
+        probs.append(f"request.md 已写好第 {cur} 轮，但还没运行 request-review 派发")
+    rounds = [r for r in B.load_rounds(D) if r["sent"]]
+    if not rounds:
+        return probs, None
+    last = rounds[-1]
+    n = last["n"]
+    if last["responses"] is None:
+        probs.append(f"第 {n} 轮评审还没结束：" + ("评审方还在审" if not last["done"] else "findings 还没回应"))
+        return probs, None
+    sev = lambda fid: last["findings"].get(fid, {}).get("sev", "")
+    resp = last["responses"].items()
+    if any(v == "reject" or (v == "defer" and sev(f) == "blocking") for f, (v, _) in resp):
+        probs.append(f"第 {n} 轮有被拒绝、或暂缓的阻断 finding："
+                     + ("要等人裁决，再走一轮" if B.pending_decisions(last) else "人已裁决，还要再走一轮"))
+    elif any(v == "accept" for _, (v, _) in resp):
+        probs.append(f"第 {n} 轮有接受的 finding，改完要再开一轮验证")
+    return probs, (None if probs else last["sent"]["target"])
+
+
+def check_done(task):
+    h = head()
+    probs = []
+    dirty = tree_dirty()
+    if dirty:
+        probs.append("工作区有没提交的改动：" + "、".join(dirty[:5]) + (" 等" if len(dirty) > 5 else ""))
+    psent = B.parse_sent(B.read(f"{D}/.plan.sent"))
+    if psent and not B.sentinel_ok(B.read(f"{D}/plan.md"), "PLAN-COMPLETE"):
+        probs.append("规划者还没交付计划：plan.md 还没写完")
+    cp, cycle_end = cycle_state(h)
+    probs += cp
+    if not cp:
+        # 起点之一到 HEAD 之间没有该审而没审的提交，就算过了路由：这个任务的起点、triage 判 SKIP 的那个 HEAD、刚闭合的那一轮
+        tri = (B.read(f"{D}/.triage") or "").splitlines()
+        bases = [task["start"], tri[0].strip() if len(tri) > 1 and tri[1].strip() == "SKIP" else "", cycle_end or ""]
+        skipped = skipped_shas()
+        if not any(b and unreviewed(b, h, skipped) == [] for b in bases):
+            probs.append("开始以来的改动还没过路由：运行 request-review，让它评审完或判 SKIP")
+    return probs
+
+
+# ============================================================ 命令
+def cmd_add(title, notes):
+    title = title.strip()
+    if not title or "\n" in title:
+        die(2, "ERROR: 标题要是一行非空的文字")
+    tid = f"T{next_num()}"
+    text = B.read(Q) or ""
+    sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    with open(Q, "a", encoding="utf-8") as f:
+        f.write(sep + f"## {tid} {title}\n" + "".join(n.rstrip("\n") + "\n" for n in notes))
+    print(f"已加入队列末尾 {tid}：{title}")
+    return 0
+
+
+def cmd_next():
+    tasks, current, awaiting = fold()
+    if current:
+        return issue(current, again=True)
+    if os.path.exists(PAUSED):
+        return stop("PAUSED: 队列已暂停，不发新任务。停下，把这句报告给人；人运行 review-task resume 之后，再运行 review-task next。")
+    if awaiting:
+        return stop(f"WAIT: {awaiting} 已完成，放行模式下要等人放行。停下，把这句报告给人；人运行 review-task go 之后，再运行 review-task next。")
+    todo = pending(tasks)
+    if not todo:
+        return stop(f"EMPTY: 队列空了，没有新任务。停下，把这句报告给人；人往 {Q} 里加了任务之后，再运行 review-task next。")
+    b = todo[0]
+    t = {"id": b["id"] or f"T{next_num()}", "title": b["title"], "body": b["body"]}
+    append({"ev": "start", "id": t["id"], "title": t["title"], "body": t["body"], "key": t["title"], "sha": head()})
+    return issue(t)
+
+
+def cmd_done(tid):
+    tasks, current, awaiting = fold()
+    if not current or current["id"] != tid:
+        die(2, f"ERROR: {tid} 不是进行中的任务" + (f"，进行中的是 {current['id']}" if current else "，现在没有进行中的任务"))
+    probs = check_done(current)
+    if probs:
+        print(f"NOT DONE: {tid} 还没收尾：")
+        for p in probs:
+            print(f"  - {p}")
+        print(f"处理完再运行 review-task done {tid}。")
+        return 9
+    append({"ev": "done", "id": tid, "sha": head(), "gate": GATE})
+    if GATE:
+        return stop(f"DONE {tid}：核对通过。放行模式：停下，把这句报告给人，等人放行；放行后运行 review-task next。")
+    print(f"DONE {tid}：核对通过。")
+    return cmd_next()
+
+
+def cmd_go():
+    _, _, awaiting = fold()
+    if not awaiting:
+        die(2, "ERROR: 没有在等放行的任务")
+    append({"ev": "go", "id": awaiting})
+    print(f"已放行（{awaiting} 之后）。对写手说「继续」，它会运行 review-task next；想换个新写手，就开一个新的，对它说「开始循环」。")
+    return 0
+
+
+def cmd_drop(tid, reason):
+    tasks, _, _ = fold()
+    t = tasks.get(tid)
+    if t and t["status"] != "doing":
+        die(2, f"ERROR: {tid} 已经{'完成' if t['status'] == 'done' else '放弃'}了")
+    if not t:
+        b = next((b for b in parse_queue() if b["id"] == tid), None)
+        if not b:
+            die(2, f"ERROR: 找不到 {tid}：它不在进行中，队列里也没有这个编号")
+        t = {"title": b["title"], "key": b["title"]}
+    append({"ev": "drop", "id": tid, "title": t["title"], "key": t.get("key") or t["title"], "reason": reason})
+    print(f"已放弃 {tid}：{t['title']}" + (f"（{reason}）" if reason else ""))
+    return 0
+
+
+def cmd_pause(on):
+    if on:
+        open(PAUSED, "a").close()
+        print("已暂停：不再发新任务，正在做的会做完。运行 review-task resume 恢复。")
+    else:
+        if os.path.exists(PAUSED):
+            os.remove(PAUSED)
+        print("已恢复：写手下次运行 review-task next 会拿到新任务。")
+    return 0
+
+
+def span(a, b):
+    if not a or not b:
+        return ""
+    m = max(0, int(b - a)) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def cmd_list():
+    tasks, current, awaiting = fold()
+    todo = pending(tasks)
+    print(f"模式：{'放行模式' if GATE else '自动模式'}" + ("（已暂停）" if os.path.exists(PAUSED) else "")
+          + (f"；{awaiting} 已完成，等人放行" if awaiting else ""))
+    print("\n进行中：")
+    print(f"  {current['id']} {current['title']}（开始于 {current['start'][:7]}）" if current else "  （无）")
+    print("\n队列：")
+    for i, b in enumerate(todo, 1):
+        print(f"  {i}. {b['id'] or '（未编号）'} {b['title']}" + ("  ← 下一个" if i == 1 else ""))
+    if not todo:
+        print("  （空）")
+    fin = [t for t in tasks.values() if t["status"] != "doing"]
+    print("\n已完成 / 放弃：")
+    for t in reversed(fin[-10:]):
+        if t["status"] == "done":
+            print(f"  {t['id']} {t['title']} · {span(t.get('t0'), t.get('t1'))} · {t['start'][:7]}..{t['end'][:7]}")
+        else:
+            print(f"  {t['id']} {t['title']} · 放弃" + (f"：{t['reason']}" if t.get("reason") else ""))
+    if not fin:
+        print("  （无）")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    setup()
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "add" and rest:
+        return cmd_add(rest[0], rest[1:])
+    if cmd == "list" and not rest:
+        return cmd_list()
+    if cmd == "next" and not rest:
+        return cmd_next()
+    if cmd == "done" and len(rest) == 1:
+        return cmd_done(rest[0].upper())
+    if cmd == "go" and not rest:
+        return cmd_go()
+    if cmd == "drop" and rest:
+        return cmd_drop(rest[0].upper(), " ".join(rest[1:]))
+    if cmd in ("pause", "resume") and not rest:
+        return cmd_pause(cmd == "pause")
+    die(2, f"ERROR: 用法不对：review-task {' '.join(argv)}\n\n{__doc__.strip()}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
