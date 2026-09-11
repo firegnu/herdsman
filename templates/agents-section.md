@@ -10,7 +10,8 @@
 - 0 且输出 `SKIP: …` → 结束，已记入 docs/reviews/self-closed.md
 - 6 且输出 `REVIEW: …` → 输出还有 `kind:`、`level:`、`base sha:` 三行，**照抄**进 request.md
   （target sha 为 HEAD），再次运行进入评审周期。base 是上次评审的 target，不是紧邻的前一个提交
-- 3 → 再次运行继续等待
+- 3 → 看输出第一行：写着「已派发」就停下，把那句原样报告给人，**不要重跑** —— 评审方
+      判完会有人叫你继续，被叫醒后再运行一次即可。没写「已派发」就是还在等，再次运行继续等待
 
 人明确要求评审时，直接写 request.md 运行，不经 triage。你可以随时主动请求评审；
 你不得推翻 REVIEW，不得跳过 request-review 就结束含代码的任务。

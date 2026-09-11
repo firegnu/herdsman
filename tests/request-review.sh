@@ -1103,3 +1103,39 @@ assert_eq "${SELFWATCH_STATUS}" 3 'self-watch fallback status'
 [ -f "${REVIEW_DIR}/.wake" ] && fail 'must not arm a waker that watches and wakes the same pane'
 grep -q '再次运行' "${TMP}/stdout" || fail 'self-watch should fall back to foreground waiting'
 echo 'PASS arming is refused when the watched pane is our own'
+
+# Nested waits: the writer's waker watches plan.md while the planner runs its own plan review.
+# The planner's run finishing must not delete the writer's marker — it belongs to another sentinel.
+clear_cycle
+write_request code "${B}" 1/3
+printf '%s\n%s\n' "$(date +%s)" "$(git -C "${REPO}" rev-parse HEAD)" > "${REVIEW_DIR}/.r1.sent"
+printf 'F1 | nit\nclaim: x\nREVIEW-COMPLETE\n' > "${REVIEW_DIR}/r1-findings.md"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${REVIEW_DIR}/plan.md" PLAN-COMPLETE new-pane writer-pane \
+  term-writer '' '规划者那边完成了' '-' > "${REVIEW_DIR}/.wake"
+cp "${REVIEW_DIR}/.wake" "${TMP}/wake.before"
+run_review new
+assert_eq "${RUN_STATUS}" 0 'nested finish status'
+[ -f "${REVIEW_DIR}/.wake" ] || fail "another run's finish deleted the waiting writer's marker"
+cmp -s "${REVIEW_DIR}/.wake" "${TMP}/wake.before" || fail "another run's finish altered the writer's marker"
+# …but a run finishing the very sentinel a marker waits on does clear it.
+printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${REVIEW_DIR}/r1-findings.md" REVIEW-COMPLETE reviewer-pane \
+  writer-pane term-writer '' '评审完成' '-' > "${REVIEW_DIR}/.wake"
+run_review new
+[ -f "${REVIEW_DIR}/.wake" ] && fail 'finishing the watched sentinel should clear its own marker'
+echo 'PASS finish only clears the marker waiting on its own sentinel'
+
+# Writer → planner: plan mode arms a waker on plan.md, and delivering the plan clears it.
+grep -q '^PLAN_KIND=' "${REPO}/.review.conf" || printf 'PLAN_KIND=claude\n' >> "${REPO}/.review.conf"
+clear_cycle
+rm -f "${REVIEW_DIR}/.plan.sent" "${REVIEW_DIR}/plan.md" "${REVIEW_DIR}/.plan-pane"
+printf 'task: 做 M7\n' > "${REVIEW_DIR}/plan-request.md"
+run_review plan-new plan
+assert_eq "${RUN_STATUS}" 3 'plan wake dispatch status'
+grep -q '已派发给规划者' "${TMP}/stdout" || fail 'plan wake should tell the writer to stop'
+assert_eq "$(sed -n '1p' "${REVIEW_DIR}/.wake")" "${REVIEW_DIR}/plan.md" 'plan wake marker sentinel file'
+assert_eq "$(sed -n '3p' "${REVIEW_DIR}/.wake")" new-pane 'plan wake marker watches the planner'
+printf 'PLAN: docs/plans/m7.md\nPLAN-COMPLETE\n' > "${REVIEW_DIR}/plan.md"
+run_review plan-live plan
+assert_eq "${RUN_STATUS}" 0 'plan delivery after wake status'
+[ -f "${REVIEW_DIR}/.wake" ] && fail 'delivering the plan should clear the marker waiting on it'
+echo 'PASS writer→planner arms on plan.md and delivery clears it'

@@ -126,7 +126,7 @@ sentinel_ok() {
 # ---- 完成处理：记录的是被评审的 target，不是当前 HEAD（两者可能已不同）----
 finish() {
   local elapsed sha nb
-  rm -f "${WAKE_MARK}"     # 已经领到结果了，还在盯的进程下一轮自己退出
+  clear_wake_for "${OUT}"   # 领到了这个哨兵的结果，等它的标记作废；那个进程下一轮自己退出
   elapsed=$(( $(date +%s) - START ))
   sha=$(git rev-parse --short "${TARGET:-HEAD}")
   # 同一 sha 同一轮只记一次：写手在写 responses 之前再跑一遍，只是再领一次路径
@@ -401,6 +401,13 @@ send_prompt() {          # $1=pane_id  $2=target sha  $3=sent file  $4=prompt
 # （或被盯的 agent 卡住、空转、超时）时把写手叫醒，叫完就退出 —— 没有常驻的东西。
 # 它不做任何判断：判断全在写手重跑时的 request-review 里，这里只负责"该回去看了"。
 
+# 标记按哨兵文件认领：只有等的正是这个哨兵的那次运行才清它。规划者自己送审时，它那轮评审
+# 结束不能把写手等规划者的标记一起删掉 —— 删了，写手就再也没人叫。
+clear_wake_for() {       # $1=哨兵文件
+  [ -f "${WAKE_MARK}" ] && [ "$(sed -n '1p' "${WAKE_MARK}")" = "$1" ] && rm -f "${WAKE_MARK}"
+  return 0
+}
+
 # 记下写手自己的身份并 fork。认不出自己在哪个 pane（不在 herdr 里跑）就返回 1，退回前台等待。
 fork_waker() {           # $1=哨兵文件 $2=哨兵词 $3=被盯的 pane
   local payload term sess pid
@@ -470,7 +477,7 @@ wake_loop() {            # $1=标记文件
 # 一句话、或根本没开始）：等满 REVIEW_WAIT 只会让写手反复续等。连续两次看到 idle 即退出 4。
 wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   local deadline st idle=0
-  sentinel_ok "$1" "$2" && return 0
+  sentinel_ok "$1" "$2" && { clear_wake_for "$1"; return 0; }
   if fork_waker "$1" "$2" "$3"; then
     echo "PENDING: 已派发给${ROLE_LABEL}，本回合到此为止。停下把话交回给人；那边完成时会有人叫你继续，不要反复重跑。"
     exit 3
@@ -478,7 +485,7 @@ wait_sentinel() {        # $1=file  $2=word  $3=pane_id
   deadline=$(( $(date +%s) + REVIEW_WAIT ))
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     sleep "${REVIEW_POLL}"
-    sentinel_ok "$1" "$2" && return 0
+    sentinel_ok "$1" "$2" && { clear_wake_for "$1"; return 0; }
     st=$(transport_state "$3")
     case "${st}" in
       blocked)
@@ -857,6 +864,7 @@ acquire_planner() {      # 定位或拉起规划者，输出 pane_id；失败返
 plan_deliver() {         # plan.md 已完成时的交付；返回 1 表示还没完成
   local first
   sentinel_ok "${POUT}" PLAN-COMPLETE || return 1
+  clear_wake_for "${POUT}"
   first=$(sed -n '1p' "${POUT}")
   case "${first}" in
     STOP*) echo "STOP: 规划者停下了：${first#STOP:}"; echo "      详情见 ${POUT}，请你亲自查看 pane $(sed -n '3p' "${PSENT}")。"; exit 4;;
