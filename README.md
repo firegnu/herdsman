@@ -1,5 +1,11 @@
 # bounded-adversarial-review
 
+> **2026-09-20：本仓库冻结，不再维护。**
+> 外循环（任务队列、看板、记账）已经分出去成为独立项目 **drover**，接在 corral / corral-dispatch 上，
+> 评审协议整条退役（理由见 drover 的 `docs/ROADMAP.md`「从哪来」）。
+> drover 从本仓库 clone，历史全留。本仓库保持现状供 jb-finetune 继续使用，
+> 等它也迁过去之后再决定归档还是删。路线图见 `docs/ROADMAP.md` R1。
+
 一个写手 agent 实现，一个评审 agent 挑错，你只在起点和分歧点出现。
 
 基于 [herdr](https://herdr.dev) 的终端多路复用能力，把只为「人坐在键盘前」设计的交互式 agent 变得可脚本、可观测。
